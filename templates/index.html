@@ -7,41 +7,53 @@
     <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 </head>
 <body>
-    <div class="app">
-        <header class="app-header">
+    <div class="container">
+        <header>
             <h1>Travel assistant</h1>
-            <p>Practical help with routes, traffic, and planning your journeys.</p>
+            <p class="subtitle">Ask about traffic, routes, timetables, and travel conditions</p>
         </header>
 
-        <section id="chat" class="chat">
-            <div id="messages" class="messages">
-                <div class="message bot">
-                    <div class="bubble">
-                        Hi, I’m your travel assistant. I can help you with queries based on the London network:
-                        <ul>
-                            <li>Bus schedules</li>
-                            <li>Train schedules</li>
-                            <li>Bus status and disruptions</li>
-                            <li>Train status and disruptions</li>
-                            <li>Journey planning across London</li>
-                        </ul>
-                        You can ask things like: “What are the bus times for Oxford Circus?”, “Is the Victoria line running well?”, or “Plan a journey from Harlesden to Oxford Street.”.
+        <div class="main-layout">
+            <div class="chat-column">
+                <div class="chat-container">
+                    <div class="chat-messages" id="chatMessages">
+                        <div class="message bot-message">
+                            <p>Hi, I'm your travel assistant. I can help you with:</p>
+                            <ul>
+                                <li>Delay information</li>
+                                <li>Transit disruptions</li>
+                                <li>Timetables and schedules</li>
+                                <li>Route suggestions</li>
+                            </ul>
+                        </div>
+                    </div>
+                    <div class="chat-input-container">
+                        <input
+                            type="text"
+                            id="userInput"
+                            placeholder="Ask about traffic, delays, routes, or timetables..."
+                            autocomplete="off"
+                        >
+                        <button id="sendButton">Send</button>
                     </div>
                 </div>
             </div>
 
-            <form id="chatForm" class="input-row">
-                <input
-                    id="messageInput"
-                    type="text"
-                    autocomplete="off"
-                    placeholder="Ask about traffic, delays, or a route…"
-                >
-                <button type="submit">Send</button>
-            </form>
-        </section>
+            <aside class="side-panel">
+                <div class="info-panel">
+                    <div class="info-item">
+                        <strong>Detected Intent:</strong> <span id="intentDisplay">-</span>
+                    </div>
+                    <div class="info-item">
+                        <strong>Confidence:</strong> <span id="confidenceDisplay">-</span>
+                    </div>
+                    <div class="info-item">
+                        <strong>Entities:</strong> <span id="entitiesDisplay">-</span>
+                    </div>
+                </div>
+            </aside>
+        </div>
     </div>
-
     <script src="{{ url_for('static', filename='script.js') }}"></script>
 </body>
 </html>

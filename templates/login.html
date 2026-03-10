@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Log in / Sign up — Travel assistant</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body class="auth-page">
+    <div class="auth-container">
+        <a href="{{ url_for('index') }}" class="auth-back">← Back to Travel assistant</a>
+        <h1 class="auth-title">Log in / Sign up</h1>
+        <p class="auth-subtitle">Use the same form to log in or create an account.</p>
+
+        <div class="auth-requirements">
+            <strong>Registration requirements</strong>
+            <ul>
+                <li>Username: longer than 3 characters</li>
+                <li>Password: minimum 8 characters</li>
+            </ul>
+        </div>
+
+        <form id="authForm" class="auth-form">
+            <div class="auth-field">
+                <label for="authUsername">Username</label>
+                <input
+                    id="authUsername"
+                    name="username"
+                    type="text"
+                    autocomplete="username"
+                    placeholder="e.g. jane"
+                    required
+                >
+            </div>
+            <div class="auth-field">
+                <label for="authPassword">Password</label>
+                <input
+                    id="authPassword"
+                    name="password"
+                    type="password"
+                    autocomplete="current-password"
+                    placeholder="••••••••"
+                    required
+                >
+            </div>
+            <div id="authError" class="auth-error hidden"></div>
+            <button type="submit" class="auth-submit">Log in / Sign up</button>
+        </form>
+    </div>
+    <script>
+        (function() {
+            var form = document.getElementById('authForm');
+            var errorEl = document.getElementById('authError');
+            function showError(msg) {
+                errorEl.textContent = msg;
+                errorEl.classList.remove('hidden');
+            }
+            function hideError() {
+                errorEl.textContent = '';
+                errorEl.classList.add('hidden');
+            }
+            form.addEventListener('submit', function(e) {
+                e.preventDefault();
+                hideError();
+                var username = (document.getElementById('authUsername').value || '').trim();
+                var password = (document.getElementById('authPassword').value || '').trim();
+                if (!username || !password) {
+                    showError('Please enter a username and password.');
+                    return;
+                }
+                fetch('/login', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ username: username, password: password })
+                })
+                    .then(function(res) { return res.json().then(function(data) { return { ok: res.ok, data: data }; }); })
+                    .then(function(result) {
+                        if (result.ok) {
+                            window.location.href = '/';
+                        } else {
+                            showError(result.data.error || 'Login failed.');
+                        }
+                    })
+                    .catch(function() {
+                        showError('Something went wrong. Please try again.');
+                    });
+            });
+        })();
+    </script>
+</body>
+</html>

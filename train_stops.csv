@@ -1,0 +1,505 @@
+Network,Line,Line Colour,Station
+London Underground,Bakerloo Line,Brown,Harrow & Wealdstone
+London Underground,Bakerloo Line,Brown,Kenton
+London Underground,Bakerloo Line,Brown,South Kenton
+London Underground,Bakerloo Line,Brown,North Wembley
+London Underground,Bakerloo Line,Brown,Wembley Central
+London Underground,Bakerloo Line,Brown,Stonebridge Park
+London Underground,Bakerloo Line,Brown,Harlesden
+London Underground,Bakerloo Line,Brown,Willesden Junction
+London Underground,Bakerloo Line,Brown,Kensal Green
+London Underground,Bakerloo Line,Brown,Queen's Park
+London Underground,Bakerloo Line,Brown,Kilburn Park
+London Underground,Bakerloo Line,Brown,Maida Vale
+London Underground,Bakerloo Line,Brown,Warwick Avenue
+London Underground,Bakerloo Line,Brown,Paddington
+London Underground,Bakerloo Line,Brown,Edgware Road
+London Underground,Bakerloo Line,Brown,Marylebone
+London Underground,Bakerloo Line,Brown,Baker Street
+London Underground,Bakerloo Line,Brown,Regent's Park
+London Underground,Bakerloo Line,Brown,Oxford Circus
+London Underground,Bakerloo Line,Brown,Piccadilly Circus
+London Underground,Bakerloo Line,Brown,Charing Cross
+London Underground,Bakerloo Line,Brown,Embankment
+London Underground,Bakerloo Line,Brown,Waterloo
+London Underground,Bakerloo Line,Brown,Lambeth North
+London Underground,Bakerloo Line,Brown,Elephant & Castle
+London Underground,Central Line,Red,West Ruislip
+London Underground,Central Line,Red,Ruislip Gardens
+London Underground,Central Line,Red,South Ruislip
+London Underground,Central Line,Red,Northolt
+London Underground,Central Line,Red,Greenford
+London Underground,Central Line,Red,Perivale
+London Underground,Central Line,Red,Hanger Lane
+London Underground,Central Line,Red,Ealing Broadway
+London Underground,Central Line,Red,West Acton
+London Underground,Central Line,Red,North Acton
+London Underground,Central Line,Red,East Acton
+London Underground,Central Line,Red,White City
+London Underground,Central Line,Red,Shepherd's Bush
+London Underground,Central Line,Red,Holland Park
+London Underground,Central Line,Red,Notting Hill Gate
+London Underground,Central Line,Red,Queensway
+London Underground,Central Line,Red,Lancaster Gate
+London Underground,Central Line,Red,Marble Arch
+London Underground,Central Line,Red,Bond Street
+London Underground,Central Line,Red,Oxford Circus
+London Underground,Central Line,Red,Tottenham Court Road
+London Underground,Central Line,Red,Holborn
+London Underground,Central Line,Red,Chancery Lane
+London Underground,Central Line,Red,St. Paul's
+London Underground,Central Line,Red,Bank
+London Underground,Central Line,Red,Liverpool Street
+London Underground,Central Line,Red,Bethnal Green
+London Underground,Central Line,Red,Mile End
+London Underground,Central Line,Red,Stratford
+London Underground,Central Line,Red,Leyton
+London Underground,Central Line,Red,Leytonstone
+London Underground,Central Line,Red,Snaresbrook
+London Underground,Central Line,Red,South Woodford
+London Underground,Central Line,Red,Woodford
+London Underground,Central Line,Red,Buckhurst Hill
+London Underground,Central Line,Red,Loughton
+London Underground,Central Line,Red,Debden
+London Underground,Central Line,Red,Theydon Bois
+London Underground,Central Line,Red,Epping
+London Underground,Central Line,Red,Wanstead
+London Underground,Central Line,Red,Redbridge
+London Underground,Central Line,Red,Gants Hill
+London Underground,Central Line,Red,Newbury Park
+London Underground,Central Line,Red,Barkingside
+London Underground,Central Line,Red,Fairlop
+London Underground,Central Line,Red,Hainault
+London Underground,Central Line,Red,Grange Hill
+London Underground,Central Line,Red,Chigwell
+London Underground,Central Line,Red,Roding Valley
+London Underground,Circle Line,Yellow,Hammersmith
+London Underground,Circle Line,Yellow,Goldhawk Road
+London Underground,Circle Line,Yellow,Shepherd's Bush Market
+London Underground,Circle Line,Yellow,Wood Lane
+London Underground,Circle Line,Yellow,Latimer Road
+London Underground,Circle Line,Yellow,Ladbroke Grove
+London Underground,Circle Line,Yellow,Westbourne Park
+London Underground,Circle Line,Yellow,Royal Oak
+London Underground,Circle Line,Yellow,Paddington
+London Underground,Circle Line,Yellow,Edgware Road
+London Underground,Circle Line,Yellow,Baker Street
+London Underground,Circle Line,Yellow,Great Portland Street
+London Underground,Circle Line,Yellow,Euston Square
+London Underground,Circle Line,Yellow,King's Cross St Pancras
+London Underground,Circle Line,Yellow,Farringdon
+London Underground,Circle Line,Yellow,Barbican
+London Underground,Circle Line,Yellow,Moorgate
+London Underground,Circle Line,Yellow,Liverpool Street
+London Underground,Circle Line,Yellow,Aldgate
+London Underground,Circle Line,Yellow,Tower Hill
+London Underground,Circle Line,Yellow,Monument
+London Underground,Circle Line,Yellow,Cannon Street
+London Underground,Circle Line,Yellow,Mansion House
+London Underground,Circle Line,Yellow,Blackfriars
+London Underground,Circle Line,Yellow,Temple
+London Underground,Circle Line,Yellow,Embankment
+London Underground,Circle Line,Yellow,Westminster
+London Underground,Circle Line,Yellow,St. James's Park
+London Underground,Circle Line,Yellow,Victoria
+London Underground,Circle Line,Yellow,Sloane Square
+London Underground,Circle Line,Yellow,South Kensington
+London Underground,Circle Line,Yellow,Gloucester Road
+London Underground,Circle Line,Yellow,High Street Kensington
+London Underground,Circle Line,Yellow,Notting Hill Gate
+London Underground,Circle Line,Yellow,Bayswater
+London Underground,Circle Line,Yellow,Paddington (Praed Street)
+London Underground,District Line,Green,Richmond
+London Underground,District Line,Green,Kew Gardens
+London Underground,District Line,Green,Gunnersbury
+London Underground,District Line,Green,Turnham Green
+London Underground,District Line,Green,Chiswick Park
+London Underground,District Line,Green,Acton Town
+London Underground,District Line,Green,Ealing Common
+London Underground,District Line,Green,Ealing Broadway
+London Underground,District Line,Green,South Ealing
+London Underground,District Line,Green,Northfields
+London Underground,District Line,Green,Boston Manor
+London Underground,District Line,Green,Osterley
+London Underground,District Line,Green,Hounslow East
+London Underground,District Line,Green,Hounslow Central
+London Underground,District Line,Green,Hounslow West
+London Underground,District Line,Green,Stamford Brook
+London Underground,District Line,Green,Ravenscourt Park
+London Underground,District Line,Green,Hammersmith
+London Underground,District Line,Green,Barons Court
+London Underground,District Line,Green,West Kensington
+London Underground,District Line,Green,Earl's Court
+London Underground,District Line,Green,Gloucester Road
+London Underground,District Line,Green,South Kensington
+London Underground,District Line,Green,Sloane Square
+London Underground,District Line,Green,Victoria
+London Underground,District Line,Green,St. James's Park
+London Underground,District Line,Green,Westminster
+London Underground,District Line,Green,Embankment
+London Underground,District Line,Green,Temple
+London Underground,District Line,Green,Blackfriars
+London Underground,District Line,Green,Mansion House
+London Underground,District Line,Green,Cannon Street
+London Underground,District Line,Green,Monument
+London Underground,District Line,Green,Tower Hill
+London Underground,District Line,Green,Aldgate East
+London Underground,District Line,Green,Whitechapel
+London Underground,District Line,Green,Stepney Green
+London Underground,District Line,Green,Mile End
+London Underground,District Line,Green,Bow Road
+London Underground,District Line,Green,Bromley-by-Bow
+London Underground,District Line,Green,West Ham
+London Underground,District Line,Green,Plaistow
+London Underground,District Line,Green,Upton Park
+London Underground,District Line,Green,East Ham
+London Underground,District Line,Green,Barking
+London Underground,District Line,Green,Upney
+London Underground,District Line,Green,Becontree
+London Underground,District Line,Green,Dagenham Heathway
+London Underground,District Line,Green,Dagenham East
+London Underground,District Line,Green,Elm Park
+London Underground,District Line,Green,Hornchurch
+London Underground,District Line,Green,Upminster Bridge
+London Underground,District Line,Green,Upminster
+London Underground,District Line,Green,High Street Kensington
+London Underground,District Line,Green,Notting Hill Gate
+London Underground,District Line,Green,Bayswater
+London Underground,District Line,Green,Paddington
+London Underground,District Line,Green,Edgware Road
+London Underground,District Line,Green,West Brompton
+London Underground,District Line,Green,Fulham Broadway
+London Underground,District Line,Green,Parsons Green
+London Underground,District Line,Green,Putney Bridge
+London Underground,District Line,Green,East Putney
+London Underground,District Line,Green,Southfields
+London Underground,District Line,Green,Wimbledon Park
+London Underground,District Line,Green,Wimbledon
+London Underground,Hammersmith & City Line,Pink,Hammersmith
+London Underground,Hammersmith & City Line,Pink,Goldhawk Road
+London Underground,Hammersmith & City Line,Pink,Shepherd's Bush Market
+London Underground,Hammersmith & City Line,Pink,Wood Lane
+London Underground,Hammersmith & City Line,Pink,Latimer Road
+London Underground,Hammersmith & City Line,Pink,Ladbroke Grove
+London Underground,Hammersmith & City Line,Pink,Westbourne Park
+London Underground,Hammersmith & City Line,Pink,Royal Oak
+London Underground,Hammersmith & City Line,Pink,Paddington
+London Underground,Hammersmith & City Line,Pink,Edgware Road
+London Underground,Hammersmith & City Line,Pink,Baker Street
+London Underground,Hammersmith & City Line,Pink,Great Portland Street
+London Underground,Hammersmith & City Line,Pink,Euston Square
+London Underground,Hammersmith & City Line,Pink,King's Cross St Pancras
+London Underground,Hammersmith & City Line,Pink,Farringdon
+London Underground,Hammersmith & City Line,Pink,Barbican
+London Underground,Hammersmith & City Line,Pink,Moorgate
+London Underground,Hammersmith & City Line,Pink,Liverpool Street
+London Underground,Hammersmith & City Line,Pink,Aldgate East
+London Underground,Hammersmith & City Line,Pink,Whitechapel
+London Underground,Hammersmith & City Line,Pink,Stepney Green
+London Underground,Hammersmith & City Line,Pink,Mile End
+London Underground,Hammersmith & City Line,Pink,Bow Road
+London Underground,Hammersmith & City Line,Pink,Bromley-by-Bow
+London Underground,Hammersmith & City Line,Pink,West Ham
+London Underground,Hammersmith & City Line,Pink,Plaistow
+London Underground,Hammersmith & City Line,Pink,Upton Park
+London Underground,Hammersmith & City Line,Pink,East Ham
+London Underground,Hammersmith & City Line,Pink,Barking
+London Underground,Jubilee Line,Silver,Stanmore
+London Underground,Jubilee Line,Silver,Canons Park
+London Underground,Jubilee Line,Silver,Queensbury
+London Underground,Jubilee Line,Silver,Kingsbury
+London Underground,Jubilee Line,Silver,Wembley Park
+London Underground,Jubilee Line,Silver,Neasden
+London Underground,Jubilee Line,Silver,Dollis Hill
+London Underground,Jubilee Line,Silver,Willesden Green
+London Underground,Jubilee Line,Silver,Kilburn
+London Underground,Jubilee Line,Silver,West Hampstead
+London Underground,Jubilee Line,Silver,Finchley Road
+London Underground,Jubilee Line,Silver,Swiss Cottage
+London Underground,Jubilee Line,Silver,St. John's Wood
+London Underground,Jubilee Line,Silver,Baker Street
+London Underground,Jubilee Line,Silver,Bond Street
+London Underground,Jubilee Line,Silver,Green Park
+London Underground,Jubilee Line,Silver,Westminster
+London Underground,Jubilee Line,Silver,Waterloo
+London Underground,Jubilee Line,Silver,Southwark
+London Underground,Jubilee Line,Silver,London Bridge
+London Underground,Jubilee Line,Silver,Bermondsey
+London Underground,Jubilee Line,Silver,Canada Water
+London Underground,Jubilee Line,Silver,Canary Wharf
+London Underground,Jubilee Line,Silver,North Greenwich
+London Underground,Jubilee Line,Silver,Canning Town
+London Underground,Jubilee Line,Silver,West Ham
+London Underground,Jubilee Line,Silver,Stratford
+London Underground,Metropolitan Line,Magenta,Aldgate
+London Underground,Metropolitan Line,Magenta,Liverpool Street
+London Underground,Metropolitan Line,Magenta,Moorgate
+London Underground,Metropolitan Line,Magenta,Barbican
+London Underground,Metropolitan Line,Magenta,Farringdon
+London Underground,Metropolitan Line,Magenta,King's Cross St Pancras
+London Underground,Metropolitan Line,Magenta,Euston Square
+London Underground,Metropolitan Line,Magenta,Great Portland Street
+London Underground,Metropolitan Line,Magenta,Baker Street
+London Underground,Metropolitan Line,Magenta,Finchley Road
+London Underground,Metropolitan Line,Magenta,Wembley Park
+London Underground,Metropolitan Line,Magenta,Preston Road
+London Underground,Metropolitan Line,Magenta,Northwick Park
+London Underground,Metropolitan Line,Magenta,Harrow-on-the-Hill
+London Underground,Metropolitan Line,Magenta,West Harrow
+London Underground,Metropolitan Line,Magenta,Rayners Lane
+London Underground,Metropolitan Line,Magenta,Eastcote
+London Underground,Metropolitan Line,Magenta,Ruislip Manor
+London Underground,Metropolitan Line,Magenta,Ruislip
+London Underground,Metropolitan Line,Magenta,Ickenham
+London Underground,Metropolitan Line,Magenta,Hillingdon
+London Underground,Metropolitan Line,Magenta,Uxbridge
+London Underground,Metropolitan Line,Magenta,North Harrow
+London Underground,Metropolitan Line,Magenta,Pinner
+London Underground,Metropolitan Line,Magenta,Northwood Hills
+London Underground,Metropolitan Line,Magenta,Northwood
+London Underground,Metropolitan Line,Magenta,Moor Park
+London Underground,Metropolitan Line,Magenta,Croxley
+London Underground,Metropolitan Line,Magenta,Watford
+London Underground,Metropolitan Line,Magenta,Rickmansworth
+London Underground,Metropolitan Line,Magenta,Chorleywood
+London Underground,Metropolitan Line,Magenta,Chalfont & Latimer
+London Underground,Metropolitan Line,Magenta,Chesham
+London Underground,Metropolitan Line,Magenta,Amersham
+London Underground,Northern Line,Black,High Barnet
+London Underground,Northern Line,Black,Totteridge & Whetstone
+London Underground,Northern Line,Black,Woodside Park
+London Underground,Northern Line,Black,West Finchley
+London Underground,Northern Line,Black,Finchley Central
+London Underground,Northern Line,Black,East Finchley
+London Underground,Northern Line,Black,Highgate
+London Underground,Northern Line,Black,Archway
+London Underground,Northern Line,Black,Tufnell Park
+London Underground,Northern Line,Black,Kentish Town
+London Underground,Northern Line,Black,Camden Town
+London Underground,Northern Line,Black,Mornington Crescent
+London Underground,Northern Line,Black,Euston
+London Underground,Northern Line,Black,Warren Street
+London Underground,Northern Line,Black,Goodge Street
+London Underground,Northern Line,Black,Tottenham Court Road
+London Underground,Northern Line,Black,Leicester Square
+London Underground,Northern Line,Black,Charing Cross
+London Underground,Northern Line,Black,Embankment
+London Underground,Northern Line,Black,Waterloo
+London Underground,Northern Line,Black,Kennington
+London Underground,Northern Line,Black,Oval
+London Underground,Northern Line,Black,Stockwell
+London Underground,Northern Line,Black,Clapham North
+London Underground,Northern Line,Black,Clapham Common
+London Underground,Northern Line,Black,Clapham South
+London Underground,Northern Line,Black,Balham
+London Underground,Northern Line,Black,Tooting Bec
+London Underground,Northern Line,Black,Tooting Broadway
+London Underground,Northern Line,Black,Colliers Wood
+London Underground,Northern Line,Black,South Wimbledon
+London Underground,Northern Line,Black,Morden
+London Underground,Northern Line,Black,Mill Hill East
+London Underground,Northern Line,Black,Edgware
+London Underground,Northern Line,Black,Burnt Oak
+London Underground,Northern Line,Black,Colindale
+London Underground,Northern Line,Black,Hendon Central
+London Underground,Northern Line,Black,Brent Cross
+London Underground,Northern Line,Black,Golders Green
+London Underground,Northern Line,Black,Hampstead
+London Underground,Northern Line,Black,Belsize Park
+London Underground,Northern Line,Black,Chalk Farm
+London Underground,Northern Line,Black,Borough
+London Underground,Northern Line,Black,Elephant & Castle
+London Underground,Northern Line,Black,London Bridge
+London Underground,Northern Line,Black,Bank
+London Underground,Northern Line,Black,Moorgate
+London Underground,Northern Line,Black,Old Street
+London Underground,Northern Line,Black,Angel
+London Underground,Northern Line,Black,King's Cross St Pancras
+London Underground,Northern Line,Black,Nine Elms
+London Underground,Northern Line,Black,Battersea Power Station
+London Underground,Piccadilly Line,Dark Blue,Uxbridge
+London Underground,Piccadilly Line,Dark Blue,Hillingdon
+London Underground,Piccadilly Line,Dark Blue,Ickenham
+London Underground,Piccadilly Line,Dark Blue,Ruislip
+London Underground,Piccadilly Line,Dark Blue,Ruislip Manor
+London Underground,Piccadilly Line,Dark Blue,Eastcote
+London Underground,Piccadilly Line,Dark Blue,Rayners Lane
+London Underground,Piccadilly Line,Dark Blue,South Harrow
+London Underground,Piccadilly Line,Dark Blue,Sudbury Hill
+London Underground,Piccadilly Line,Dark Blue,Sudbury Town
+London Underground,Piccadilly Line,Dark Blue,Alperton
+London Underground,Piccadilly Line,Dark Blue,Park Royal
+London Underground,Piccadilly Line,Dark Blue,North Ealing
+London Underground,Piccadilly Line,Dark Blue,Ealing Common
+London Underground,Piccadilly Line,Dark Blue,Acton Town
+London Underground,Piccadilly Line,Dark Blue,Turnham Green
+London Underground,Piccadilly Line,Dark Blue,Hammersmith
+London Underground,Piccadilly Line,Dark Blue,Barons Court
+London Underground,Piccadilly Line,Dark Blue,Earl's Court
+London Underground,Piccadilly Line,Dark Blue,Gloucester Road
+London Underground,Piccadilly Line,Dark Blue,South Kensington
+London Underground,Piccadilly Line,Dark Blue,Knightsbridge
+London Underground,Piccadilly Line,Dark Blue,Hyde Park Corner
+London Underground,Piccadilly Line,Dark Blue,Green Park
+London Underground,Piccadilly Line,Dark Blue,Piccadilly Circus
+London Underground,Piccadilly Line,Dark Blue,Leicester Square
+London Underground,Piccadilly Line,Dark Blue,Covent Garden
+London Underground,Piccadilly Line,Dark Blue,Holborn
+London Underground,Piccadilly Line,Dark Blue,Russell Square
+London Underground,Piccadilly Line,Dark Blue,King's Cross St Pancras
+London Underground,Piccadilly Line,Dark Blue,Caledonian Road
+London Underground,Piccadilly Line,Dark Blue,Holloway Road
+London Underground,Piccadilly Line,Dark Blue,Arsenal
+London Underground,Piccadilly Line,Dark Blue,Finsbury Park
+London Underground,Piccadilly Line,Dark Blue,Manor House
+London Underground,Piccadilly Line,Dark Blue,Turnpike Lane
+London Underground,Piccadilly Line,Dark Blue,Wood Green
+London Underground,Piccadilly Line,Dark Blue,Bounds Green
+London Underground,Piccadilly Line,Dark Blue,Arnos Grove
+London Underground,Piccadilly Line,Dark Blue,Southgate
+London Underground,Piccadilly Line,Dark Blue,Oakwood
+London Underground,Piccadilly Line,Dark Blue,Cockfosters
+London Underground,Piccadilly Line,Dark Blue,Hatton Cross
+London Underground,Piccadilly Line,Dark Blue,Heathrow Terminals 2 & 3
+London Underground,Piccadilly Line,Dark Blue,Heathrow Terminal 4
+London Underground,Piccadilly Line,Dark Blue,Heathrow Terminal 5
+London Underground,Piccadilly Line,Dark Blue,Boston Manor
+London Underground,Piccadilly Line,Dark Blue,Osterley
+London Underground,Piccadilly Line,Dark Blue,Hounslow East
+London Underground,Piccadilly Line,Dark Blue,Hounslow Central
+London Underground,Piccadilly Line,Dark Blue,Hounslow West
+London Underground,Piccadilly Line,Dark Blue,Northfields
+London Underground,Piccadilly Line,Dark Blue,South Ealing
+London Underground,Victoria Line,Light Blue,Walthamstow Central
+London Underground,Victoria Line,Light Blue,Blackhorse Road
+London Underground,Victoria Line,Light Blue,Tottenham Hale
+London Underground,Victoria Line,Light Blue,Seven Sisters
+London Underground,Victoria Line,Light Blue,Finsbury Park
+London Underground,Victoria Line,Light Blue,Highbury & Islington
+London Underground,Victoria Line,Light Blue,King's Cross St Pancras
+London Underground,Victoria Line,Light Blue,Euston
+London Underground,Victoria Line,Light Blue,Warren Street
+London Underground,Victoria Line,Light Blue,Oxford Circus
+London Underground,Victoria Line,Light Blue,Green Park
+London Underground,Victoria Line,Light Blue,Victoria
+London Underground,Victoria Line,Light Blue,Pimlico
+London Underground,Victoria Line,Light Blue,Vauxhall
+London Underground,Victoria Line,Light Blue,Stockwell
+London Underground,Victoria Line,Light Blue,Brixton
+London Underground,Waterloo & City Line,Teal,Waterloo
+London Underground,Waterloo & City Line,Teal,Bank
+London Overground,Lioness Line,Yellow,Watford Junction
+London Overground,Lioness Line,Yellow,Watford High Street
+London Overground,Lioness Line,Yellow,Bushey
+London Overground,Lioness Line,Yellow,Carpenders Park
+London Overground,Lioness Line,Yellow,Hatch End
+London Overground,Lioness Line,Yellow,Headstone Lane
+London Overground,Lioness Line,Yellow,Harrow & Wealdstone
+London Overground,Lioness Line,Yellow,Kenton
+London Overground,Lioness Line,Yellow,South Kenton
+London Overground,Lioness Line,Yellow,North Wembley
+London Overground,Lioness Line,Yellow,Wembley Central
+London Overground,Lioness Line,Yellow,Stonebridge Park
+London Overground,Lioness Line,Yellow,Harlesden
+London Overground,Lioness Line,Yellow,Willesden Junction
+London Overground,Lioness Line,Yellow,Kensal Green
+London Overground,Lioness Line,Yellow,Queen's Park
+London Overground,Lioness Line,Yellow,Kilburn High Road
+London Overground,Lioness Line,Yellow,South Hampstead
+London Overground,Lioness Line,Yellow,Euston
+London Overground,Mildmay Line,Blue,Stratford
+London Overground,Mildmay Line,Blue,Hackney Wick
+London Overground,Mildmay Line,Blue,Homerton
+London Overground,Mildmay Line,Blue,Hackney Central
+London Overground,Mildmay Line,Blue,Dalston Kingsland
+London Overground,Mildmay Line,Blue,Canonbury
+London Overground,Mildmay Line,Blue,Highbury & Islington
+London Overground,Mildmay Line,Blue,Caledonian Road & Barnsbury
+London Overground,Mildmay Line,Blue,Camden Road
+London Overground,Mildmay Line,Blue,Kentish Town West
+London Overground,Mildmay Line,Blue,Gospel Oak
+London Overground,Mildmay Line,Blue,Hampstead Heath
+London Overground,Mildmay Line,Blue,Finchley Road & Frognal
+London Overground,Mildmay Line,Blue,West Hampstead
+London Overground,Mildmay Line,Blue,Brondesbury
+London Overground,Mildmay Line,Blue,Brondesbury Park
+London Overground,Mildmay Line,Blue,Kensal Rise
+London Overground,Mildmay Line,Blue,Willesden Junction
+London Overground,Mildmay Line,Blue,Acton Central
+London Overground,Mildmay Line,Blue,South Acton
+London Overground,Mildmay Line,Blue,Gunnersbury
+London Overground,Mildmay Line,Blue,Kew Gardens
+London Overground,Mildmay Line,Blue,Richmond
+London Overground,Mildmay Line,Blue,Shepherd's Bush
+London Overground,Mildmay Line,Blue,Kensington (Olympia)
+London Overground,Mildmay Line,Blue,West Brompton
+London Overground,Mildmay Line,Blue,Imperial Wharf
+London Overground,Mildmay Line,Blue,Clapham Junction
+London Overground,Windrush Line,Red,Highbury & Islington
+London Overground,Windrush Line,Red,Canonbury
+London Overground,Windrush Line,Red,Dalston Junction
+London Overground,Windrush Line,Red,Haggerston
+London Overground,Windrush Line,Red,Hoxton
+London Overground,Windrush Line,Red,Shoreditch High Street
+London Overground,Windrush Line,Red,Whitechapel
+London Overground,Windrush Line,Red,Shadwell
+London Overground,Windrush Line,Red,Wapping
+London Overground,Windrush Line,Red,Rotherhithe
+London Overground,Windrush Line,Red,Canada Water
+London Overground,Windrush Line,Red,Surrey Quays
+London Overground,Windrush Line,Red,Queens Road Peckham
+London Overground,Windrush Line,Red,Peckham Rye
+London Overground,Windrush Line,Red,Denmark Hill
+London Overground,Windrush Line,Red,Clapham High Street
+London Overground,Windrush Line,Red,Wandsworth Road
+London Overground,Windrush Line,Red,Clapham Junction
+London Overground,Windrush Line,Red,New Cross
+London Overground,Windrush Line,Red,New Cross Gate
+London Overground,Windrush Line,Red,Brockley
+London Overground,Windrush Line,Red,Honor Oak Park
+London Overground,Windrush Line,Red,Forest Hill
+London Overground,Windrush Line,Red,Sydenham
+London Overground,Windrush Line,Red,Crystal Palace
+London Overground,Windrush Line,Red,Penge West
+London Overground,Windrush Line,Red,Anerley
+London Overground,Windrush Line,Red,Norwood Junction
+London Overground,Windrush Line,Red,West Croydon
+London Overground,Weaver Line,Green,Liverpool Street
+London Overground,Weaver Line,Green,Bethnal Green
+London Overground,Weaver Line,Green,Cambridge Heath
+London Overground,Weaver Line,Green,London Fields
+London Overground,Weaver Line,Green,Hackney Downs
+London Overground,Weaver Line,Green,Rectory Road
+London Overground,Weaver Line,Green,Stoke Newington
+London Overground,Weaver Line,Green,Stamford Hill
+London Overground,Weaver Line,Green,Seven Sisters
+London Overground,Weaver Line,Green,Bruce Grove
+London Overground,Weaver Line,Green,White Hart Lane
+London Overground,Weaver Line,Green,Silver Street
+London Overground,Weaver Line,Green,Edmonton Green
+London Overground,Weaver Line,Green,Southbury
+London Overground,Weaver Line,Green,Turkey Street
+London Overground,Weaver Line,Green,Theobalds Grove
+London Overground,Weaver Line,Green,Cheshunt
+London Overground,Weaver Line,Green,Clapton
+London Overground,Weaver Line,Green,St James Street
+London Overground,Weaver Line,Green,Walthamstow Central
+London Overground,Weaver Line,Green,Wood Street
+London Overground,Weaver Line,Green,Highams Park
+London Overground,Weaver Line,Green,Chingford
+London Overground,Weaver Line,Green,Enfield Town
+London Overground,Suffragette Line,Maroon,Gospel Oak
+London Overground,Suffragette Line,Maroon,Upper Holloway
+London Overground,Suffragette Line,Maroon,Crouch Hill
+London Overground,Suffragette Line,Maroon,Harringay Green Lanes
+London Overground,Suffragette Line,Maroon,South Tottenham
+London Overground,Suffragette Line,Maroon,Blackhorse Road
+London Overground,Suffragette Line,Maroon,Walthamstow Queens Road
+London Overground,Suffragette Line,Maroon,Leyton Midland Road
+London Overground,Suffragette Line,Maroon,Leytonstone High Road
+London Overground,Suffragette Line,Maroon,Wanstead Park
+London Overground,Suffragette Line,Maroon,Woodgrange Park
+London Overground,Suffragette Line,Maroon,Barking
+London Overground,Liberty Line,Grey,Romford
+London Overground,Liberty Line,Grey,Emerson Park
+London Overground,Liberty Line,Grey,Upminster
