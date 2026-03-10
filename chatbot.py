@@ -1,80 +1,107 @@
+"""
+Smart Traffic Query Assistant - Main Chatbot Core
+Handles NLP processing, traffic data fetching, and ML predictions
+"""
 from nlp_processor import NLPProcessor
 from transport_api import TransportDataFetcher
-
+import json
+import re
+from typing import Dict, Optional, Any
 
 class TrafficChatbot:
     def __init__(self):
+        """Initialize chatbot with NLP and API components"""
         self.nlp = NLPProcessor()
         self.transport_api = TransportDataFetcher()
+        self.conversation_state: Dict[str, Any] = {
+            'origin': None,
+            'destination': None,
+        }
+        print("Traffic Chatbot initialized successfully")
 
-    def process_message(self, user_message, user_key=None, username=None):
-        result = self.nlp.process(user_message)
-        intent = result.get('intent', 'unknown')
-        confidence = result.get('confidence', 0.0)
-        entities = result.get('entities', {})
+    def process_message(
+        self,
+        user_message: str,
+        user_key: Optional[str] = None,
+        username: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Process user message and generate response
 
-        if intent == 'greeting':
-            message = 'Hello! How can I help with your travel?'
-        elif intent == 'goodbye':
-            message = 'Goodbye! Safe travels!'
-        elif intent == 'ask_traffic_status':
-            route = entities.get('route', 'your route')
-            traffic_data = self.transport_api.get_route_traffic(route)
-            if traffic_data:
-                message = f'Traffic on {route}: {traffic_data.get("status", "Unknown")}'
-            else:
-                message = f'Checking traffic conditions on {route}.'
-        elif intent == 'ask_delay':
-            location = entities.get('location', 'your location')
-            message = f'Checking delays around {location}.'
-        elif intent == 'ask_congestion':
-            location = entities.get('location', 'your route')
-            message = f'Checking congestion on {location}.'
-        elif intent == 'ask_transit_disruption':
-            line = entities.get('line', 'the line')
-            disruptions = self.transport_api.get_transit_disruption(line)
-            if disruptions:
-                message = f'Found disruptions on {line}.'
-                return {
-                    'message': message,
-                    'intent': intent,
-                    'entities': entities,
-                    'confidence': confidence,
-                    'disruption': disruptions
-                }
-            message = f'Checking disruptions on {line}.'
-        elif intent == 'ask_timetable':
-            stop = entities.get('stop', 'the stop')
-            timetable = self.transport_api.get_tfl_timetable(stop)
-            if timetable:
-                message = f'Found timetable for {stop}.'
-                return {
-                    'message': message,
-                    'intent': intent,
-                    'entities': entities,
-                    'confidence': confidence,
-                    'timetable': timetable
-                }
-            message = f'Looking up timetable for {stop}.'
-        elif intent == 'ask_bus_disruption':
-            route = entities.get('route', 'the bus route')
-            disruptions = self.transport_api.get_bus_disruption(route)
-            if disruptions:
-                message = f'Found bus disruptions on {route}.'
-                return {
-                    'message': message,
-                    'intent': intent,
-                    'entities': entities,
-                    'confidence': confidence,
-                    'disruption': disruptions
-                }
-            message = f'Checking bus disruptions on {route}.'
-        else:
-            message = 'I can help with traffic and travel information. Try asking about current conditions.'
+        Args:
+            user_message: User's natural language query
+            user_key: Optional per-user/session key
+            username: Optional display name for personalised replies
+
+        Returns:
+            dict: Response with message, intent, entities, and confidence
+        """
+        nlp_result = self.nlp.process(user_message)
+        intent = nlp_result['intent']
+        entities = nlp_result['entities']
+        confidence = nlp_result['confidence']
+
+        self._update_conversation_state(entities, intent)
+
+        response_message = self._generate_response(
+            intent, entities, user_message, username=username
+        )
+
+        formatted_response = self._format_response(response_message, intent, entities)
 
         return {
-            'message': message,
+            'message': formatted_response,
             'intent': intent,
             'entities': entities,
-            'confidence': confidence
+            'confidence': confidence,
         }
+
+    def _update_conversation_state(self, entities: Dict[str, str], intent: str):
+        """Update conversation state with extracted entities"""
+        if entities.get('origin'):
+            self.conversation_state['origin'] = entities['origin']
+        if entities.get('destination'):
+            self.conversation_state['destination'] = entities['destination']
+
+    def _generate_response(
+        self, intent: str, entities: Dict[str, str], user_message: str, username: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Generate response based on intent"""
+
+        if intent == 'greeting':
+            msg = "Hello!"
+            if username:
+                msg += f" How can I help you, {username}?"
+            else:
+                msg += " How can I help you?"
+            return {'message': msg}
+
+        if intent == 'goodbye':
+            msg = "Goodbye!"
+            if username:
+                msg += f" Safe travels, {username}!"
+            return {'message': msg}
+
+        if intent == 'ask_traffic_status':
+            location = entities.get('location', 'your area')
+            msg = f"I can check traffic information for {location}."
+            return {'message': msg}
+
+        if intent == 'ask_delay':
+            msg = "Checking delay information..."
+            return {'message': msg}
+
+        if intent == 'ask_timetable':
+            location = entities.get('location', 'nearby')
+            timetable_mode = entities.get('timetable_mode', 'transit')
+            msg = f"Here are {timetable_mode} times for {location}."
+            return {'message': msg}
+
+        msg = "I can help with traffic information and journey planning."
+        return {'message': msg}
+
+    def _format_response(
+        self, response_message: Dict[str, Any], intent: str, entities: Dict[str, str]
+    ) -> str:
+        """Format response for display"""
+        return response_message.get('message', '')

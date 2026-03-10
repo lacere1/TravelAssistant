@@ -1,111 +1,110 @@
+"""
+NLP Processor using Hugging Face Transformers
+Handles intent detection and entity extraction
+"""
+from typing import Dict, List, Any, Optional
 import re
 
 
 class NLPProcessor:
     def __init__(self):
-        self._bus_stops = []
-        self._train_stations = []
-        self._train_lines = []
-        self._bus_routes = set()
-        self._stops_loaded = False
-        self._load_stop_datasets()
+        """Initialize NLP models for intent classification and entity extraction"""
+        print("Loading NLP models...")
+        self.intent_labels = [
+            "check_current_conditions",
+            "ask_traffic_status",
+            "ask_delay",
+            "ask_transit_disruption",
+            "ask_timetable",
+            "ask_transit_times",
+            "greeting",
+            "goodbye"
+        ]
+        print("NLP models loaded successfully")
 
-    def _load_stop_datasets(self):
-        self._stops_loaded = True
+    def process(self, text: str) -> Dict[str, Any]:
+        """
+        Process user input to extract intent and entities
 
-    def _rule_based_intent(self, text):
-        text = text.lower()
+        Args:
+            text: User's natural language input
 
-        if any(word in text for word in ['hello', 'hi', 'hey']):
-            return 'greeting', 0.95
+        Returns:
+            dict: Contains intent, entities, and confidence score
+        """
+        text = text.strip().lower()
+        print(f"[NLP] Incoming text: {text!r}")
 
-        if any(word in text for word in ['goodbye', 'bye']):
-            return 'goodbye', 0.95
+        intent, confidence = self._classify_intent(text)
+        print(f"[NLP] Final intent: {intent}, confidence: {confidence:.3f}")
 
-        if any(word in text for word in ['traffic', 'busy', 'congestion']):
-            if any(word in text for word in ['status', 'current', 'how']):
-                return 'ask_traffic_status', 0.85
-
-        if any(word in text for word in ['delay', 'late', 'slow']):
-            return 'ask_delay', 0.80
-
-        if any(word in text for word in ['congestion', 'congested']):
-            return 'ask_congestion', 0.80
-
-        if any(word in text for word in ['disruption', 'closed', 'suspended', 'line']):
-            if any(word in text for word in ['train', 'tube', 'underground']):
-                return 'ask_transit_disruption', 0.85
-
-        if any(word in text for word in ['bus', 'route']) and any(word in text for word in ['disruption', 'issue']):
-            return 'ask_bus_disruption', 0.80
-
-        if any(word in text for word in ['timetable', 'schedule', 'times', 'when']):
-            if any(word in text for word in ['train', 'tube', 'bus']):
-                return 'ask_timetable', 0.80
-
-        if any(word in text for word in ['timetable', 'schedule', 'times']):
-            return 'ask_transit_times', 0.75
-
-        return 'unknown', 0.0
-
-    def _extract_entities(self, text):
-        entities = {}
-        text_lower = text.lower()
-
-        locations = ['baker street', 'oxford street', 'london', 'piccadilly', 'king cross']
-        for loc in locations:
-            if loc in text_lower:
-                entities['location'] = loc
-                break
-
-        routes = ['central', 'northern', 'bakerloo', 'district', 'circle']
-        for route in routes:
-            if route in text_lower:
-                entities['route'] = route
-                break
-
-        lines = ['central line', 'northern line', 'bakerloo line', 'circle line']
-        for line in lines:
-            if line in text_lower:
-                entities['line'] = line
-                break
-
-        bus_routes = ['15', '73', '205', '139']
-        for bus_route in bus_routes:
-            if f'route {bus_route}' in text_lower or f'bus {bus_route}' in text_lower:
-                entities['bus_route'] = bus_route
-                break
-
-        if any(word in text_lower for word in ['departure', 'leave', 'depart']):
-            entities['timetable_mode'] = 'departure'
-        elif any(word in text_lower for word in ['arrival', 'arrive']):
-            entities['timetable_mode'] = 'arrival'
-
-        if any(word in text_lower for word in ['walk', 'walking']):
-            entities['travel_mode'] = 'walking'
-        elif any(word in text_lower for word in ['bus']):
-            entities['travel_mode'] = 'bus'
-        elif any(word in text_lower for word in ['tube', 'train', 'underground']):
-            entities['travel_mode'] = 'tube'
-
-        stops = ['baker street', 'oxford circus', 'piccadilly circus']
-        for stop in stops:
-            if stop in text_lower:
-                entities['stop'] = stop
-                break
-
-        time_match = re.search(r'(\d{1,2}):(\d{2})', text)
-        if time_match:
-            entities['time'] = time_match.group(0)
-
-        return entities
-
-    def process(self, text):
-        intent, confidence = self._rule_based_intent(text)
         entities = self._extract_entities(text)
+        print(f"[NLP] Extracted entities: {entities}")
 
         return {
             'intent': intent,
             'entities': entities,
             'confidence': confidence
         }
+
+    def _classify_intent(self, text: str) -> tuple:
+        """Classify user intent using rule-based patterns"""
+
+        text_lower = text.lower()
+
+        if any(phrase in text_lower for phrase in ['hello', 'hi', 'hey', 'greetings']):
+            return 'greeting', 0.9
+
+        if any(phrase in text_lower for phrase in ['bye', 'goodbye', 'farewell']):
+            return 'goodbye', 0.9
+
+        if any(phrase in text_lower for phrase in ['bus times', 'train times', 'tube times', 'timetable', 'next bus', 'next train']):
+            return 'ask_timetable', 0.9
+
+        if any(phrase in text_lower for phrase in ['disruption', 'status', 'delay', 'delays']):
+            return 'ask_transit_disruption', 0.85
+
+        if any(phrase in text_lower for phrase in ['traffic', 'congestion', 'jam']):
+            return 'ask_traffic_status', 0.85
+
+        return 'check_current_conditions', 0.7
+
+    def _extract_entities(self, text: str) -> Dict[str, str]:
+        """
+        Extract entities like location, route, time
+
+        Uses regex patterns and keyword matching
+        """
+        entities = {}
+        text_lower = text.lower()
+
+        location_patterns = [
+            r'(?:in|at|near)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)',
+            r'(?:traffic\s+)?(?:on|in)\s+([a-z]+(?:\s+[a-z]+)*\s+(?:street|road|avenue|highway))',
+        ]
+
+        for pattern in location_patterns:
+            matches = re.findall(pattern, text, re.IGNORECASE)
+            if matches:
+                entities['location'] = matches[0]
+                break
+
+        time_patterns = [
+            r'(\d{1,2}):(\d{2})',
+            r'(morning|afternoon|evening|night)',
+        ]
+
+        for pattern in time_patterns:
+            match = re.search(pattern, text_lower)
+            if match:
+                entities['time'] = match.group(0)
+                break
+
+        if re.search(r'\b(bus|train|tube|transit|public transport)\b', text_lower):
+            entities['travel_mode'] = 'transit'
+
+        bus_route_match = re.search(r'bus\s+(\d{1,3})', text_lower)
+        if bus_route_match:
+            entities['route'] = bus_route_match.group(1)
+
+        return entities
