@@ -1,7 +1,8 @@
 """
 Journey planner backend integrated into the main app.
 
-This file brings over the TfL journey-planning chatbot and the TfL Journey API wrapper.
+This file brings over the TfL journey-planning chatbot with datetime NLP
+and location disambiguation.
 """
 
 from __future__ import annotations
@@ -32,10 +33,68 @@ class JourneySummary:
     legs: List[JourneyLeg]
 
 
+def parse_datetime_text(text: str, now: datetime) -> Optional[dict]:
+    """
+    Lightweight parser for phrases like:
+    - 'now'
+    - 'tomorrow 9am'
+    - 'today 18:30'
+    - 'arrive by 6pm'
+    """
+    t = text.strip().lower()
+
+    if t == "now":
+        return {"datetime": now, "timeIs": "Departing"}
+
+    time_is = "Departing"
+    if t.startswith("arrive by"):
+        time_is = "Arriving"
+        t = t.replace("arrive by", "", 1).strip()
+
+    day = now.date()
+    if t.startswith("tomorrow"):
+        day = (now + timedelta(days=1)).date()
+        t = t.replace("tomorrow", "", 1).strip()
+    elif t.startswith("today"):
+        day = now.date()
+        t = t.replace("today", "", 1).strip()
+
+    t = t.strip()
+    if not t:
+        dt = datetime.combine(day, now.time())
+        return {"datetime": dt, "timeIs": time_is}
+
+    m = re.match(r"^(\d{1,2})(?::(\d{2}))?\s*(am|pm)?$", t)
+    if not m:
+        return None
+
+    hour = int(m.group(1))
+    minute = int(m.group(2) or 0)
+    ampm = m.group(3)
+
+    if ampm:
+        if ampm == "pm" and hour < 12:
+            hour += 12
+        if ampm == "am" and hour == 12:
+            hour = 0
+
+    try:
+        dt = datetime(
+            year=day.year,
+            month=day.month,
+            day=day.day,
+            hour=hour,
+            minute=minute,
+        )
+    except ValueError:
+        return None
+
+    return {"datetime": dt, "timeIs": time_is}
+
+
 class TflJourneyClient:
     """
     Thin wrapper around TfL Journey Planner endpoints.
-    You will need to set TFL_APP_ID and TFL_APP_KEY as environment variables.
     """
 
     def __init__(self):
@@ -46,8 +105,8 @@ class TflJourneyClient:
 
     def disambiguate_location(self, query: str) -> List[Dict[str, Any]]:
         """
-        Calls the journey results endpoint with a free-text location to let TfL
-        perform disambiguation. Returns a list of options with id/name/qualifier.
+        Calls the journey results endpoint with a free-text location.
+        Returns a list of options with id/name.
         """
         if not query:
             return []
@@ -180,7 +239,7 @@ def _parse_tfl_iso(s: str | None) -> datetime | None:
 
 class JourneyChatbot:
     """
-    Simple stateful dialogue manager for a TfL journey-planning assistant.
+    Stateful dialogue manager for a TfL journey-planning assistant.
     """
 
     def __init__(self):
@@ -192,16 +251,52 @@ class JourneyChatbot:
     ) -> Dict[str, Any]:
         """
         Core entry point called from Flask.
-
-        Returns a JSON structure the frontend can render.
         """
         user_state = self.state["global"]
 
-        self._apply_full_plan_if_present(text, user_state)
+        self._apply_full_plan_if_present(text, user_state, now)
         if "fromQuery" not in user_state or "toQuery" not in user_state:
             self._maybe_extract_initial_intent(text, user_state)
 
         return self._continue_planning(text, user_state, now, username=username)
+
+    def handle_structured_journey(
+        self,
+        from_text: str,
+        to_text: str,
+        date_str: str | None,
+        time_str: str | None,
+        now: datetime,
+        username: str | None = None,
+    ) -> Dict[str, Any]:
+        """
+        Entry point for structured inputs from the From/To/When text boxes.
+        """
+        user_state = self.state["global"]
+        for key in ("fromQuery", "toQuery", "fromLocationId", "toLocationId", "fromOptions", "toOptions", "when"):
+            user_state.pop(key, None)
+
+        user_state["fromQuery"] = from_text.strip()
+        user_state["toQuery"] = to_text.strip()
+
+        when = None
+        if date_str and time_str:
+            try:
+                dt = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
+                when = {"datetime": dt, "timeIs": "Departing"}
+            except ValueError:
+                when = None
+        if when is None:
+            when = {"datetime": now, "timeIs": "Departing"}
+
+        user_state["when"] = when
+
+        return self._continue_planning(
+            text=f"Plan a journey from {from_text} to {to_text}",
+            user_state=user_state,
+            now=now,
+            username=username,
+        )
 
     def _continue_planning(
         self,
@@ -246,9 +341,10 @@ class JourneyChatbot:
             out["tfl_journey_url"] = self.tfl_client.last_url
         return out
 
-    def _apply_full_plan_if_present(self, text: str, user_state: Dict[str, Any]) -> None:
+    def _apply_full_plan_if_present(self, text: str, user_state: Dict[str, Any], now: datetime) -> None:
         """
         If the message looks like "Plan a journey from X to Y", set fromQuery and toQuery.
+        Also parse datetime if present.
         """
         lowered = text.lower().strip()
         if " from " not in lowered or " to " not in lowered:
@@ -262,10 +358,30 @@ class JourneyChatbot:
         from_part = from_part.strip()
         to_part = to_part.strip()
 
+        to_part = re.sub(
+            r"\s+on\s+\d{4}-\d{2}-\d{2}\s+at\s+\d{1,2}:\d{2}\s*$",
+            "",
+            to_part,
+            flags=re.IGNORECASE,
+        )
+        to_part = re.sub(
+            r"\s+at\s+\d{1,2}:\d{2}\s*$", "", to_part, flags=re.IGNORECASE
+        )
+        to_part = to_part.strip()
+
         orig = text.strip()
         try:
             _, after_from_orig = orig.split(" from ", 1)
             from_orig, to_orig = after_from_orig.split(" to ", 1)
+            to_orig = re.sub(
+                r"\s+on\s+\d{4}-\d{2}-\d{2}\s+at\s+\d{1,2}:\d{2}\s*$",
+                "",
+                to_orig,
+                flags=re.IGNORECASE,
+            )
+            to_orig = re.sub(
+                r"\s+at\s+\d{1,2}:\d{2}\s*$", "", to_orig, flags=re.IGNORECASE
+            )
             user_state["fromQuery"] = from_orig.strip()
             user_state["toQuery"] = to_orig.strip()
         except ValueError:
@@ -275,9 +391,13 @@ class JourneyChatbot:
         for key in ("fromLocationId", "toLocationId", "fromOptions", "toOptions", "when"):
             user_state.pop(key, None)
 
+        when = _parse_on_date_time(text)
+        if when is not None:
+            user_state["when"] = when
+
     def _maybe_extract_initial_intent(self, text: str, user_state: Dict[str, Any]):
         """
-        Look for patterns like 'from X to Y' in the initial sentence.
+        Look for patterns like 'from X to Y'.
         """
         lowered = text.lower()
         if " from " in lowered and " to " in lowered:
@@ -294,7 +414,6 @@ class JourneyChatbot:
     ) -> Dict[str, Any]:
         """
         Handles both asking disambiguation questions and interpreting answers.
-        key_prefix is 'from' or 'to'.
         """
         query_key = f"{key_prefix}Query"
         chosen_id_key = f"{key_prefix}LocationId"
@@ -358,17 +477,41 @@ class JourneyChatbot:
         self, text: str, user_state: Dict[str, Any], now: datetime
     ) -> Dict[str, Any]:
         """
-        Ask for date+time.
+        Ask for or parse date+time.
         """
         if "askedWhen" not in user_state:
             user_state["askedWhen"] = True
             return {
-                "reply": "When are you travelling?",
+                "reply": "When are you travelling? You can say 'now', 'tomorrow 9am', or 'arrive by 6pm'.",
                 "journeys": [],
             }
 
-        user_state["when"] = {"datetime": now, "timeIs": "Departing"}
+        parsed = parse_datetime_text(text, now=now)
+        if not parsed:
+            return {
+                "reply": "I didn't quite catch the time. Try 'now', 'tomorrow 9am', or 'arrive by 6pm'.",
+                "journeys": [],
+            }
+
+        user_state["when"] = parsed
         return {
             "reply": "Great.",
             "journeys": [],
         }
+
+
+def _parse_on_date_time(text: str) -> Dict[str, Any] | None:
+    """If text ends with ' on YYYY-MM-DD at H:MM', parse and return when dict."""
+    text = text.strip()
+    m = re.search(
+        r"\s+on\s+(\d{4}-\d{2}-\d{2})\s+at\s+(\d{1,2}:\d{2})\s*$", text, re.IGNORECASE
+    )
+    if m:
+        try:
+            dt = datetime.strptime(
+                m.group(1) + " " + m.group(2), "%Y-%m-%d %H:%M"
+            )
+            return {"datetime": dt, "timeIs": "Departing"}
+        except ValueError:
+            pass
+    return None

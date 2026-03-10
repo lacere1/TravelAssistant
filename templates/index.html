@@ -7,111 +7,160 @@
     <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 </head>
 <body>
-    <div class="container">
-        <header>
-            <h1>Travel assistant</h1>
-            <p class="subtitle">Practical help with routes, traffic, and planning your journeys</p>
-        </header>
+    <div class="app-shell">
+        <aside class="sidebar" aria-label="Chat navigation">
+            <div class="sidebar-header">
+                <div class="sidebar-title">Travel assistant</div>
+                <div class="sidebar-subtitle">Chats</div>
+            </div>
 
-        <div class="main-layout">
-            <div class="chat-column">
-                <div class="chat-container">
-                    <div class="chat-messages" id="chatMessages">
-                        <div class="message bot-message">
-                            <div class="message-content">
-                                <p>Hi, I'm your travel assistant. I can help you with:</p>
-                                <ul style="margin-left: 20px; margin-top: 8px;">
-                                    <li>Journey planning and routes</li>
-                                    <li>Transport timetables</li>
-                                </ul>
-                            </div>
-                        </div>
-                    </div>
+            <button id="newChatButton" class="sidebar-button primary-button">
+                New chat
+            </button>
 
-                    <div class="journey-planner-toggle-wrap">
-                        <button
-                            type="button"
-                            id="journey-planner-toggle"
-                            class="journey-planner-toggle-btn hidden"
-                            aria-expanded="false"
-                            aria-controls="journey-inputs"
-                        >
-                            Show journey planner
-                        </button>
-                    </div>
+            <div class="sidebar-search">
+                <input
+                    type="text"
+                    id="chatSearchInput"
+                    placeholder="Search chats"
+                    autocomplete="off"
+                >
+            </div>
 
-                    <section
-                        id="journey-inputs"
-                        class="journey-inputs hidden"
-                        aria-label="Plan a journey"
-                    >
-                        <div class="journey-field">
-                            <label for="from-input">From</label>
-                            <input
-                                id="from-input"
-                                type="text"
-                                placeholder="Start location"
-                                autocomplete="off"
-                            />
-                        </div>
+            <div id="chatListFilter" class="chat-list-filter" role="group" aria-label="Chat list filter">
+                <button type="button" id="chatFilterAll" class="chat-list-filter-btn active">All</button>
+                <button type="button" id="chatFilterStarred" class="chat-list-filter-btn">Starred</button>
+            </div>
 
-                        <div class="journey-field">
-                            <label for="to-input">To</label>
-                            <input
-                                id="to-input"
-                                type="text"
-                                placeholder="Destination"
-                                autocomplete="off"
-                            />
-                        </div>
+            <div class="sidebar-section">
+                <div class="sidebar-section-title">Your chats</div>
+                <ul id="chatList" class="chat-list" aria-label="Saved chats">
+                    <!-- Filled dynamically -->
+                </ul>
+            </div>
 
-                        <div class="journey-field journey-when">
-                            <label for="date-input">When</label>
-                            <div class="journey-when-row">
-                                <input
-                                    id="date-input"
-                                    type="date"
-                                    aria-label="Travel date"
-                                />
-                                <input
-                                    id="time-input"
-                                    type="time"
-                                    aria-label="Travel time"
-                                />
-                            </div>
-                            <small class="journey-when-hint">Optional: date and time</small>
-                        </div>
+            <div class="sidebar-account">
+                <div id="accountLoggedOut" class="account-logged-out">
+                    <a href="/login" id="loginLink" class="sidebar-button">
+                        Log in / Sign up
+                    </a>
+                </div>
 
-                        <div class="journey-actions">
-                            <button id="plan-btn" type="button">Plan</button>
-                        </div>
-                    </section>
-
-                    <div class="chat-input-container">
-                        <input
-                            type="text"
-                            id="userInput"
-                            placeholder="Ask about traffic, delays, routes..."
-                            autocomplete="off"
-                        >
-                        <button id="sendButton">Send</button>
+                <div id="accountLoggedIn" class="account-logged-in hidden">
+                    <button type="button" id="accountMenuButton" class="account-menu-button" aria-expanded="false">
+                        <span class="account-menu-avatar" id="accountMenuAvatar">👤</span>
+                        <span id="currentUsername" class="account-menu-username"></span>
+                        <span class="account-menu-chevron">▼</span>
+                    </button>
+                    <div id="accountDropdown" class="account-dropdown hidden">
+                        <button type="button" id="logoutButton" class="account-dropdown-item">Sign out</button>
                     </div>
                 </div>
             </div>
+        </aside>
 
-            <aside class="side-panel" aria-label="Detected intent and entities">
-                <div class="info-panel">
-                    <div class="info-item">
-                        <strong>Detected Intent:</strong> <span id="intentDisplay">-</span>
-                    </div>
-                    <div class="info-item">
-                        <strong>Confidence:</strong> <span id="confidenceDisplay">-</span>
-                    </div>
-                    <div class="info-item">
-                        <strong>Entities:</strong> <span id="entitiesDisplay">-</span>
+        <div class="container">
+            <header>
+                <div class="header-row">
+                    <div class="header-text">
+                        <h1>Travel assistant</h1>
+                        <p class="subtitle">Practical help with routes and journey planning</p>
                     </div>
                 </div>
-            </aside>
+            </header>
+
+            <div class="main-layout">
+                <div class="chat-column">
+                    <div class="chat-container">
+                        <div class="chat-messages" id="chatMessages">
+                            <div class="message bot-message">
+                                <div class="message-content">
+                                    <p>Hi! I can help you plan journeys and find transport routes.</p>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="journey-planner-toggle-wrap">
+                            <button
+                                type="button"
+                                id="journey-planner-toggle"
+                                class="journey-planner-toggle-btn hidden"
+                                aria-expanded="false"
+                            >
+                                Show journey planner
+                            </button>
+                        </div>
+
+                        <section
+                            id="journey-inputs"
+                            class="journey-inputs hidden"
+                            aria-label="Plan a journey"
+                        >
+                            <div class="journey-field">
+                                <label for="from-input">From</label>
+                                <input
+                                    id="from-input"
+                                    type="text"
+                                    placeholder="Start location"
+                                    autocomplete="off"
+                                />
+                            </div>
+
+                            <div class="journey-field">
+                                <label for="to-input">To</label>
+                                <input
+                                    id="to-input"
+                                    type="text"
+                                    placeholder="Destination"
+                                    autocomplete="off"
+                                />
+                            </div>
+
+                            <div class="journey-field journey-when">
+                                <label>When (optional)</label>
+                                <div class="journey-when-row">
+                                    <input
+                                        id="date-input"
+                                        type="date"
+                                    />
+                                    <input
+                                        id="time-input"
+                                        type="time"
+                                    />
+                                </div>
+                            </div>
+
+                            <div class="journey-actions">
+                                <button id="plan-btn" type="button">Plan</button>
+                            </div>
+                        </section>
+
+                        <div class="chat-input-container">
+                            <input
+                                type="text"
+                                id="userInput"
+                                placeholder="Ask about routes, times..."
+                                autocomplete="off"
+                            >
+                            <button id="sendButton">Send</button>
+                        </div>
+                    </div>
+                </div>
+
+                <aside class="side-panel" aria-label="Detected intent and entities">
+                    <div class="info-panel">
+                        <div class="info-item">
+                            <strong>Intent:</strong> <span id="intentDisplay">-</span>
+                        </div>
+                        <div class="info-item">
+                            <strong>Confidence:</strong> <span id="confidenceDisplay">-</span>
+                        </div>
+                        <div class="info-item">
+                            <strong>Entities:</strong> <span id="entitiesDisplay">-</span>
+                        </div>
+                    </div>
+                </aside>
+            </div>
         </div>
     </div>
 
