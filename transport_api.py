@@ -39,6 +39,44 @@ class TransportDataFetcher:
             params["app_key"] = self.tfl_app_key
         return params
 
+    def _expand_to_leaf_bus_stops(self, stop_id: str) -> List[str]:
+        """
+        If stop_id is a StopPoint group/area, expand to leaf bus stop IDs.
+        Returns just the stop_id if not expandable or expansion not available.
+        """
+        if not stop_id:
+            return []
+
+        if not self.has_tfl:
+            return [stop_id]
+
+        try:
+            url = f"{self.tfl_base_url}/StopPoint/{stop_id}"
+            resp = requests.get(url, params=self._tfl_params(), timeout=5)
+            resp.raise_for_status()
+            data = resp.json()
+
+            children = data.get("children", [])
+            if children:
+                child_ids = [c.get("id") for c in children if c.get("id")]
+                return child_ids if child_ids else [stop_id]
+        except Exception:
+            pass
+
+        return [stop_id]
+
+    def _platform_from_stop_id(self, stop_id: str) -> Optional[str]:
+        """Get platform information for a stop."""
+        return None
+
+    def _get_stop_direction_from_arrivals(self, stop_id: str, mode: str = 'bus') -> Optional[str]:
+        """Get direction/destination from timetable arrivals."""
+        return None
+
+    def _format_bus_stop_disambiguation_name(self, stop_id: str) -> Optional[str]:
+        """Format a stop name with platform/direction for disambiguation."""
+        return None
+
     def get_route_traffic(self, route: str) -> Optional[Dict[str, Any]]:
         """
         Get traffic information for a specific route
@@ -82,6 +120,42 @@ class TransportDataFetcher:
                     }
         except Exception as e:
             print(f"TFL fetch error: {e}")
+
+        return None
+
+    def get_tfl_timetable_by_stop_id(self, stop_id: str, mode: str = 'bus') -> Optional[List[Dict[str, Any]]]:
+        """
+        Get timetable for a specific stop by ID.
+
+        Args:
+            stop_id: TfL stop ID
+            mode: 'bus' or 'train'
+
+        Returns:
+            list: Timetable entries with arrival times
+        """
+        if not self.has_tfl:
+            return None
+
+        try:
+            url = f"{self.tfl_base_url}/StopPoint/{stop_id}/Arrivals"
+            resp = requests.get(url, params=self._tfl_params(), timeout=5)
+            resp.raise_for_status()
+            data = resp.json()
+
+            if isinstance(data, list):
+                arrivals = []
+                for arrival in data[:5]:
+                    arrivals.append({
+                        'lineId': arrival.get('lineId'),
+                        'lineName': arrival.get('lineName'),
+                        'destination': arrival.get('destinationName'),
+                        'timeToStation': arrival.get('timeToStation'),
+                        'expectedArrival': arrival.get('expectedArrival'),
+                    })
+                return arrivals if arrivals else None
+        except Exception:
+            pass
 
         return None
 
