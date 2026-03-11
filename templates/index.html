@@ -5,6 +5,12 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Travel assistant</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <script>
+        (function() {
+            var t = localStorage.getItem('travelAssistantTheme');
+            if (t === 'dark' || t === 'light') document.documentElement.setAttribute('data-theme', t);
+        })();
+    </script>
 </head>
 <body>
     <div class="app-shell">
@@ -66,6 +72,13 @@
                         <h1>Travel assistant</h1>
                         <p class="subtitle">Practical help with routes and journey planning</p>
                     </div>
+                    <div class="header-actions">
+                        <button type="button" id="themeToggle" class="theme-toggle" aria-label="Toggle theme" title="Toggle theme">
+                            <span class="theme-icon theme-icon-sun" aria-hidden="true">☀</span>
+                            <span class="theme-icon theme-icon-moon hidden" aria-hidden="true">🌙</span>
+                            <span id="themeToggleLabel" class="header-action-label">Light</span>
+                        </button>
+                    </div>
                 </div>
             </header>
 
@@ -75,7 +88,7 @@
                         <div class="chat-messages" id="chatMessages">
                             <div class="message bot-message">
                                 <div class="message-content">
-                                    <p>Hi! I can help you plan journeys and find transport routes.</p>
+                                    <p>Hi! I can help you plan journeys and find transport routes. Use voice input with the microphone button.</p>
                                 </div>
                             </div>
                         </div>
@@ -142,6 +155,10 @@
                                 placeholder="Ask about routes, times..."
                                 autocomplete="off"
                             >
+                            <button type="button" id="voiceInputButton" class="voice-btn" aria-label="Voice input" title="Voice input">
+                                <span class="voice-btn-icon">🎤</span>
+                                <span class="voice-btn-label">Voice input</span>
+                            </button>
                             <button id="sendButton">Send</button>
                         </div>
                     </div>

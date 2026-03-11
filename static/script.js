@@ -1,6 +1,7 @@
 const chatMessages = document.getElementById('chatMessages');
 const userInput = document.getElementById('userInput');
 const sendButton = document.getElementById('sendButton');
+const voiceInputButton = document.getElementById('voiceInputButton');
 const intentDisplay = document.getElementById('intentDisplay');
 const confidenceDisplay = document.getElementById('confidenceDisplay');
 const entitiesDisplay = document.getElementById('entitiesDisplay');
@@ -17,6 +18,8 @@ const accountLoggedIn = document.getElementById('accountLoggedIn');
 const currentUsernameEl = document.getElementById('currentUsername');
 const accountMenuButton = document.getElementById('accountMenuButton');
 const accountDropdown = document.getElementById('accountDropdown');
+const themeToggle = document.getElementById('themeToggle');
+const themeToggleLabel = document.getElementById('themeToggleLabel');
 
 const journeyInputsSection = document.getElementById('journey-inputs');
 const journeyPlannerToggle = document.getElementById('journey-planner-toggle');
@@ -27,12 +30,14 @@ const timeInput = document.getElementById('time-input');
 const planBtn = document.getElementById('plan-btn');
 
 const STORAGE_KEY_BASE = 'travelAssistantChats';
+const THEME_STORAGE_KEY = 'travelAssistantTheme';
 let currentUser = null;
 let conversations = [];
 let activeChatId = null;
 let currentSearchTerm = '';
 let showStarredOnly = false;
 let selectedChatIds = new Set();
+let isListening = false;
 
 function getStorageKey() {
     return currentUser ? `${STORAGE_KEY_BASE}:${currentUser}` : STORAGE_KEY_BASE;
@@ -323,6 +328,71 @@ function sendChatMessage(payload) {
     });
 }
 
+function startVoiceInput() {
+    if (isListening) return;
+
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SpeechRecognition) {
+        alert('Voice input not supported in this browser');
+        return;
+    }
+
+    isListening = true;
+    voiceInputButton.classList.add('listening');
+    voiceInputButton.textContent = 'Listening...';
+
+    const recognition = new SpeechRecognition();
+    recognition.continuous = false;
+    recognition.interimResults = false;
+    recognition.lang = 'en-US';
+
+    recognition.onresult = (event) => {
+        let transcript = '';
+        for (let i = event.resultIndex; i < event.results.length; i++) {
+            transcript += event.results[i][0].transcript;
+        }
+        userInput.value = transcript.trim();
+        isListening = false;
+        voiceInputButton.classList.remove('listening');
+        voiceInputButton.textContent = '🎤 Voice input';
+    };
+
+    recognition.onerror = () => {
+        isListening = false;
+        voiceInputButton.classList.remove('listening');
+        voiceInputButton.textContent = '🎤 Voice input';
+    };
+
+    recognition.onend = () => {
+        isListening = false;
+        voiceInputButton.classList.remove('listening');
+        voiceInputButton.textContent = '🎤 Voice input';
+    };
+
+    recognition.start();
+}
+
+function getTheme() {
+    return localStorage.getItem(THEME_STORAGE_KEY) || 'light';
+}
+
+function applyTheme(theme) {
+    document.documentElement.setAttribute('data-theme', theme);
+    localStorage.setItem(THEME_STORAGE_KEY, theme);
+    const label = themeToggleLabel.textContent;
+    if (theme === 'dark') {
+        themeToggleLabel.textContent = 'Dark';
+    } else {
+        themeToggleLabel.textContent = 'Light';
+    }
+}
+
+function toggleTheme() {
+    const current = getTheme();
+    const next = current === 'dark' ? 'light' : 'dark';
+    applyTheme(next);
+}
+
 function checkLoggedIn() {
     return fetch('/me')
         .then(res => res.json())
@@ -400,6 +470,10 @@ document.addEventListener('click', (e) => {
     }
 });
 
+themeToggle.addEventListener('click', toggleTheme);
+
+voiceInputButton.addEventListener('click', startVoiceInput);
+
 sendButton.addEventListener('click', () => {
     const message = userInput.value.trim();
     if (!message) return;
@@ -419,6 +493,7 @@ journeyPlannerToggle.addEventListener('click', toggleJourneyPlanner);
 planBtn.addEventListener('click', sendPlannedJourney);
 
 document.addEventListener('DOMContentLoaded', () => {
+    applyTheme(getTheme());
     checkLoggedIn();
     journeyPlannerToggle.classList.remove('hidden');
 });
