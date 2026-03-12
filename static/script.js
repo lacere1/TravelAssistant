@@ -233,10 +233,43 @@ function displayMetadata(intent, confidence, entities) {
     entitiesDisplay.textContent = Object.keys(entities).length > 0 ? JSON.stringify(entities) : '-';
 }
 
+function buildDirectionsHtml(journey) {
+    if (!journey.steps || journey.steps.length === 0) return '';
+    const steps = journey.steps.map(step => `<div class="journey-leg-step">${escapeHtml(step)}</div>`).join('');
+    return `<div class="journey-leg-directions" style="display:none;">${steps}</div>`;
+}
+
+function buildStopsHtml(journey) {
+    if (!journey.stops || journey.stops.length === 0) return '';
+    const stops = journey.stops.map(stop => `<div class="journey-leg-stop">${escapeHtml(stop)}</div>`).join('');
+    return `<div class="journey-leg-stops-list" style="display:none;">${stops}</div>`;
+}
+
 function buildJourneyCard(journey) {
     const legs = (journey.legs || [])
         .map(leg => `<span class="journey-leg">${escapeHtml(leg.mode)}</span>`)
         .join('');
+
+    let fareHtml = '';
+    if (journey.fare_pence) {
+        const farePounds = (journey.fare_pence / 100).toFixed(2);
+        fareHtml = `<div class="journey-fare">£${farePounds}</div>`;
+    }
+
+    let directionsHtml = buildDirectionsHtml(journey);
+    let stopsHtml = buildStopsHtml(journey);
+
+    let expandableHtml = '';
+    if (directionsHtml || stopsHtml) {
+        expandableHtml = `
+            <div class="journey-leg-expandable">
+                ${directionsHtml ? `<button class="journey-leg-expand-btn" data-target="directions">View directions</button>` : ''}
+                ${stopsHtml ? `<button class="journey-leg-expand-btn" data-target="stops">View stops</button>` : ''}
+                ${directionsHtml}
+                ${stopsHtml}
+            </div>
+        `;
+    }
 
     return `
         <div class="journey-card">
@@ -245,8 +278,12 @@ function buildJourneyCard(journey) {
                 <span class="arrow">→</span>
                 <span class="arrival">${journey.arrival}</span>
             </div>
-            <div class="journey-duration">${journey.duration} mins</div>
+            <div class="journey-row">
+                <div class="journey-duration">${journey.duration} mins</div>
+                ${fareHtml}
+            </div>
             <div class="journey-legs">${legs}</div>
+            ${expandableHtml}
         </div>
     `;
 }
@@ -259,6 +296,140 @@ function appendJourneyCards(journeys) {
     container.innerHTML = journeys.map(j => buildJourneyCard(j)).join('');
     chatMessages.appendChild(container);
     chatMessages.scrollTop = chatMessages.scrollHeight;
+}
+
+function appendTimetableCard(timetable) {
+    if (!timetable) return;
+
+    const container = document.createElement('div');
+    container.className = 'timetable-card';
+
+    const stopName = document.createElement('div');
+    stopName.className = 'timetable-stop-name';
+    stopName.textContent = timetable.stop_name || 'Stop';
+    container.appendChild(stopName);
+
+    if (timetable.bus_arrivals && timetable.bus_arrivals.length > 0) {
+        const busSection = document.createElement('div');
+        busSection.className = 'timetable-section';
+
+        const busHeader = document.createElement('div');
+        busHeader.className = 'timetable-section-header';
+        busHeader.textContent = 'Bus';
+        busSection.appendChild(busHeader);
+
+        timetable.bus_arrivals.forEach(arrival => {
+            const row = document.createElement('div');
+            row.className = 'timetable-row';
+
+            const icon = document.createElement('span');
+            icon.className = 'timetable-row-icon';
+            icon.textContent = '🚌';
+
+            const details = document.createElement('div');
+            details.className = 'timetable-row-details';
+            details.innerHTML = `
+                <strong>${arrival.lineName || ''}</strong> → ${arrival.destination || ''}
+                <br>
+                <span class="timetable-time">${arrival.timeToStation || ''}s</span>
+            `;
+
+            row.appendChild(icon);
+            row.appendChild(details);
+            busSection.appendChild(row);
+        });
+
+        container.appendChild(busSection);
+    }
+
+    if (timetable.train_arrivals && timetable.train_arrivals.length > 0) {
+        const trainSection = document.createElement('div');
+        trainSection.className = 'timetable-section';
+
+        const trainHeader = document.createElement('div');
+        trainHeader.className = 'timetable-section-header';
+        trainHeader.textContent = 'Train';
+        trainSection.appendChild(trainHeader);
+
+        timetable.train_arrivals.forEach(arrival => {
+            const row = document.createElement('div');
+            row.className = 'timetable-row';
+
+            const icon = document.createElement('span');
+            icon.className = 'timetable-row-icon';
+            icon.textContent = '🚆';
+
+            const details = document.createElement('div');
+            details.className = 'timetable-row-details';
+            details.innerHTML = `
+                <strong>${arrival.lineName || ''}</strong> → ${arrival.destination || ''}
+                <br>
+                <span class="timetable-time">${arrival.timeToStation || ''}s</span>
+            `;
+
+            row.appendChild(icon);
+            row.appendChild(details);
+            trainSection.appendChild(row);
+        });
+
+        container.appendChild(trainSection);
+    }
+
+    chatMessages.appendChild(container);
+    chatMessages.scrollTop = chatMessages.scrollHeight;
+}
+
+function appendDisruptionCard(disruption) {
+    if (!disruption) return;
+
+    const container = document.createElement('div');
+    container.className = 'disruption-card';
+
+    const statusRow = document.createElement('div');
+    statusRow.className = 'disruption-status-row';
+
+    const statusSpan = document.createElement('span');
+    statusSpan.className = disruption.status === 'Good Service' ? 'disruption-status-good' : 'disruption-status-issue';
+    statusSpan.textContent = disruption.status || 'Unknown';
+    statusRow.appendChild(statusSpan);
+
+    container.appendChild(statusRow);
+
+    if (disruption.description) {
+        const descDiv = document.createElement('div');
+        descDiv.className = 'disruption-description';
+        descDiv.textContent = disruption.description;
+        container.appendChild(descDiv);
+    }
+
+    if (disruption.affected_locations && disruption.affected_locations.length > 0) {
+        const affectedDiv = document.createElement('div');
+        affectedDiv.className = 'disruption-affected';
+        affectedDiv.innerHTML = '<strong>Affected:</strong> ' + disruption.affected_locations.join(', ');
+        container.appendChild(affectedDiv);
+    }
+
+    chatMessages.appendChild(container);
+    chatMessages.scrollTop = chatMessages.scrollHeight;
+}
+
+function handleChatResponse(data) {
+    appendMessage('bot', data.response);
+    storeMessage(data.response, 'bot', {});
+
+    if (data.journeys && data.journeys.length > 0) {
+        appendJourneyCards(data.journeys);
+    }
+
+    if (data.timetable) {
+        appendTimetableCard(data.timetable);
+    }
+
+    if (data.disruption) {
+        appendDisruptionCard(data.disruption);
+    }
+
+    displayMetadata(data.intent, data.confidence, data.entities || {});
 }
 
 function sendPlannedJourney() {
@@ -313,14 +484,7 @@ function sendChatMessage(payload) {
     })
     .then(res => res.json())
     .then(data => {
-        appendMessage('bot', data.response);
-        storeMessage(data.response, 'bot', {});
-
-        if (data.journeys && data.journeys.length > 0) {
-            appendJourneyCards(data.journeys);
-        }
-
-        displayMetadata(data.intent, data.confidence, data.entities || {});
+        handleChatResponse(data);
     })
     .catch(err => {
         appendMessage('bot', 'Error: ' + err.message);

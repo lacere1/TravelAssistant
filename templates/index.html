@@ -181,6 +181,12 @@
         </div>
     </div>
 
+    {% if google_places_api_key %}
+    <script src="https://maps.googleapis.com/maps/api/js?key={{ google_places_api_key }}&libraries=places"></script>
+    {% endif %}
+    <script>
+        const googlePlacesApiKey = "{{ google_places_api_key or '' }}";
+    </script>
     <script src="{{ url_for('static', filename='script.js') }}"></script>
 </body>
 </html>

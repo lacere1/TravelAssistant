@@ -312,6 +312,146 @@ header {
     border: 1px solid #ddd;
 }
 
+.journey-row {
+    display: flex;
+    gap: 12px;
+    align-items: center;
+    margin-bottom: 6px;
+}
+
+.journey-fare {
+    font-weight: 600;
+    color: #10b981;
+    font-size: 12px;
+}
+
+.journey-leg-expandable {
+    margin-top: 8px;
+    padding-top: 8px;
+    border-top: 1px solid #e0e0e0;
+}
+
+.journey-leg-expand-btn {
+    display: inline-block;
+    background: transparent;
+    border: 1px solid #667eea;
+    color: #667eea;
+    padding: 4px 8px;
+    border-radius: 3px;
+    font-size: 10px;
+    cursor: pointer;
+    margin-right: 6px;
+}
+
+.journey-leg-expand-btn:hover {
+    background: #667eea;
+    color: white;
+}
+
+.journey-leg-step {
+    font-size: 10px;
+    padding: 4px 0;
+    color: var(--text-primary);
+}
+
+.journey-leg-stop {
+    font-size: 10px;
+    padding: 4px 0;
+    color: var(--text-primary);
+}
+
+.timetable-card {
+    background: var(--msg-bot-bg);
+    border: 1px solid var(--msg-bot-border);
+    border-radius: 6px;
+    padding: 12px;
+    font-size: 12px;
+}
+
+.timetable-stop-name {
+    font-weight: 600;
+    margin-bottom: 10px;
+    color: var(--text-primary);
+}
+
+.timetable-section {
+    margin-bottom: 10px;
+}
+
+.timetable-section-header {
+    font-weight: 600;
+    font-size: 11px;
+    color: var(--text-secondary);
+    margin-bottom: 6px;
+    text-transform: uppercase;
+}
+
+.timetable-row {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 6px;
+    padding: 6px;
+    background: var(--bg-page);
+    border-radius: 4px;
+}
+
+.timetable-row-icon {
+    font-size: 14px;
+    flex-shrink: 0;
+}
+
+.timetable-row-details {
+    flex: 1;
+    font-size: 11px;
+}
+
+.timetable-time {
+    color: var(--text-secondary);
+}
+
+.disruption-card {
+    background: var(--msg-bot-bg);
+    border: 1px solid var(--msg-bot-border);
+    border-radius: 6px;
+    padding: 12px;
+    font-size: 12px;
+}
+
+.disruption-status-row {
+    margin-bottom: 8px;
+}
+
+.disruption-status-good {
+    display: inline-block;
+    background: #10b981;
+    color: white;
+    padding: 4px 8px;
+    border-radius: 4px;
+    font-size: 11px;
+    font-weight: 600;
+}
+
+.disruption-status-issue {
+    display: inline-block;
+    background: #ef4444;
+    color: white;
+    padding: 4px 8px;
+    border-radius: 4px;
+    font-size: 11px;
+    font-weight: 600;
+}
+
+.disruption-description {
+    margin-bottom: 8px;
+    line-height: 1.4;
+    color: var(--text-primary);
+}
+
+.disruption-affected {
+    font-size: 11px;
+    color: var(--text-secondary);
+}
+
 .side-panel {
     background: var(--bg-container);
     border: 1px solid var(--border-main);
