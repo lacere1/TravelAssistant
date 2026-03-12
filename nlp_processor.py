@@ -2,7 +2,7 @@
 NLP Processor using Hugging Face Transformers
 Handles intent detection and entity extraction
 """
-from typing import Dict, List, Any, Optional, Tuple
+from typing import Dict, List, Any, Optional
 import re
 
 
@@ -15,6 +15,7 @@ class NLPProcessor:
             "ask_traffic_status",
             "ask_delay",
             "ask_transit_disruption",
+            "ask_bus_disruption",
             "ask_timetable",
             "ask_transit_times",
             "greeting",
@@ -60,6 +61,9 @@ class NLPProcessor:
 
         if any(phrase in text_lower for phrase in ['bus times', 'train times', 'tube times', 'timetable', 'next bus', 'next train']):
             return 'ask_timetable', 0.9
+
+        if any(phrase in text_lower for phrase in ['bus disruption', 'bus delay', 'bus status']):
+            return 'ask_bus_disruption', 0.85
 
         if any(phrase in text_lower for phrase in ['disruption', 'status', 'delay', 'delays']):
             return 'ask_transit_disruption', 0.85
@@ -108,43 +112,3 @@ class NLPProcessor:
             entities['route'] = bus_route_match.group(1)
 
         return entities
-
-    def extract_train_disruption_line(self, query: str) -> Optional[str]:
-        """
-        If the query is about train/tube/Overground/DLR status or disruption and mentions
-        a line, return that line's display name. Otherwise return None.
-        """
-        return None
-
-    def extract_bus_disruption_route(self, query: str) -> Optional[str]:
-        """
-        If the query is about bus status or disruption and contains a route number,
-        return that route id. Otherwise return None.
-        """
-        return None
-
-    def parse_line_or_route_followup(self, message: str) -> Optional[Tuple[str, str]]:
-        """
-        For follow-up replies after "couldn't find a train/bus": if the message is just a train line
-        or bus route, return (value, 'train') or (value, 'bus'). Otherwise return None.
-        """
-        return None
-
-    def _best_csv_stop_match(self, candidate: str, mode_hint: Optional[str] = None):
-        """
-        Given a free-text candidate, find the best fuzzy match across bus and/or train CSV stop names.
-        Returns a dict with keys: type ('bus'|'train'), name, score, or None.
-        """
-        return None
-
-    def _refine_with_stop_datasets(
-        self,
-        original_text: str,
-        intent: str,
-        entities: Dict[str, Any],
-        confidence: float,
-    ):
-        """
-        Use CSV stop names as an additional NER + slot-filling and intent hint layer.
-        """
-        return intent, entities, confidence
