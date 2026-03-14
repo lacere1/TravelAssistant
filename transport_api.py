@@ -43,7 +43,7 @@ class TransportDataFetcher:
         """
         If stop_id is a StopPoint group/area, expand to leaf bus stop IDs.
 
-        In this earlier-stage version we keep things simple and just return
+        Returns the stop ID directly — group expansion is handled
         the id we were given so timetable logic can still call this helper
         without needing the full StopPoint hierarchy traversal.
         """
@@ -98,11 +98,29 @@ class TransportDataFetcher:
         return cleaned, main_words, first_word
     
     def _normalize_tube_station_name(self, station_name: str) -> str:
+        """Normalize punctuation and casing for tube station names."""
         if not station_name or not station_name.strip():
             return station_name
-        return ' '.join(w.capitalize() for w in station_name.strip().split())
+        normalized = station_name.strip()
+        normalized = re.sub(r'\bSt\.\b', 'St', normalized, flags=re.IGNORECASE)
+        normalized = re.sub(r'\s*&\s*', ' and ', normalized)
+        normalized = re.sub(r'\s+', ' ', normalized)
+        words = normalized.split()
+        if not words:
+            return normalized
+        small_words = {'and', 'on', 'the', 'of', 'by', 'in', 'at', 'to', 'for'}
+        title_words = []
+        for i, word in enumerate(words):
+            if i == 0:
+                title_words.append(word.capitalize())
+            elif word.lower() in small_words:
+                title_words.append(word.lower())
+            else:
+                title_words.append(word.capitalize())
+        return ' '.join(title_words).strip()
     
     def _find_closest_location_match(self, location: str, all_stops: List[Dict[str, Any]]) -> Optional[str]:
+        """Find closest matching stop using fuzzy matching."""
         if not all_stops:
             return None
         location_lower = location.lower()
@@ -158,10 +176,21 @@ class TransportDataFetcher:
             # Search for stop points matching the user query
             url = f"{self.tfl_base_url}/StopPoint/Search"
             
+            # If mode_filter is 'train' and query contains "station", try base name first
+            # This helps find "Underground Station" entries when user says just "station"
+            initial_query = search_query
+            if mode_filter == 'train' and 'station' in stop_query.lower() and 'underground' not in stop_query.lower():
+                # Try base name first (without "station") for better train station matching
+                common_words = ['station', 'stop', 'the', 'tube', 'underground', 'metro']
+                query_words = stop_query.split()
+                cleaned_query = ' '.join(w for w in query_words if w.lower() not in common_words).strip()
+                if cleaned_query:
+                    initial_query = cleaned_query
+            
             params = {
                 'app_id': self.tfl_app_id,
                 'app_key': self.tfl_app_key,
-                'query': search_query,
+                'query': initial_query,
                 'modes': 'tube,bus,dlr,overground,tram'
             }
             
@@ -172,31 +201,86 @@ class TransportDataFetcher:
             # Check if any stop points were found
             matches = data.get('matches', [])
             
-            if not matches:
-                # Retry with cleaned query
+            # If mode_filter is 'train', check if we have any train/tube stations
+            # If not, try with just the base name (remove "station")
+            if matches and mode_filter == 'train':
+                has_train_station = any(
+                    any(m in match.get('modes', []) for m in ['tube', 'train', 'dlr', 'overground', 'tram', 'national-rail'])
+                    for match in matches
+                )
+                if not has_train_station:
+                    common_words = ['station', 'stop', 'the', 'tube', 'underground', 'metro']
+                    query_words = stop_query.split()
+                    cleaned_query = ' '.join(w for w in query_words if w.lower() not in common_words).strip()
+                    if cleaned_query and cleaned_query.lower() != stop_query.lower():
+                        params['query'] = cleaned_query
+                        try:
+                            response = requests.get(url, params=params, timeout=10)
+                            if response.status_code == 200:
+                                cleaned_data = response.json()
+                                cleaned_matches = cleaned_data.get('matches', [])
+                                if cleaned_matches:
+                                    has_train = any(
+                                        any(m in match.get('modes', []) for m in ['tube', 'train', 'dlr', 'overground', 'tram', 'national-rail'])
+                                        for match in cleaned_matches
+                                    )
+                                    if has_train:
+                                        matches = cleaned_matches
+                        except Exception:
+                            pass
+            
+            if not matches or len(matches) == 0:
+                # Try with cleaned version of the query (remove common words)
                 common_words = ['station', 'stop', 'the', 'tube', 'underground', 'metro']
-                cleaned_query = ' '.join(w for w in stop_query.split() if w.lower() not in common_words).strip()
+                query_words = stop_query.split()
+                cleaned_query = ' '.join(w for w in query_words if w.lower() not in common_words).strip()
+                
                 if cleaned_query and cleaned_query.lower() != stop_query.lower():
                     params['query'] = cleaned_query
                     response = requests.get(url, params=params, timeout=10)
                     if response.status_code == 200:
-                        matches = response.json().get('matches', [])
-
-                # Broader: first main word
-                if not matches:
-                    main_words = [w for w in stop_query.split() if len(w) > 2 and w.lower() not in common_words]
-                    if main_words:
-                        params['query'] = main_words[0]
-                        response = requests.get(url, params=params, timeout=10)
-                        if response.status_code == 200:
-                            broader = response.json().get('matches', [])
-                            if broader:
-                                closest = self._find_closest_location_match(stop_query, broader)
-                                if closest:
-                                    params['query'] = closest
+                        data = response.json()
+                        matches = data.get('matches', [])
+                
+                # If mode_filter is 'train' and still no matches, try adding "Underground Station"
+                if (not matches or len(matches) == 0) and mode_filter == 'train':
+                    query_lower = stop_query.lower()
+                    if 'station' in query_lower or 'underground' not in query_lower:
+                        if 'underground' not in query_lower:
+                            underground_query = stop_query.replace('station', 'Underground Station').replace('Station', 'Underground Station')
+                            underground_query = self._normalize_tube_station_name(underground_query)
+                            if underground_query != stop_query:
+                                params['query'] = underground_query
+                                try:
                                     response = requests.get(url, params=params, timeout=10)
                                     if response.status_code == 200:
-                                        matches = response.json().get('matches', [])
+                                        underground_data = response.json()
+                                        underground_matches = underground_data.get('matches', [])
+                                        if underground_matches:
+                                            matches = underground_matches
+                                except Exception:
+                                    pass
+                
+                # Broader search with first main word
+                if not matches or len(matches) == 0:
+                    main_words = [w for w in stop_query.split() if len(w) > 2 and w.lower() not in common_words]
+                    
+                    # Strategy: Use first main word only (broad)
+                    if main_words:
+                        broader_query = main_words[0]
+                        params['query'] = broader_query
+                        response = requests.get(url, params=params, timeout=10)
+                        if response.status_code == 200:
+                            broader_data = response.json()
+                            broader_matches = broader_data.get('matches', [])
+                            if broader_matches:
+                                closest_match = self._find_closest_location_match(stop_query, broader_matches)
+                                if closest_match:
+                                    params['query'] = closest_match
+                                    response = requests.get(url, params=params, timeout=10)
+                                    if response.status_code == 200:
+                                        data = response.json()
+                                        matches = data.get('matches', [])
             
             # Check if any stop points were found after retry attempts
             if not matches or len(matches) == 0:
@@ -273,23 +357,104 @@ class TransportDataFetcher:
                     if 'bus' in match.get('modes', [])
                 ]
                 
+                # Use the route numbers we extracted at the start of the function
+                # (Routes were already extracted from stop_query and stored in mentioned_routes)
                 route_was_specified = len(mentioned_routes) > 0
                 
-                if mentioned_routes and bus_stop_matches:
-                    filtered = [m for m in bus_stop_matches
-                                if any(r in [(l.get('id','').upper() if isinstance(l,dict) else str(l).upper()) for l in m.get('lines',[])]
-                                       for r in mentioned_routes)]
-                    if filtered:
-                        matches = filtered
-                    elif route_was_specified:
-                        return {'error': 'route_not_served', 'query': stop_query,
-                                'stop_name': bus_stop_matches[0].get('name', stop_query),
-                                'requested_route': ', '.join(mentioned_routes),
-                                'available_routes': [], 'available_routes_str': 'unknown'}
+                # If user mentioned a bus route, filter stops to only those serving that route
+                if mentioned_routes and len(bus_stop_matches) >= 1:
+                    filtered_stops = []
+                    for match in bus_stop_matches:
+                        stop_lines = match.get('lines', [])
+                        # Check if any mentioned route is in this stop's lines
+                        stop_line_ids = []
+                        for line in stop_lines:
+                            if isinstance(line, dict):
+                                line_id = line.get('id', '').upper()
+                            else:
+                                line_id = str(line).upper()
+                            stop_line_ids.append(line_id)
+                        
+                        # Also check if this is a group stop - need to check child stops
+                        stop_id = match.get('id', '')
+                        serves_route = any(route in stop_line_ids for route in mentioned_routes)
+                        
+                        # If group stop doesn't have the route in its own lines, check children
+                        if not serves_route and stop_id:
+                            try:
+                                stop_info_url = f"{self.tfl_base_url}/StopPoint/{stop_id}"
+                                info_params = {
+                                    'app_id': self.tfl_app_id,
+                                    'app_key': self.tfl_app_key,
+                                }
+                                info_resp = requests.get(stop_info_url, params=info_params, timeout=3)
+                                if info_resp.status_code == 200:
+                                    info_data = info_resp.json()
+                                    children = info_data.get('children', [])
+                                    for child in children:
+                                        child_lines = child.get('lines', [])
+                                        for line in child_lines:
+                                            if isinstance(line, dict):
+                                                line_id = line.get('id', '').upper()
+                                            else:
+                                                line_id = str(line).upper()
+                                            if line_id in mentioned_routes:
+                                                serves_route = True
+                                                break
+                                        if serves_route:
+                                            break
+                            except Exception:
+                                pass  # If check fails, include the stop anyway
+                        
+                        if serves_route:
+                            filtered_stops.append(match)
+                    
+                    # If user specified a route, use all stops that serve that route (no disambiguation)
+                    if len(filtered_stops) > 0:
+                        # User specified a route - return all stops serving that route
+                        bus_stop_matches = filtered_stops
+                        # Update matches to only include filtered bus stops (plus any train stops if mode_filter allows)
+                        # This ensures the main loop only processes stops serving the specified route
+                        if mode_filter == 'bus':
+                            # Replace matches with only the filtered bus stops
+                            matches = filtered_stops
+                        else:
+                            # Keep train stops, but filter bus stops
+                            train_matches = [m for m in matches if any(mode in m.get('modes', []) for mode in ['tube', 'train', 'dlr', 'overground', 'tram', 'national-rail'])]
+                            matches = filtered_stops + train_matches
+                        # Skip disambiguation - proceed to fetch arrivals for all stops serving the route
+                    elif route_was_specified and len(filtered_stops) == 0:
+                        # Collect available routes from all bus stops
+                        available_routes = set()
+                        for match in bus_stop_matches:
+                            stop_lines = match.get('lines', [])
+                            for line in stop_lines:
+                                if isinstance(line, dict):
+                                    line_id = line.get('id', '')
+                                else:
+                                    line_id = str(line)
+                                if line_id:
+                                    available_routes.add(line_id)
+                        
+                        sorted_routes = sorted(available_routes, key=lambda x: (len(x), x))
+                        routes_str = ', '.join(sorted_routes) if sorted_routes else 'none'
+                        stop_name = bus_stop_matches[0].get('name', stop_query) if bus_stop_matches else stop_query
+                        requested_route = ', '.join(mentioned_routes)
+                        
+                        return {
+                            'error': 'route_not_served',
+                            'query': stop_query,
+                            'stop_name': stop_name,
+                            'requested_route': requested_route,
+                            'available_routes': sorted_routes,
+                            'available_routes_str': routes_str
+                        }
                 
-                # Simple disambiguation
+                # Only check for disambiguation if user did NOT specify a route
+                # If route was specified, we already filtered and will return all matching stops
+                
+                # Simple bus disambiguation: check if stops have different directions
                 if len(bus_stop_matches) > 1 and not route_was_specified:
-                    # Simple disambiguation: check if stops have different directions
                     towards_set = set((m.get('towards') or '').strip() for m in bus_stop_matches if (m.get('towards') or '').strip())
                     if len(towards_set) > 1:
                         labelled_stops = []
@@ -536,6 +701,90 @@ class TransportDataFetcher:
             'source': 'TFL'
         }
 
+    def get_tfl_timetable_by_stop_id(
+        self, stop_id: str, mode_filter: Optional[str] = None, stop_name: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        """Get timetable for a single TFL stop by ID (used after disambiguation)."""
+        if not self.has_tfl or not stop_id:
+            return None
+        mode_filter = mode_filter or 'bus'
+        if not stop_name:
+            try:
+                info_url = f"{self.tfl_base_url}/StopPoint/{stop_id}"
+                info_resp = requests.get(info_url, params=self._tfl_params(), timeout=5)
+                if info_resp.status_code == 200:
+                    stop_name = info_resp.json().get('commonName') or info_resp.json().get('name') or stop_id
+                else:
+                    stop_name = stop_id
+            except Exception:
+                stop_name = stop_id
+        arrival_stop_ids = self._expand_to_leaf_bus_stops(stop_id)
+        all_arrivals = []
+        for aid in arrival_stop_ids:
+            try:
+                resp = requests.get(f"{self.tfl_base_url}/StopPoint/{aid}/Arrivals", params=self._tfl_params(), timeout=10)
+                if resp.status_code == 200:
+                    stop_arrivals = resp.json()
+                    if stop_arrivals:
+                        for arr in stop_arrivals:
+                            arr["_stop_name"] = arr.get("stationName", stop_name)
+                            arr["_stop_id"] = aid
+                            arr["_query_stop_id"] = stop_id
+                            arr["_group_name"] = stop_name
+                        all_arrivals.extend(stop_arrivals)
+            except Exception as e:
+                print(f"Error fetching arrivals for stop {aid}: {e}")
+        if not all_arrivals:
+            return {'error': 'no_arrivals', 'stop_name': stop_name, 'query': stop_id}
+        return self._build_timetable_from_arrivals(all_arrivals, stop_name, stop_id, mode_filter)
+
+    def _get_stop_direction_from_arrivals(self, stop_id: str) -> tuple:
+        """
+        Fetch Arrivals for a stop and return (platform, towards) from the first prediction.
+        Used to enrich disambiguation labels when Search API does not provide direction info.
+        """
+        if not stop_id or not self.has_tfl:
+            return ('', '')
+        try:
+            arrival_ids = self._expand_to_leaf_bus_stops(stop_id)
+            for aid in arrival_ids[:1]:
+                url = f"{self.tfl_base_url}/StopPoint/{aid}/Arrivals"
+                resp = requests.get(url, params=self._tfl_params(), timeout=5)
+                if resp.status_code == 200:
+                    arrivals = resp.json()
+                    if arrivals:
+                        first = arrivals[0]
+                        platform = (first.get('platformName') or '').strip()
+                        towards = (first.get('towards') or '').strip()
+                        return (platform, towards)
+                break
+        except Exception:
+            pass
+        return ('', '')
+
+    def _format_bus_stop_disambiguation_name(
+        self, stop_match: Dict[str, Any], fallback_query: str,
+        enrich_from_arrivals: bool = False
+    ) -> str:
+        """Build a human-friendly label for a bus stop used in disambiguation prompts."""
+        base_name = stop_match.get('name') or fallback_query or 'Unknown stop'
+        towards = (stop_match.get('towards') or '').strip()
+        stop_id = stop_match.get('id') or ''
+        platform = self._platform_from_stop_id(stop_id)
+        if (not towards or not platform) and enrich_from_arrivals and stop_id:
+            arr_platform, arr_towards = self._get_stop_direction_from_arrivals(stop_id)
+            if arr_platform:
+                platform = arr_platform
+            if arr_towards:
+                towards = arr_towards
+        if platform and towards:
+            return f"{base_name} – Stop {platform} (towards {towards})"
+        if towards:
+            return f"{base_name} (towards {towards})"
+        if platform:
+            return f"{base_name} – Stop {platform}"
+        return base_name
+
     def _platform_from_stop_id(self, stop_id: str) -> str:
         """
         Derive platform/stop letter from TFL stop id (e.g. 490000153AA -> AA, 490000153BB -> BB).
@@ -548,7 +797,43 @@ class TransportDataFetcher:
             return tail.upper()
         return ''
 
-    # Map display names to TfL Line/Mode API ids
+
+    def get_route_recommendation(self, origin: str, destination: str, avoid_tolls: bool = False, avoid_motorways: bool = False) -> Optional[Dict[str, Any]]:
+        """
+        Get route recommendation between two points
+        
+        Args:
+            origin: Starting location
+            destination: Destination location
+            
+        Returns:
+            dict: Route information including distance, duration, traffic level
+        """
+        # Try TFL Journey Planner first (for London)
+        if self.has_tfl:
+            try:
+                tfl_journey = self._fetch_tfl_journey(origin, destination)
+                if tfl_journey:
+                    return tfl_journey
+            except Exception as e:
+                print(f"TFL Journey Planner error: {e}")
+        
+        # No API data available
+        return None
+    
+    def get_transit_route(self, origin: str, destination: str) -> Optional[Dict[str, Any]]:
+        """Get public transport route between origin and destination"""
+        if self.has_tfl:
+            try:
+                journey = self._fetch_tfl_journey(origin, destination)
+                if journey:
+                    return journey
+            except Exception as e:
+                print(f"Error fetching transit route: {e}")
+        return None
+    
+    
+    # Map display names (from _train_lines) to TfL Line/Mode API ids
     _TRAIN_LINE_DISPLAY_TO_ID = {
         'bakerloo': 'bakerloo',
         'central': 'central',
@@ -810,6 +1095,19 @@ class TransportDataFetcher:
         
         return None
     
+    def get_transit_route(self, origin: str, destination: str) -> Optional[Dict[str, Any]]:
+        """Get public transport route between origin and destination"""
+        if self.has_tfl:
+            try:
+                journey = self._fetch_tfl_journey(origin, destination)
+                if journey:
+                    return journey
+            except Exception as e:
+                print(f"Error fetching transit route: {e}")
+        
+        # No API data available - return None instead of mock data
+        return None
+    
     
     def _fetch_tfl_line_status(self, route: str) -> Optional[Dict[str, Any]]:
         """
@@ -922,13 +1220,73 @@ class TransportDataFetcher:
                             delay_minutes = max(delay_minutes, 15)
                         status = status_text
                 
+                # 2) Fallback: use top-level `disruptions` list when present
+                # This matches the shape shown in the sample TFL response the user provided,
+                # where each line object has a `disruptions` array alongside `lineStatuses`.
+                if not disruptions:
+                    for disruption in line_status.get('disruptions', []):
+                        # Prefer a human‑readable description if available
+                        desc = (
+                            disruption.get('description')
+                            or disruption.get('categoryDescription')
+                            or disruption.get('category')
+                        )
+                        if not desc:
+                            continue
+                        disruptions.append(desc)
+                        # Also extract detailed description if available
+                        detailed_desc = disruption.get('description', '')
+                        if detailed_desc and detailed_desc.strip() and detailed_desc not in detailed_descriptions:
+                            detailed_descriptions.append(detailed_desc.strip())
+                        
+                        # Extract location information from disruption if available
+                        affected_routes = disruption.get('affectedRoutes', [])
+                        affected_stops = disruption.get('affectedStops', [])
+                        
+                        # Check validityPeriods in disruption
+                        disruption_periods = disruption.get('validityPeriods', [])
+                        for period in disruption_periods:
+                            from_station = period.get('fromStation')
+                            to_station = period.get('toStation')
+                            
+                            if from_station and to_station:
+                                from_name = from_station.get('commonName', '') if isinstance(from_station, dict) else str(from_station)
+                                to_name = to_station.get('commonName', '') if isinstance(to_station, dict) else str(to_station)
+                                if from_name and to_name:
+                                    location_str = f"between {from_name} and {to_name}"
+                                    if location_str not in affected_locations:
+                                        affected_locations.append(location_str)
+                        
+                        # Severity-based rough delay estimation if a severity field is present
+                        severity = (disruption.get('severity') or '').lower()
+                        if 'severe' in severity or 'closure' in severity or 'closed' in severity:
+                            delay_minutes = max(delay_minutes, 30)
+                        elif 'minor' in severity or 'reduced' in severity:
+                            delay_minutes = max(delay_minutes, 5)
+                        else:
+                            # Generic disruption with unknown severity – treat as moderate
+                            delay_minutes = max(delay_minutes, 15)
+                        if status == 'Good Service':
+                            status = desc
+                
+                # Only calculate derived values if we have actual status / disruption data
+                # Don't add default/synthetic congestion or speed values
                 result = {
-                    'route': line_name, 'status': status,
+                    'route': line_name,
+                    'status': status,
                     'delay_minutes': delay_minutes,
-                    'timestamp': datetime.now().isoformat(), 'source': 'TFL'
+                    'disruptions': disruptions,
+                    'detailed_descriptions': detailed_descriptions,  # More specific disruption details
+                    'affected_locations': affected_locations,  # Location/segment information
+                    'timestamp': datetime.now().isoformat(),
+                    'source': 'TFL'
                 }
+                
+                # Only add congestion_level if we have a non‑zero delay (i.e. some disruption)
                 if delay_minutes > 0:
-                    result['congestion_level'] = 'light' if delay_minutes < 10 else 'moderate' if delay_minutes < 20 else 'heavy'
+                    congestion_level = 'light' if delay_minutes < 10 else 'moderate' if delay_minutes < 20 else 'heavy'
+                    result['congestion_level'] = congestion_level
+                
                 return result
         except requests.exceptions.RequestException as e:
             print(f"TFL API request failed: {e}")

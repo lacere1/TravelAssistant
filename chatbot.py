@@ -22,7 +22,7 @@ class TrafficChatbot:
             # When we asked "couldn't find a train/bus" - user can reply with just a line/route name
             'awaiting_disruption_line': None,  # 'train' | 'bus' when waiting for follow-up line/route
         }
-        # Per-user preference tracking removed in this prototype
+
         print("Traffic Chatbot initialized successfully")
     
     def process_message(
