@@ -306,6 +306,34 @@ header h1 {
     margin-bottom: 6px;
 }
 
+.chat-list-filter {
+    display: flex;
+    gap: 4px;
+    margin-bottom: 10px;
+}
+
+.chat-list-filter-btn {
+    flex: 1;
+    padding: 6px 10px;
+    font-size: 0.8rem;
+    border: 1px solid var(--sidebar-border);
+    border-radius: 6px;
+    background: var(--sidebar-input-bg);
+    color: var(--sidebar-text);
+    cursor: pointer;
+    transition: background 0.2s, border-color 0.2s;
+}
+
+.chat-list-filter-btn:hover {
+    background: var(--shortcut-item-hover);
+}
+
+.chat-list-filter-btn.active {
+    background: var(--input-focus);
+    border-color: var(--input-focus);
+    color: var(--text-inverse);
+}
+
 .chat-list-empty {
     list-style: none;
     padding: 12px 10px;
@@ -320,6 +348,40 @@ header h1 {
     margin: 0;
     flex: 1;
     overflow-y: auto;
+}
+
+.chat-list-delete-selected-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 8px 10px;
+    margin-bottom: 8px;
+    background: var(--shortcut-item-hover);
+    border-radius: 8px;
+    border: 1px solid var(--shortcut-border);
+    font-size: 0.8rem;
+    color: var(--text-secondary);
+}
+
+.chat-list-delete-selected-bar.hidden {
+    display: none !important;
+}
+
+.chat-list-delete-selected-btn {
+    padding: 4px 10px;
+    font-size: 0.8rem;
+    border: 1px solid var(--shortcut-border);
+    border-radius: 6px;
+    background: var(--bg-input);
+    color: var(--text-primary);
+    cursor: pointer;
+}
+
+.chat-list-delete-selected-btn:hover {
+    background: rgba(220, 53, 69, 0.2);
+    border-color: #dc3545;
+    color: #dc3545;
 }
 
 .chat-list-item {
@@ -341,6 +403,49 @@ header h1 {
 .chat-list-item.active {
     background: var(--sidebar-bg);
     border: 1px solid var(--sidebar-border);
+}
+
+.chat-list-item-selected .chat-list-item-checkbox {
+    background: var(--input-focus);
+    color: var(--text-inverse);
+}
+
+.chat-list-item-checkbox {
+    flex-shrink: 0;
+    width: 20px;
+    height: 20px;
+    padding: 0;
+    border: 1px solid var(--sidebar-border);
+    border-radius: 4px;
+    background: var(--sidebar-input-bg);
+    color: transparent;
+    font-size: 0.75rem;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.chat-list-item-checkbox:hover {
+    border-color: var(--input-focus);
+}
+
+.chat-list-item-star {
+    flex-shrink: 0;
+    width: 24px;
+    height: 24px;
+    padding: 0;
+    border: none;
+    border-radius: 4px;
+    background: transparent;
+    color: var(--text-muted);
+    font-size: 1rem;
+    cursor: pointer;
+    line-height: 1;
+}
+
+.chat-list-item-star:hover {
+    color: #f0c14b;
 }
 
 .chat-list-item-content {
@@ -477,6 +582,37 @@ header h1 {
     background: var(--sidebar-border);
 }
 
+.account-menu-avatar {
+    font-size: 1.1rem;
+    flex-shrink: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+}
+
+.account-menu-avatar-img-wrap {
+    border-radius: 50%;
+    overflow: hidden;
+    background: var(--sidebar-border);
+}
+
+.account-menu-avatar-img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
+}
+
+.avatar-file-input {
+    position: absolute;
+    width: 0;
+    height: 0;
+    opacity: 0;
+    pointer-events: none;
+}
+
 .account-menu-username {
     flex: 1;
     min-width: 0;
@@ -488,6 +624,7 @@ header h1 {
 .account-menu-chevron {
     font-size: 0.6rem;
     opacity: 0.8;
+    flex-shrink: 0;
 }
 
 .account-dropdown {
@@ -521,7 +658,16 @@ header h1 {
     background: var(--sidebar-border);
 }
 
-/* Auth page */
+.account-dropdown-item-subtle {
+    font-size: 0.8rem;
+    color: var(--text-muted);
+}
+
+.account-dropdown-item-subtle:hover {
+    color: var(--sidebar-text);
+}
+
+/* -------- Auth (login/sign up) page -------- */
 .auth-page {
     min-height: 100vh;
     display: flex;
@@ -1154,8 +1300,116 @@ header h1 {
     margin-top: 2px;
 }
 
+.journey-leg-link {
+    color: var(--journey-link);
+    text-decoration: underline;
+    margin-left: 8px;
+}
 
-/* Ensure journey cards as bot message take full width */
+.journey-leg-link:hover {
+    opacity: 0.9;
+}
+
+.journey-card-dest .journey-card-leg-detail {
+    color: var(--journey-link);
+    font-weight: 500;
+}
+
+.journey-card-actions {
+    display: flex;
+    gap: 10px;
+    margin-top: 12px;
+    padding-top: 12px;
+    border-top: 1px solid var(--border-main);
+}
+
+.journey-card-btn {
+    padding: 8px 14px;
+    font-size: 0.9rem;
+    color: var(--journey-link);
+    background: var(--bg-container);
+    border: 1px solid var(--journey-border);
+    border-radius: 8px;
+    cursor: pointer;
+}
+
+.journey-card-btn:hover {
+    background: var(--shortcut-item-hover);
+    border-color: var(--journey-link);
+}
+
+.journey-debug {
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    margin-top: 8px;
+    word-break: break-all;
+}
+
+.journey-leg-expandable {
+    margin-top: 8px;
+    padding-top: 8px;
+    border-top: 1px dashed var(--border-main);
+}
+
+.journey-leg-expandable.hidden {
+    display: none !important;
+}
+
+.journey-leg-steps {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding-left: 10px;
+    border-left: 2px dashed var(--journey-border);
+    margin-left: 2px;
+}
+
+.journey-leg-step {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    font-size: 0.9rem;
+    line-height: 1.35;
+}
+
+.journey-step-desc {
+    color: var(--text-primary);
+}
+
+.journey-step-dist {
+    color: var(--text-secondary);
+    font-size: 0.85rem;
+    white-space: nowrap;
+}
+
+.journey-leg-stops {
+    list-style: none;
+    margin: 0;
+    padding: 0 0 0 12px;
+    border-left: 2px solid var(--border-main);
+    margin-left: 2px;
+}
+
+.journey-leg-stops li {
+    font-size: 0.9rem;
+    color: var(--text-primary);
+    padding: 4px 0;
+    position: relative;
+}
+
+.journey-leg-stops li::before {
+    content: "";
+    position: absolute;
+    left: -14px;
+    top: 50%;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--text-muted);
+    transform: translateY(-50%);
+}
+
+/* Ensure journey cards as bot message take full width and don't overlap */
 .message.bot-message.journey-cards-wrap {
     width: 100%;
     max-width: 100%;

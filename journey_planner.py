@@ -178,6 +178,47 @@ class TflJourneyClient:
 
         return options
 
+    def search_places(self, query: str) -> List[Dict[str, Any]]:
+        """
+        Use TfL's Place Search endpoint for autocomplete-style location lookup.
+        Returns a list of options with id/name/shortLabel suitable for UI use.
+        """
+        if not query:
+            return []
+
+        params = self._auth_params()
+        # TfL Place Search uses `name` as the query parameter and returns
+        # a JSON array of Place objects (as seen in the Waterloo example).
+        params["name"] = query
+        url = f"{TFL_BASE_URL}/Place/Search"
+        self.last_url = url
+
+        try:
+            resp = self.session.get(url, params=params, timeout=5)
+            resp.raise_for_status()
+        except Exception:
+            return []
+
+        places = resp.json()
+
+        results: List[Dict[str, Any]] = []
+        for p in places:
+            pid = p.get("id") or p.get("naptanId")
+            if not pid:
+                continue
+            name = p.get("name") or p.get("commonName") or query
+            place_type = p.get("placeType") or ",".join(p.get("modes", []))
+            results.append(
+                {
+                    "id": pid,
+                    "name": name,
+                    "qualifier": place_type,
+                    "shortLabel": name,
+                }
+            )
+
+        return results
+
     def get_journeys(self, from_id: str, to_id: str, when: Dict[str, Any]) -> List[Dict[str, Any]]:
         """
         Fetches journeys between two resolved place IDs around a given datetime.
@@ -503,6 +544,7 @@ class JourneyChatbot:
             if journeys:
                 reply = _journey_reply(True)
                 out = {"reply": reply, "journeys": journeys}
+                if self.tfl_client.last_url:
                     out["tfl_journey_url"] = self.tfl_client.last_url
                 return out
 
@@ -533,6 +575,7 @@ class JourneyChatbot:
             reply = "I couldn't find any journeys for that time. Try a different time?"
         else:
             reply = _journey_reply(True)
+            if self.tfl_client.last_url:
 
         out = {"reply": reply, "journeys": journeys}
         if journeys and self.tfl_client.last_url:
@@ -629,6 +672,7 @@ class JourneyChatbot:
                 user_state.pop(pending_question_key, None)
                 # silently continue – next call will progress the flow
                 reply = "Okay."
+                if self.tfl_client.last_url:
                 return {
                     "reply": reply,
                     "journeys": [],
@@ -654,6 +698,7 @@ class JourneyChatbot:
                 f"I couldn't find anything matching '{query}'. "
                 "Could you rephrase or give a nearby station or area?"
             )
+            if self.tfl_client.last_url:
             return {
                 "reply": reply,
                 "journeys": [],
@@ -663,6 +708,7 @@ class JourneyChatbot:
         if len(options) == 1:
             user_state[chosen_id_key] = options[0]["id"]
             reply = f"Got it: {options[0]['name']}."
+            if self.tfl_client.last_url:
             return {
                 "reply": reply,
                 "journeys": [],
@@ -677,6 +723,7 @@ class JourneyChatbot:
         user_state[pending_question_key] = question
 
         reply = question
+        if self.tfl_client.last_url:
         return {
             "reply": reply,
             "journeys": [],

@@ -507,6 +507,42 @@ function getLegLineClass(mode) {
     return 'leg-line leg-line-tube';
 }
 
+function tryParseJson(str) {
+    try {
+        return typeof str === 'string' ? JSON.parse(str) : str;
+    } catch {
+        return [];
+    }
+}
+
+function buildDirectionsHtml(steps) {
+    if (!Array.isArray(steps) || steps.length === 0) return '';
+    const list = document.createElement('div');
+    list.className = 'journey-leg-steps';
+    steps.forEach((step) => {
+        const desc = step.description || step.detailedDescription || step.turnInstruction || '';
+        const dist = step.distance != null ? step.distance + 'm' : '';
+        const line = document.createElement('div');
+        line.className = 'journey-leg-step';
+        line.innerHTML = `<span class="journey-step-desc">${escapeHtml(desc)}</span>${dist ? `<span class="journey-step-dist">${escapeHtml(String(dist))}</span>` : ''}`;
+        line.appendChild(document.createTextNode(''));
+        list.appendChild(line);
+    });
+    return list.outerHTML;
+}
+
+function buildStopsHtml(stops) {
+    if (!Array.isArray(stops) || stops.length === 0) return '';
+    const list = document.createElement('ul');
+    list.className = 'journey-leg-stops';
+    stops.forEach((name) => {
+        const li = document.createElement('li');
+        li.textContent = name;
+        list.appendChild(li);
+    });
+    return list.outerHTML;
+}
+
 function buildJourneyCard(journey) {
     const card = document.createElement('div');
     card.className = 'journey-card';
@@ -528,17 +564,37 @@ function buildJourneyCard(journey) {
     timeline.className = 'journey-card-timeline';
     journey.legs.forEach((leg, i) => {
         const isLast = i === journey.legs.length - 1;
+        const lineClass = getLegLineClass(leg.mode);
+        const iconClass = getLegIconClass(leg.mode);
         const legMins = leg.duration != null ? leg.duration : '';
+        const m = (leg.mode || '').toLowerCase();
+        const isWalk = m === 'walk' || m === 'walking';
+        const hasDirections = isWalk && (leg.steps?.length || (leg.fromLatLng && leg.toLatLng));
+        const hasStops = !isWalk && leg.stops?.length;
+        const showLink = hasDirections || hasStops;
+        const linkText = isWalk ? 'View directions' : 'View stops';
         const row = document.createElement('div');
         row.className = 'journey-card-leg';
+        row.dataset.legIndex = String(i);
+        row.dataset.isWalk = isWalk ? '1' : '0';
+        if (hasDirections) {
+            row.dataset.steps = JSON.stringify(leg.steps || []);
+            if (leg.fromLatLng) row.dataset.fromLatLng = leg.fromLatLng;
+            if (leg.toLatLng) row.dataset.toLatLng = leg.toLatLng;
+        }
+        if (hasStops) row.dataset.stops = JSON.stringify(leg.stops);
         row.innerHTML = `
       <div class="journey-card-leg-left">
-        <div class="${getLegIconClass(leg.mode)}"></div>
-        ${!isLast ? `<div class="${getLegLineClass(leg.mode)}"></div>` : ''}
+        <div class="${iconClass}"></div>
+        ${!isLast ? `<div class="${lineClass}"></div>` : ''}
       </div>
       <div class="journey-card-leg-right">
         <div class="journey-card-leg-detail">${leg.detail || leg.mode}</div>
-        <div class="journey-card-leg-meta">${legMins !== '' ? `${legMins} min` : ''}</div>
+        <div class="journey-card-leg-meta">
+          ${legMins !== '' ? `${legMins} min` : ''}
+          ${showLink ? `<a href="#" class="journey-leg-link" data-link-type="${isWalk ? 'directions' : 'stops'}">${linkText}</a>` : ''}
+        </div>
+        <div class="journey-leg-expandable hidden" aria-live="polite"></div>
       </div>
     `;
         timeline.appendChild(row);
@@ -568,9 +624,91 @@ function buildJourneyCard(journey) {
 }
 
 function appendJourneyCards(journeys, debugText, options) {
+    options = options || {};
+    const tflUrl = options.tflJourneyUrl || '';
+    const fromId = options.fromId || '';
+    const toId = options.toId || '';
+    let mapUrl = '';
+    if (fromId && toId) {
+        mapUrl = 'https://www.google.com/maps/dir/?api=1&origin=' + encodeURIComponent(fromId) + '&destination=' + encodeURIComponent(toId) + '&travelmode=transit';
+    } else {
+        mapUrl = 'https://www.google.com/maps';
+    }
+
     const wrap = document.createElement('div');
     wrap.className = 'message bot-message journey-cards-wrap';
+    wrap.dataset.tflUrl = tflUrl;
+    wrap.dataset.mapUrl = mapUrl;
     journeys.forEach((j) => wrap.appendChild(buildJourneyCard(j)));
+
+    wrap.addEventListener('click', (e) => {
+        const link = e.target.closest('.journey-leg-link');
+        if (link) {
+            e.preventDefault();
+            const legRow = link.closest('.journey-card-leg');
+            const expandable = legRow?.querySelector('.journey-leg-expandable');
+            const type = link.dataset.linkType;
+
+            if (type === 'directions') {
+                const stepsJson = legRow?.dataset.steps;
+                const steps = stepsJson ? tryParseJson(stepsJson) : [];
+                const fromLatLng = legRow?.dataset.fromLatLng;
+                const toLatLng = legRow?.dataset.toLatLng;
+
+                if (expandable?.classList.contains('hidden')) {
+                    if (steps?.length) {
+                        expandable.innerHTML = buildDirectionsHtml(steps);
+                        expandable.classList.remove('hidden');
+                        link.textContent = 'Hide directions';
+                    } else if (fromLatLng && toLatLng) {
+                        const url = 'https://www.google.com/maps/dir/?api=1&origin=' + encodeURIComponent(fromLatLng) + '&destination=' + encodeURIComponent(toLatLng) + '&travelmode=walking';
+                        window.open(url, '_blank');
+                    } else {
+                        const w = link.closest('.journey-cards-wrap');
+                        if (w?.dataset?.mapUrl) window.open(w.dataset.mapUrl, '_blank');
+                    }
+                } else {
+                    expandable.classList.add('hidden');
+                    expandable.innerHTML = '';
+                    link.textContent = 'View directions';
+                }
+                return;
+            }
+
+            if (type === 'stops') {
+                const stopsJson = legRow?.dataset.stops;
+                const stops = stopsJson ? tryParseJson(stopsJson) : [];
+                if (expandable?.classList.contains('hidden')) {
+                    if (stops?.length) {
+                        expandable.innerHTML = buildStopsHtml(stops);
+                        expandable.classList.remove('hidden');
+                        link.textContent = 'Hide stops';
+                    }
+                } else {
+                    expandable.classList.add('hidden');
+                    expandable.innerHTML = '';
+                    link.textContent = 'View stops';
+                }
+                return;
+            }
+        }
+
+        const btn = e.target.closest('.journey-card-btn');
+        if (!btn) return;
+        const actions = btn.closest('.journey-card-actions');
+        const idx = Array.prototype.indexOf.call(actions.children, btn);
+        const w = btn.closest('.journey-cards-wrap');
+        if (idx === 0 && w?.dataset?.tflUrl) window.open(w.dataset.tflUrl, '_blank');
+        else if (idx === 1 && w?.dataset?.mapUrl) window.open(w.dataset.mapUrl, '_blank');
+    });
+
+    if (debugText && debugText.includes('[debug]')) {
+        const debugLine = debugText.split('\n').find((line) => line.includes('[debug]')) || debugText;
+        const debug = document.createElement('div');
+        debug.className = 'journey-debug';
+        debug.textContent = debugLine.trim();
+        wrap.appendChild(debug);
+    }
     chatMessages.appendChild(wrap);
     chatMessages.scrollTop = chatMessages.scrollHeight;
 }
@@ -672,7 +810,6 @@ function appendTimetableCard(timetableData, messageText) {
         card.appendChild(empty);
     }
 
-    appendReadAloudAndShareButtons(card, messageText);
     wrap.appendChild(card);
     chatMessages.appendChild(wrap);
     chatMessages.scrollTop = chatMessages.scrollHeight;
@@ -722,7 +859,6 @@ function appendDisruptionCard(disruptionData, messageText) {
         card.appendChild(altEl);
     }
 
-    appendReadAloudAndShareButtons(card, messageText);
     wrap.appendChild(card);
     chatMessages.appendChild(wrap);
     chatMessages.scrollTop = chatMessages.scrollHeight;

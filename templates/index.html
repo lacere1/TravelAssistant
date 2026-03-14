@@ -19,21 +19,40 @@
                 <div class="sidebar-title">Travel assistant</div>
                 <div class="sidebar-subtitle">Chats</div>
             </div>
-            <button id="newChatButton" class="sidebar-button primary-button">New chat</button>
+
+            <button id="newChatButton" class="sidebar-button primary-button">
+                New chat
+            </button>
+
             <div class="sidebar-search">
-                <input type="text" id="chatSearchInput" placeholder="Search chats" autocomplete="off">
+                <input
+                    type="text"
+                    id="chatSearchInput"
+                    placeholder="Search chats"
+                    autocomplete="off"
+                >
             </div>
+
+            <div id="chatListFilter" class="chat-list-filter" role="group" aria-label="Chat list filter">
+            </div>
+
             <div class="sidebar-section">
                 <div class="sidebar-section-title">Your chats</div>
-                <ul id="chatList" class="chat-list" aria-label="Saved chats"></ul>
+                <ul id="chatList" class="chat-list" aria-label="Saved chats">
+                </ul>
             </div>
+
             <div class="sidebar-account">
                 <div id="accountLoggedOut" class="account-logged-out">
-                    <a href="/login" id="loginLink" class="sidebar-button login-link-button">Log in / Sign up</a>
+                    <a href="/login" id="loginLink" class="sidebar-button login-link-button">
+                        Log in / Sign up
+                    </a>
                 </div>
+
                 <div id="accountLoggedIn" class="account-logged-in hidden">
                     <div class="account-button-wrap">
-                        <button type="button" id="accountMenuButton" class="account-menu-button" aria-expanded="false">
+                        <button type="button" id="accountMenuButton" class="account-menu-button" aria-expanded="false" aria-haspopup="true" aria-label="Account menu">
+                            <span class="account-menu-avatar" id="accountMenuAvatar" aria-hidden="true">👤</span>
                             <span id="currentUsername" class="account-menu-username"></span>
                             <span class="account-menu-chevron" aria-hidden="true">▼</span>
                         </button>
@@ -44,6 +63,7 @@
                 </div>
             </div>
         </aside>
+
         <div class="container">
             <header>
                 <div class="header-row">
@@ -52,7 +72,7 @@
                         <p class="subtitle">Practical help with routes, traffic, and planning your journeys</p>
                     </div>
                     <div class="header-actions">
-                        <button type="button" id="themeToggle" class="theme-toggle header-action-btn" aria-label="Toggle theme">
+                        <button type="button" id="themeToggle" class="theme-toggle header-action-btn" aria-label="Toggle light/dark mode" title="Toggle light/dark mode">
                             <span class="theme-icon theme-icon-sun" aria-hidden="true">☀</span>
                             <span class="theme-icon theme-icon-moon hidden" aria-hidden="true">🌙</span>
                             <span id="themeToggleLabel" class="header-action-label">Light</span>
@@ -72,36 +92,105 @@
                                         <li>Choosing a good time to set off</li>
                                         <li>Simple route suggestions</li>
                                     </ul>
+                                    <p>You can ask things like: "How busy is the A1 right now?" or "What time is best to drive into the city?"</p>
                                 </div>
                             </div>
                         </div>
+
                         <div class="journey-planner-toggle-wrap">
-                            <button type="button" id="journey-planner-toggle" class="journey-planner-toggle-btn hidden" aria-expanded="false">Show journey planner</button>
+                            <button
+                                type="button"
+                                id="journey-planner-toggle"
+                                class="journey-planner-toggle-btn hidden"
+                                aria-expanded="false"
+                                aria-controls="journey-inputs"
+                            >
+                                Show journey planner
+                            </button>
                         </div>
-                        <section id="journey-inputs" class="journey-inputs hidden" aria-label="Refine journey">
-                            <div class="journey-field"><label for="from-input">From</label><input id="from-input" type="text" autocomplete="off" placeholder="Start location"></div>
-                            <div class="journey-field"><label for="to-input">To</label><input id="to-input" type="text" autocomplete="off" placeholder="Destination"></div>
-                            <div class="journey-field journey-when"><label for="date-input">When</label>
-                                <div class="journey-when-row"><input id="date-input" type="date"><input id="time-input" type="time"></div>
+
+                        <section
+                            id="journey-inputs"
+                            class="journey-inputs hidden"
+                            aria-label="Refine journey"
+                        >
+                            <div class="journey-field">
+                                <label for="from-input">From</label>
+                                <input
+                                    id="from-input"
+                                    type="text"
+                                    autocomplete="off"
+                                    placeholder="Start location (e.g. Harlesden)"
+                                />
+                                <ul id="from-suggestions" class="suggestions-list" role="listbox"></ul>
                             </div>
-                            <div class="journey-actions"><button id="plan-btn" type="button">Plan</button></div>
+
+                            <div class="journey-field">
+                                <label for="to-input">To</label>
+                                <input
+                                    id="to-input"
+                                    type="text"
+                                    autocomplete="off"
+                                    placeholder="Destination (e.g. Oxford Street)"
+                                />
+                                <ul id="to-suggestions" class="suggestions-list" role="listbox"></ul>
+                            </div>
+
+                            <div class="journey-field journey-when">
+                                <label for="date-input">When</label>
+                                <div class="journey-when-row">
+                                    <input
+                                        id="date-input"
+                                        type="date"
+                                        aria-label="Travel date"
+                                    />
+                                    <input
+                                        id="time-input"
+                                        type="time"
+                                        aria-label="Travel time"
+                                    />
+                                </div>
+                                <small class="journey-when-hint">
+                                    Example: <strong>2026-02-12</strong> and <strong>17:30</strong>
+                                </small>
+                            </div>
+
+                            <div class="journey-actions">
+                                <button id="plan-btn" type="button">Plan</button>
+                            </div>
                         </section>
+
                         <div class="chat-input-container">
-                            <input type="text" id="userInput" placeholder="Ask about traffic, delays, routes..." autocomplete="off">
+                            <input 
+                                type="text" 
+                                id="userInput" 
+                                placeholder="Ask about traffic, delays, routes..." 
+                                autocomplete="off"
+                            >
                             <button id="sendButton">Send</button>
                         </div>
                     </div>
                 </div>
+
                 <aside class="side-panel" aria-label="Detected intent and entities">
                     <div class="info-panel">
-                        <div class="info-item"><strong>Detected Intent:</strong> <span id="intentDisplay">-</span></div>
-                        <div class="info-item"><strong>Confidence:</strong> <span id="confidenceDisplay">-</span></div>
-                        <div class="info-item"><strong>Entities:</strong> <span id="entitiesDisplay">-</span></div>
+                        <div class="info-item">
+                            <strong>Detected Intent:</strong> <span id="intentDisplay">-</span>
+                        </div>
+                        <div class="info-item">
+                            <strong>Confidence:</strong> <span id="confidenceDisplay">-</span>
+                        </div>
+                        <div class="info-item">
+                            <strong>Entities:</strong> <span id="entitiesDisplay">-</span>
+                        </div>
                     </div>
+
+                    <!-- Side-panel space reserved for future features -->
                 </aside>
             </div>
         </div>
     </div>
+
     <script src="{{ url_for('static', filename='script.js') }}"></script>
 </body>
 </html>

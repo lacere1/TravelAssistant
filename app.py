@@ -1,6 +1,7 @@
 from flask import Flask, render_template, request, jsonify, session
 from datetime import datetime
 import os
+import re
 
 from chatbot import TrafficChatbot
 from journey_planner import JourneyChatbot
@@ -8,14 +9,21 @@ from journey_planner import JourneyChatbot
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev-secret-key-change-in-production')
 
+# Very simple in-memory user store for demo purposes only.
 USERS = {}
+
+# Initialize chatbots
 traffic_chatbot = TrafficChatbot()
 journey_chatbot = JourneyChatbot()
 
 
 @app.route('/')
 def index():
-    return render_template('index.html')
+    """Main page with chat + journey planner interface"""
+    return render_template(
+        'index.html',
+        google_places_api_key=os.getenv('GOOGLE_PLACES_API_KEY', ''),
+    )
 
 
 @app.route('/login', methods=['GET'])
@@ -25,7 +33,12 @@ def login_page():
 
 @app.route('/me', methods=['GET'])
 def me():
-    return jsonify({'username': session.get('username')})
+    username = session.get('username')
+    return jsonify({'username': username})
+
+
+def _current_user_key() -> str:
+    return session.get('username') or '_anon'
 
 
 @app.route('/login', methods=['POST'])
@@ -33,8 +46,10 @@ def login():
     data = request.get_json(force=True) or {}
     username = (data.get('username') or '').strip()
     password = (data.get('password') or '').strip()
+
     if not username or not password:
         return jsonify({'error': 'Username and password are required.'}), 400
+
     is_new_user = username not in USERS
     if is_new_user:
         if len(username) <= 3:
@@ -44,6 +59,7 @@ def login():
     else:
         if USERS[username] != password:
             return jsonify({'error': 'Incorrect password.'}), 400
+
     USERS[username] = password
     session['username'] = username
     return jsonify({'username': username})
@@ -55,63 +71,86 @@ def logout():
     return jsonify({'ok': True})
 
 
+def _looks_like_journey_message(text: str) -> bool:
+    t = (text or '').lower()
+    if ' from ' in t and ' to ' in t:
+        return True
+    if 'plan a journey' in t or 'plan journey' in t:
+        return True
+    return False
+
+
 @app.route('/chat', methods=['POST'])
 def chat():
     try:
         data = request.get_json(force=True) or {}
-        user_message = (data.get('message') or '').strip()
-        from_text = (data.get('from') or '').strip()
-        to_text = (data.get('to') or '').strip()
+        user_message_raw = (data.get('message') or '').strip()
+
+        from_text_raw = (data.get('from') or '').strip()
+        to_text_raw = (data.get('to') or '').strip()
         from_id = (data.get('fromId') or '').strip() or None
         to_id = (data.get('toId') or '').strip() or None
         date_str = (data.get('date') or '').strip() or None
         time_str = (data.get('time') or '').strip() or None
+
+        user_key = _current_user_key()
+        user_message = user_message_raw
+        from_text = from_text_raw
+        to_text = to_text_raw
+
         now = datetime.utcnow()
         username = session.get('username')
 
-        # Structured journey inputs
+        # 1) Structured journey inputs
         if from_text and to_text:
-            jp = journey_chatbot.handle_structured_journey(
+            jp_response = journey_chatbot.handle_structured_journey(
                 from_text=from_text, to_text=to_text,
                 from_id=from_id, to_id=to_id,
                 date_str=date_str, time_str=time_str,
                 now=now, username=username,
             )
             return jsonify({
-                'response': jp.get('reply', ''),
-                'journeys': jp.get('journeys', []),
+                'response': jp_response.get('reply', ''),
+                'journeys': jp_response.get('journeys', []),
+                'tfl_journey_url': jp_response.get('tfl_journey_url'),
+                'disambiguation': jp_response.get('disambiguation', False),
+                'from_id': from_id or '',
+                'to_id': to_id or '',
                 'intent': 'journey_planner',
                 'entities': {'from': from_text, 'to': to_text},
                 'confidence': 1.0,
-                'disambiguation': jp.get('disambiguation', False),
             })
 
-        # Free-text journey
-        t = (user_message or '').lower()
-        if ' from ' in t and ' to ' in t:
-            jp = journey_chatbot.handle_message(user_message, now=now, username=username)
+        # 2) Free-text journey query
+        if _looks_like_journey_message(user_message):
+            jp_response = journey_chatbot.handle_message(user_message, now=now, username=username)
             return jsonify({
-                'response': jp.get('reply', ''),
-                'journeys': jp.get('journeys', []),
+                'response': jp_response.get('reply', ''),
+                'journeys': jp_response.get('journeys', []),
+                'tfl_journey_url': jp_response.get('tfl_journey_url'),
+                'disambiguation': jp_response.get('disambiguation', False),
                 'intent': 'journey_planner',
                 'entities': {},
                 'confidence': 0.95,
-                'disambiguation': jp.get('disambiguation', False),
             })
 
-        # Traffic chatbot
+        # 3) Traffic chatbot
         if not user_message:
             return jsonify({'error': 'No message provided'}), 400
-        resp = traffic_chatbot.process_message(user_message, username=username)
+
+        traffic_response = traffic_chatbot.process_message(
+            user_message, user_key=_current_user_key(), username=username
+        )
+
         return jsonify({
-            'response': resp['message'],
-            'intent': resp.get('intent', 'unknown'),
-            'entities': resp.get('entities', {}),
-            'confidence': resp.get('confidence', 0.0),
+            'response': traffic_response['message'],
+            'intent': traffic_response.get('intent', 'unknown'),
+            'entities': traffic_response.get('entities', {}),
+            'confidence': traffic_response.get('confidence', 0.0),
             'journeys': [],
             'disambiguation': False,
-            'timetable': resp.get('timetable'),
-            'disruption': resp.get('disruption'),
+            'timetable': traffic_response.get('timetable'),
+            'disruption': traffic_response.get('disruption'),
         })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -119,7 +158,7 @@ def chat():
 
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({'status': 'healthy'})
+    return jsonify({'status': 'healthy', 'service': 'Travel assistant'})
 
 
 if __name__ == '__main__':
