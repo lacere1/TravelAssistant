@@ -3,81 +3,37 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Log in — Travel assistant</title>
+    <title>Log in / Sign up — Travel assistant</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
-    <style>
-        body.auth-page {
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            background: var(--bg-page);
-        }
-        .auth-container {
-            width: 100%;
-            max-width: 400px;
-            padding: 40px;
-            background: var(--bg-container);
-            border: 1px solid var(--border-main);
-            border-radius: 8px;
-            box-shadow: var(--shadow);
-        }
-        .auth-title {
-            font-size: 24px;
-            margin: 20px 0 10px 0;
-        }
-        .auth-subtitle {
-            color: var(--text-secondary);
-            font-size: 14px;
-            margin-bottom: 20px;
-        }
-        .auth-form {
-            display: flex;
-            flex-direction: column;
-            gap: 15px;
-        }
-        .auth-field label {
-            display: block;
-            font-size: 12px;
-            font-weight: 600;
-            margin-bottom: 6px;
-        }
-        .auth-field input {
-            width: 100%;
-            padding: 12px;
-            border: 1px solid var(--border-main);
-            border-radius: 6px;
-            font-size: 14px;
-        }
-        .auth-field input:focus {
-            outline: none;
-            border-color: var(--accent);
-        }
-        .auth-submit {
-            background: var(--accent);
-            color: white;
-            border: none;
-            padding: 12px;
-            border-radius: 6px;
-            font-size: 14px;
-            font-weight: 600;
-            cursor: pointer;
-        }
-        .auth-submit:hover {
-            background: var(--accent-hover);
-        }
-    </style>
+    <script>
+        (function() {
+            var t = localStorage.getItem('travelAssistantTheme');
+            if (t === 'dark' || t === 'light') document.documentElement.setAttribute('data-theme', t);
+        })();
+    </script>
 </head>
 <body class="auth-page">
     <div class="auth-container">
-        <h1 class="auth-title">Log in</h1>
-        <p class="auth-subtitle">Enter your credentials</p>
+        <a href="{{ url_for('index') }}" class="auth-back">← Back to Travel assistant</a>
+        <h1 class="auth-title">Log in / Sign up</h1>
+        <p class="auth-subtitle">Use the same form to log in or create an account.</p>
+
+        <div class="auth-requirements">
+            <strong>Registration requirements</strong>
+            <ul>
+                <li>Username: longer than 3 characters</li>
+                <li>Password: minimum 8 characters</li>
+            </ul>
+        </div>
 
         <form id="authForm" class="auth-form">
             <div class="auth-field">
                 <label for="authUsername">Username</label>
                 <input
                     id="authUsername"
+                    name="username"
                     type="text"
+                    autocomplete="username"
                     placeholder="e.g. jane"
                     required
                 >
@@ -86,36 +42,56 @@
                 <label for="authPassword">Password</label>
                 <input
                     id="authPassword"
+                    name="password"
                     type="password"
+                    autocomplete="current-password"
                     placeholder="••••••••"
                     required
                 >
             </div>
-            <button type="submit" class="auth-submit">Log in</button>
+            <div id="authError" class="auth-error hidden"></div>
+            <button type="submit" class="auth-submit">Log in / Sign up</button>
         </form>
     </div>
-
     <script>
-        document.getElementById('authForm').addEventListener('submit', function(e) {
-            e.preventDefault();
-            const username = document.getElementById('authUsername').value;
-            const password = document.getElementById('authPassword').value;
-
-            fetch('/login', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ username, password })
-            })
-            .then(res => res.json())
-            .then(data => {
-                if (data.username) {
-                    window.location.href = '/';
-                } else {
-                    alert('Login failed: ' + (data.error || 'Unknown error'));
+        (function() {
+            var form = document.getElementById('authForm');
+            var errorEl = document.getElementById('authError');
+            function showError(msg) {
+                errorEl.textContent = msg;
+                errorEl.classList.remove('hidden');
+            }
+            function hideError() {
+                errorEl.textContent = '';
+                errorEl.classList.add('hidden');
+            }
+            form.addEventListener('submit', function(e) {
+                e.preventDefault();
+                hideError();
+                var username = (document.getElementById('authUsername').value || '').trim();
+                var password = (document.getElementById('authPassword').value || '').trim();
+                if (!username || !password) {
+                    showError('Please enter a username and password.');
+                    return;
                 }
-            })
-            .catch(err => alert('Error: ' + err.message));
-        });
+                fetch('/login', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ username: username, password: password })
+                })
+                    .then(function(res) { return res.json().then(function(data) { return { ok: res.ok, data: data }; }); })
+                    .then(function(result) {
+                        if (result.ok) {
+                            window.location.href = '/';
+                        } else {
+                            showError(result.data.error || 'Login failed.');
+                        }
+                    })
+                    .catch(function() {
+                        showError('Something went wrong. Please try again.');
+                    });
+            });
+        })();
     </script>
 </body>
 </html>

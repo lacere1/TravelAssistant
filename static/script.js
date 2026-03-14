@@ -1,16 +1,15 @@
+// Chat interface JavaScript
 const chatMessages = document.getElementById('chatMessages');
 const userInput = document.getElementById('userInput');
 const sendButton = document.getElementById('sendButton');
-const voiceInputButton = document.getElementById('voiceInputButton');
 const intentDisplay = document.getElementById('intentDisplay');
 const confidenceDisplay = document.getElementById('confidenceDisplay');
 const entitiesDisplay = document.getElementById('entitiesDisplay');
 
+// Sidebar elements (chats + account)
 const newChatButton = document.getElementById('newChatButton');
 const chatSearchInput = document.getElementById('chatSearchInput');
 const chatList = document.getElementById('chatList');
-const chatFilterAll = document.getElementById('chatFilterAll');
-const chatFilterStarred = document.getElementById('chatFilterStarred');
 const loginLink = document.getElementById('loginLink');
 const logoutButton = document.getElementById('logoutButton');
 const accountLoggedOut = document.getElementById('accountLoggedOut');
@@ -18,9 +17,9 @@ const accountLoggedIn = document.getElementById('accountLoggedIn');
 const currentUsernameEl = document.getElementById('currentUsername');
 const accountMenuButton = document.getElementById('accountMenuButton');
 const accountDropdown = document.getElementById('accountDropdown');
-const themeToggle = document.getElementById('themeToggle');
-const themeToggleLabel = document.getElementById('themeToggleLabel');
 
+
+// Journey planner UI elements
 const journeyInputsSection = document.getElementById('journey-inputs');
 const journeyPlannerToggle = document.getElementById('journey-planner-toggle');
 const fromInput = document.getElementById('from-input');
@@ -29,15 +28,22 @@ const dateInput = document.getElementById('date-input');
 const timeInput = document.getElementById('time-input');
 const planBtn = document.getElementById('plan-btn');
 
-const STORAGE_KEY_BASE = 'travelAssistantChats';
+// Theme toggle
+const themeToggle = document.getElementById('themeToggle');
+const themeToggleLabel = document.getElementById('themeToggleLabel');
 const THEME_STORAGE_KEY = 'travelAssistantTheme';
+
+let hasShownJourneyInputs = false;
+let fromCoord = '';
+let toCoord = '';
+
+// Local chat history state (per user, stored in localStorage)
+const STORAGE_KEY_BASE = 'travelAssistantChats';
 let currentUser = null;
 let conversations = [];
 let activeChatId = null;
+let isRestoringMessages = false;
 let currentSearchTerm = '';
-let showStarredOnly = false;
-let selectedChatIds = new Set();
-let isListening = false;
 
 function getStorageKey() {
     return currentUser ? `${STORAGE_KEY_BASE}:${currentUser}` : STORAGE_KEY_BASE;
@@ -45,18 +51,23 @@ function getStorageKey() {
 
 function migrateConversation(convo) {
     if (convo.starred === undefined) convo.starred = false;
-    if (convo.updatedAt === undefined) convo.updatedAt = Date.now();
+    if (convo.updatedAt === undefined) {
+        convo.updatedAt = convo.messages && convo.messages.length
+            ? Date.now()
+            : Date.now();
+    }
     return convo;
 }
 
 function loadConversations() {
-    selectedChatIds.clear();
     try {
         const raw = localStorage.getItem(getStorageKey());
         const loaded = raw ? JSON.parse(raw) : [];
         conversations = Array.isArray(loaded) ? loaded.map(migrateConversation) : [];
     } catch (e) {
         conversations = [];
+        // eslint-disable-next-line no-console
+        console.error('Failed to load conversations', e);
     }
 }
 
@@ -64,6 +75,8 @@ function saveConversations() {
     try {
         localStorage.setItem(getStorageKey(), JSON.stringify(conversations));
     } catch (e) {
+        // eslint-disable-next-line no-console
+        console.error('Failed to save conversations', e);
     }
 }
 
@@ -104,560 +117,847 @@ function formatLastMessageTime(updatedAt) {
     const diffHours = Math.floor(diffMs / 3600000);
     const diffDays = Math.floor(diffMs / 86400000);
     if (diffMins < 1) return 'Just now';
-    if (diffMins < 60) return `${diffMins}m`;
-    if (diffHours < 24 && d.getDate() === now.getDate()) return `${diffHours}h`;
-    if (diffDays === 1 || (diffDays < 2 && d.getDate() !== now.getDate())) return 'Yday';
+    if (diffMins < 60) return `${diffMins} min ago`;
+    if (diffHours < 24 && d.getDate() === now.getDate()) return `${diffHours}h ago`;
+    if (diffDays === 1 || (diffDays < 2 && d.getDate() !== now.getDate())) return 'Yesterday';
     if (diffDays < 7) return d.toLocaleDateString(undefined, { weekday: 'short' });
     return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
 }
 
 function deleteChat(chatId) {
     conversations = conversations.filter((c) => c.id !== chatId);
-    selectedChatIds.delete(chatId);
     if (activeChatId === chatId) {
         activeChatId = conversations[0]?.id || null;
         if (activeChatId) setActiveChat(activeChatId);
-        else clearMessages();
+        else if (chatMessages) clearMessages();
     }
     saveConversations();
     renderChatList(currentSearchTerm);
 }
 
-function toggleStar(chatId) {
-    const convo = conversations.find((c) => c.id === chatId);
-    if (!convo) return;
-    convo.starred = !convo.starred;
+    if (wasActive) {
+        activeChatId = conversations[0]?.id || null;
+        if (activeChatId) setActiveChat(activeChatId);
+        else if (chatMessages) clearMessages();
+    }
     saveConversations();
     renderChatList(currentSearchTerm);
 }
 
-function toggleChatSelected(chatId) {
-    if (selectedChatIds.has(chatId)) selectedChatIds.delete(chatId);
-    else selectedChatIds.add(chatId);
-    renderChatList(currentSearchTerm);
+function renameChat(chatId) {
+    const convo = conversations.find((c) => c.id === chatId);
+    if (!convo) return;
+    const newTitle = (window.prompt('Rename chat', convo.title) || '').trim();
+    if (newTitle && newTitle !== convo.title) {
+        convo.title = newTitle.length > 60 ? newTitle.slice(0, 60) : newTitle;
+        saveConversations();
+        renderChatList(currentSearchTerm);
+    }
 }
 
-function renderChatList(searchTerm = '') {
-    chatList.innerHTML = '';
-    const filtered = conversations.filter((c) => {
-        const matchesSearch = c.title.toLowerCase().includes(searchTerm.toLowerCase());
-        const matchesFilter = !showStarredOnly || c.starred;
-        return matchesSearch && matchesFilter;
-    });
+function getWelcomeMessageHtml() {
+    const greeting = currentUser
+        ? `Hi ${escapeHtml(currentUser)}, I'm your travel assistant. I can help you with:`
+        : "Hi, I'm your travel assistant. I can help you with:";
+    return `
+        <p>${greeting}</p>
+        <ul>
+            <li>Rough delay expectations</li>
+            <li>Choosing a good time to set off</li>
+            <li>Simple route suggestions</li>
+        </ul>
+        <p>You can ask things like: "How busy is the A1 right now?" or "What time is best to drive into the city?"</p>
+    `;
+}
 
-    filtered.forEach((convo) => {
-        const li = document.createElement('li');
-        li.className = 'chat-list-item';
-        if (activeChatId === convo.id) li.classList.add('active');
+function updateWelcomeMessage() {
+    if (!chatMessages) return;
+    const firstBot = chatMessages.querySelector('.message.bot-message .message-content');
+    if (firstBot) firstBot.innerHTML = getWelcomeMessageHtml();
+}
 
-        const label = document.createElement('label');
-        label.className = 'chat-list-item-label';
-
-        const checkbox = document.createElement('input');
-        checkbox.type = 'checkbox';
-        checkbox.className = 'chat-list-item-checkbox';
-        checkbox.checked = selectedChatIds.has(convo.id);
-        checkbox.addEventListener('change', () => toggleChatSelected(convo.id));
-
-        const titleButton = document.createElement('button');
-        titleButton.type = 'button';
-        titleButton.className = 'chat-list-item-title';
-        titleButton.textContent = convo.title;
-        titleButton.addEventListener('click', () => setActiveChat(convo.id));
-
-        const timeSpan = document.createElement('span');
-        timeSpan.className = 'chat-list-item-time';
-        timeSpan.textContent = formatLastMessageTime(convo.updatedAt);
-
-        const starBtn = document.createElement('button');
-        starBtn.type = 'button';
-        starBtn.className = 'chat-list-item-star';
-        starBtn.textContent = convo.starred ? '★' : '☆';
-        starBtn.addEventListener('click', () => toggleStar(convo.id));
-
-        const deleteBtn = document.createElement('button');
-        deleteBtn.type = 'button';
-        deleteBtn.className = 'chat-list-item-delete';
-        deleteBtn.textContent = '✕';
-        deleteBtn.addEventListener('click', () => deleteChat(convo.id));
-
-        label.appendChild(checkbox);
-        label.appendChild(titleButton);
-        li.appendChild(label);
-        li.appendChild(timeSpan);
-        li.appendChild(starBtn);
-        li.appendChild(deleteBtn);
-        chatList.appendChild(li);
-    });
+function clearMessages() {
+    if (!chatMessages) return;
+    chatMessages.innerHTML = '';
+    const messageDiv = document.createElement('div');
+    messageDiv.className = 'message bot-message';
+    const contentDiv = document.createElement('div');
+    contentDiv.className = 'message-content';
+    contentDiv.innerHTML = getWelcomeMessageHtml();
+    messageDiv.appendChild(contentDiv);
+    chatMessages.appendChild(messageDiv);
 }
 
 function setActiveChat(chatId) {
     activeChatId = chatId;
-    const convo = conversations.find((c) => c.id === chatId);
+    if (!chatMessages) return;
     clearMessages();
-    if (convo && convo.messages) {
-        convo.messages.forEach((msg) => {
-            appendMessage(msg.sender, msg.text);
-        });
+    const convo = conversations.find((c) => c.id === chatId);
+    if (!convo) {
+        highlightActiveChat();
+        return;
     }
-    renderChatList(currentSearchTerm);
-    displayMetadata('', 0, {});
+    isRestoringMessages = true;
+    convo.messages.forEach((m) => {
+        const p = m.payload;
+        if (m.sender === 'bot' && p && (p.timetable || p.disruption)) {
+            if (p.timetable) appendTimetableCard(p.timetable, m.text);
+            if (p.disruption) appendDisruptionCard(p.disruption, m.text);
+        } else {
+            addMessage(m.text, m.sender);
+            if (p && p.journeys && p.journeys.length) appendJourneyCards(p.journeys, m.text || '', p.journeyOptions || {});
+        }
+    });
+    isRestoringMessages = false;
+    highlightActiveChat();
 }
 
-function clearMessages() {
-    chatMessages.innerHTML = '';
+function highlightActiveChat() {
+    if (!chatList) return;
+    Array.from(chatList.children).forEach((item) => {
+        if (item.dataset && item.dataset.chatId === activeChatId) {
+            item.classList.add('active');
+        } else {
+            item.classList.remove('active');
+        }
+    });
 }
 
-function appendMessage(sender, text) {
+function renderChatList(filterText) {
+    if (!chatList) return;
+    const term = (filterText || '').toLowerCase();
+    let filtered = conversations.filter((c) => !term || (c.title || '').toLowerCase().includes(term));
+    const sorted = [...filtered].sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+
+    chatList.innerHTML = '';
+    sorted.forEach((convo) => {
+        const li = document.createElement('li');
+        li.className = 'chat-list-item';
+        li.dataset.chatId = convo.id;
+
+        const content = document.createElement('div');
+        content.className = 'chat-list-item-content';
+        content.addEventListener('click', (e) => {
+            if (!e.target.closest('.chat-list-item-menu-btn')) setActiveChat(convo.id);
+        });
+        const titleEl = document.createElement('div');
+        titleEl.className = 'chat-list-item-title';
+        titleEl.textContent = convo.title || 'Untitled chat';
+        const timeEl = document.createElement('div');
+        timeEl.className = 'chat-list-item-time';
+        timeEl.textContent = formatLastMessageTime(convo.updatedAt);
+        content.appendChild(titleEl);
+        content.appendChild(timeEl);
+
+        const menuBtn = document.createElement('button');
+        menuBtn.type = 'button';
+        menuBtn.className = 'chat-list-item-menu-btn';
+        menuBtn.setAttribute('aria-label', 'Chat options');
+        menuBtn.textContent = '⋮';
+        menuBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const menu = li.querySelector('.chat-list-item-menu');
+            if (!menu) return;
+            document.querySelectorAll('.chat-list-item-menu').forEach((m) => m.classList.add('hidden'));
+            const rect = menuBtn.getBoundingClientRect();
+            menu.style.left = rect.left + 'px';
+            menu.style.top = (rect.bottom + 4) + 'px';
+            menu.style.right = 'auto';
+            menu.style.bottom = 'auto';
+            menu.classList.toggle('hidden');
+        });
+
+        const menu = document.createElement('div');
+        menu.className = 'chat-list-item-menu hidden';
+        const renameBtn = document.createElement('button');
+        renameBtn.type = 'button';
+        renameBtn.className = 'chat-list-item-menu-item';
+        renameBtn.textContent = 'Rename';
+        renameBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            menu.classList.add('hidden');
+            renameChat(convo.id);
+        });
+        const deleteBtn = document.createElement('button');
+        deleteBtn.type = 'button';
+        deleteBtn.className = 'chat-list-item-menu-item chat-list-item-menu-item-danger';
+        deleteBtn.textContent = 'Delete';
+        deleteBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            menu.classList.add('hidden');
+            deleteChat(convo.id);
+        });
+        menu.appendChild(renameBtn);
+        menu.appendChild(deleteBtn);
+
+        li.appendChild(content);
+        li.appendChild(menuBtn);
+        li.appendChild(menu);
+        chatList.appendChild(li);
+    });
+
+    highlightActiveChat();
+}
+
+document.addEventListener('click', (e) => {
+    if (!e.target.closest('.chat-list-item-menu') && !e.target.closest('.chat-list-item-menu-btn')) {
+        document.querySelectorAll('.chat-list-item-menu').forEach((m) => m.classList.add('hidden'));
+    }
+});
+
+function addMessageAndStore(text, sender, payload) {
+    addMessage(text, sender);
+    if (!isRestoringMessages) {
+        storeMessage(text, sender, payload);
+    }
+}
+
+// Handle send button click
+sendButton.addEventListener('click', sendMessage);
+
+// Handle Enter key press
+userInput.addEventListener('keypress', (e) => {
+    if (e.key === 'Enter') {
+        sendMessage();
+    }
+});
+
+function sendMessage() {
+    const message = userInput.value.trim();
+    if (!message) return;
+
+    // Add user message to chat
+    addMessageAndStore(message, 'user');
+    userInput.value = '';
+
+    // Reveal journey planner toggle after first free-text query
+    if (!hasShownJourneyInputs) {
+        showJourneyInputsIfNeeded();
+    }
+
+    // Show typing indicator
+    const typingId = showTypingIndicator();
+
+    // Send message to backend
+    fetch('/chat', {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ message: message })
+    })
+        .then(response => response.json())
+        .then(data => {
+            // Remove typing indicator
+            removeTypingIndicator(typingId);
+            handleChatResponse(data);
+        })
+        .catch(error => {
+            removeTypingIndicator(typingId);
+            addMessageAndStore('Sorry, I encountered an error. Please try again.', 'bot');
+            console.error('Error:', error);
+        });
+}
+
+function addMessage(text, sender) {
     const messageDiv = document.createElement('div');
     messageDiv.className = `message ${sender}-message`;
-    messageDiv.innerHTML = `<div class="message-content"><p>${escapeHtml(text)}</p></div>`;
+    if (sender === 'bot' && text) {
+        messageDiv.dataset.messageText = text;
+    }
+
+    const contentDiv = document.createElement('div');
+    contentDiv.className = 'message-content';
+
+    // Format message text (handle line breaks and lists)
+    const formattedText = formatMessage(text);
+    contentDiv.innerHTML = formattedText;
+
+    if (sender === 'bot' && text) {
+        // No extra per-message controls at this stage.
+    }
+
+    messageDiv.appendChild(contentDiv);
     chatMessages.appendChild(messageDiv);
+
+    // Scroll to bottom
     chatMessages.scrollTop = chatMessages.scrollHeight;
+}
+
+function formatMessage(text) {
+    // Convert line breaks to <br>
+    text = text.replace(/\n/g, '<br>');
+    
+    // Convert simple list patterns to HTML lists
+    const lines = text.split('<br>');
+    let formatted = '';
+    let inList = false;
+    
+    for (let line of lines) {
+        const trimmed = line.trim();
+        if (trimmed.startsWith('- ') || trimmed.startsWith('• ')) {
+            if (!inList) {
+                formatted += '<ul>';
+                inList = true;
+            }
+            formatted += '<li>' + trimmed.substring(2) + '</li>';
+        } else {
+            if (inList) {
+                formatted += '</ul>';
+                inList = false;
+            }
+            if (trimmed) {
+                formatted += '<p>' + trimmed + '</p>';
+            }
+        }
+    }
+    
+    if (inList) {
+        formatted += '</ul>';
+    }
+    
+    return formatted || '<p>' + text + '</p>';
+}
+
+function showTypingIndicator() {
+    const messageDiv = document.createElement('div');
+    messageDiv.className = 'message bot-message';
+    messageDiv.id = 'typing-indicator';
+
+    const contentDiv = document.createElement('div');
+    contentDiv.className = 'message-content';
+
+    const typingDiv = document.createElement('div');
+    typingDiv.className = 'typing-indicator';
+    typingDiv.innerHTML = '<span></span><span></span><span></span>';
+
+    contentDiv.appendChild(typingDiv);
+    messageDiv.appendChild(contentDiv);
+    chatMessages.appendChild(messageDiv);
+
+    chatMessages.scrollTop = chatMessages.scrollHeight;
+
+    return 'typing-indicator';
+}
+
+function removeTypingIndicator(id) {
+    const indicator = document.getElementById(id);
+    if (indicator) {
+        indicator.remove();
+    }
+}
+
+function updateInfoPanel(data) {
+    // Update intent
+    if (data.intent) {
+        intentDisplay.textContent = data.intent.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
+    }
+
+    // Update confidence
+    if (data.confidence !== undefined) {
+        const confidencePercent = (data.confidence * 100).toFixed(1);
+        confidenceDisplay.textContent = confidencePercent + '%';
+        confidenceDisplay.style.color = data.confidence > 0.7 ? '#28a745' : data.confidence > 0.5 ? '#ffc107' : '#dc3545';
+    }
+
+    // Update entities
+    if (data.entities && Object.keys(data.entities).length > 0) {
+        const entitiesList = Object.entries(data.entities)
+            .map(([key, value]) => `${key}: ${value}`)
+            .join(', ');
+        entitiesDisplay.textContent = entitiesList;
+    } else {
+        entitiesDisplay.textContent = 'None detected';
+    }
+}
+
+// -------- Journey planner helpers (cards, toggle, structured planning) -----
+
+function updateJourneyPlannerToggle(expanded) {
+    if (!journeyPlannerToggle || !journeyInputsSection) return;
+    const isExpanded = expanded ?? !journeyInputsSection.classList.contains('hidden');
+    journeyPlannerToggle.setAttribute('aria-expanded', String(isExpanded));
+    journeyPlannerToggle.textContent = isExpanded ? 'Hide journey planner' : 'Show journey planner';
+}
+
+function toggleJourneyPlanner() {
+    if (!journeyInputsSection) return;
+    journeyInputsSection.classList.toggle('hidden');
+    updateJourneyPlannerToggle();
 }
 
 function escapeHtml(text) {
-    const map = {
-        '&': '&amp;',
-        '<': '&lt;',
-        '>': '&gt;',
-        '"': '&quot;',
-        "'": '&#039;'
-    };
-    return text.replace(/[&<>"']/g, m => map[m]);
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
 }
 
-function displayMetadata(intent, confidence, entities) {
-    intentDisplay.textContent = intent || '-';
-    confidenceDisplay.textContent = confidence ? (confidence * 100).toFixed(1) + '%' : '-';
-    entitiesDisplay.textContent = Object.keys(entities).length > 0 ? JSON.stringify(entities) : '-';
+function getLegIconClass(mode) {
+    const m = (mode || '').toLowerCase();
+    if (m === 'walk' || m === 'walking') return 'leg-icon walk';
+    if (m === 'bus') return 'leg-icon bus';
+    if (m === 'tube' || m === 'metro' || m === 'rail' || m === 'dlr' || m === 'overground' || m === 'tram') return 'leg-icon tube';
+    return 'leg-icon walk';
 }
 
-function buildDirectionsHtml(journey) {
-    if (!journey.steps || journey.steps.length === 0) return '';
-    const steps = journey.steps.map(step => `<div class="journey-leg-step">${escapeHtml(step)}</div>`).join('');
-    return `<div class="journey-leg-directions" style="display:none;">${steps}</div>`;
-}
-
-function buildStopsHtml(journey) {
-    if (!journey.stops || journey.stops.length === 0) return '';
-    const stops = journey.stops.map(stop => `<div class="journey-leg-stop">${escapeHtml(stop)}</div>`).join('');
-    return `<div class="journey-leg-stops-list" style="display:none;">${stops}</div>`;
+function getLegLineClass(mode) {
+    const m = (mode || '').toLowerCase();
+    if (m === 'walk' || m === 'walking') return 'leg-line leg-line-walk';
+    if (m === 'bus') return 'leg-line leg-line-bus';
+    return 'leg-line leg-line-tube';
 }
 
 function buildJourneyCard(journey) {
-    const legs = (journey.legs || [])
-        .map(leg => `<span class="journey-leg">${escapeHtml(leg.mode)}</span>`)
-        .join('');
+    const card = document.createElement('div');
+    card.className = 'journey-card';
 
-    let fareHtml = '';
-    if (journey.fare_pence) {
-        const farePounds = (journey.fare_pence / 100).toFixed(2);
-        fareHtml = `<div class="journey-fare">£${farePounds}</div>`;
-    }
+    const farePounds = journey.fare_pence != null ? (journey.fare_pence / 100).toFixed(2) : null;
 
-    let directionsHtml = buildDirectionsHtml(journey);
-    let stopsHtml = buildStopsHtml(journey);
+    const top = document.createElement('div');
+    top.className = 'journey-card-top';
+    top.innerHTML = `
+    <div class="journey-card-times">
+      <span class="journey-card-time-range">${journey.departure} – ${journey.arrival}</span>
+      ${farePounds != null ? `<span class="journey-card-fare">£${farePounds} off peak</span>` : ''}
+    </div>
+    <div class="journey-card-duration"><strong>${journey.duration}</strong> mins</div>
+  `;
+    card.appendChild(top);
 
-    let expandableHtml = '';
-    if (directionsHtml || stopsHtml) {
-        expandableHtml = `
-            <div class="journey-leg-expandable">
-                ${directionsHtml ? `<button class="journey-leg-expand-btn" data-target="directions">View directions</button>` : ''}
-                ${stopsHtml ? `<button class="journey-leg-expand-btn" data-target="stops">View stops</button>` : ''}
-                ${directionsHtml}
-                ${stopsHtml}
-            </div>
-        `;
-    }
-
-    return `
-        <div class="journey-card">
-            <div class="journey-time">
-                <span class="departure">${journey.departure}</span>
-                <span class="arrow">→</span>
-                <span class="arrival">${journey.arrival}</span>
-            </div>
-            <div class="journey-row">
-                <div class="journey-duration">${journey.duration} mins</div>
-                ${fareHtml}
-            </div>
-            <div class="journey-legs">${legs}</div>
-            ${expandableHtml}
-        </div>
+    const timeline = document.createElement('div');
+    timeline.className = 'journey-card-timeline';
+    journey.legs.forEach((leg, i) => {
+        const isLast = i === journey.legs.length - 1;
+        const legMins = leg.duration != null ? leg.duration : '';
+        const row = document.createElement('div');
+        row.className = 'journey-card-leg';
+        row.innerHTML = `
+      <div class="journey-card-leg-left">
+        <div class="${getLegIconClass(leg.mode)}"></div>
+        ${!isLast ? `<div class="${getLegLineClass(leg.mode)}"></div>` : ''}
+      </div>
+      <div class="journey-card-leg-right">
+        <div class="journey-card-leg-detail">${leg.detail || leg.mode}</div>
+        <div class="journey-card-leg-meta">${legMins !== '' ? `${legMins} min` : ''}</div>
+      </div>
     `;
+        timeline.appendChild(row);
+    });
+
+    const lastLeg = journey.legs.length ? journey.legs[journey.legs.length - 1] : null;
+    const destLabel = lastLeg && lastLeg.detail ? lastLeg.detail.replace(/^Walk to\s+/i, '').trim() || 'Destination' : 'Destination';
+    const destRow = document.createElement('div');
+    destRow.className = 'journey-card-leg journey-card-dest';
+    destRow.innerHTML = `
+    <div class="journey-card-leg-left">
+      <div class="leg-icon dest"></div>
+    </div>
+    <div class="journey-card-leg-right">
+      <div class="journey-card-leg-detail">${destLabel}</div>
+    </div>
+  `;
+    timeline.appendChild(destRow);
+    card.appendChild(timeline);
+
+    const actions = document.createElement('div');
+    actions.className = 'journey-card-actions';
+    actions.innerHTML = '<button type="button" class="journey-card-btn">View details</button><button type="button" class="journey-card-btn">Map view</button>';
+    card.appendChild(actions);
+
+    return card;
 }
 
-function appendJourneyCards(journeys) {
-    if (!journeys || journeys.length === 0) return;
-
-    const container = document.createElement('div');
-    container.className = 'journeys-container';
-    container.innerHTML = journeys.map(j => buildJourneyCard(j)).join('');
-    chatMessages.appendChild(container);
+function appendJourneyCards(journeys, debugText, options) {
+    const wrap = document.createElement('div');
+    wrap.className = 'message bot-message journey-cards-wrap';
+    journeys.forEach((j) => wrap.appendChild(buildJourneyCard(j)));
+    chatMessages.appendChild(wrap);
     chatMessages.scrollTop = chatMessages.scrollHeight;
 }
 
-function appendTimetableCard(timetable) {
-    if (!timetable) return;
+function showJourneyInputsIfNeeded() {
+    if (hasShownJourneyInputs) return;
+    hasShownJourneyInputs = true;
+    if (journeyPlannerToggle) journeyPlannerToggle.classList.remove('hidden');
+}
 
-    const container = document.createElement('div');
-    container.className = 'timetable-card';
+function appendTimetableCard(timetableData, messageText) {
+    if (!timetableData || !chatMessages) return;
+    const stopName = timetableData.stop_name || 'Stop';
+    const busArrivals = timetableData.bus_arrivals || [];
+    const trainArrivals = timetableData.train_arrivals || [];
+    const busGrouped = timetableData.bus_arrivals_grouped || {};
+    const trainByDir = timetableData.train_arrivals_by_direction || {};
 
-    const stopName = document.createElement('div');
-    stopName.className = 'timetable-stop-name';
-    stopName.textContent = timetable.stop_name || 'Stop';
-    container.appendChild(stopName);
+    const wrap = document.createElement('div');
+    wrap.className = 'message bot-message timetable-cards-wrap';
 
-    if (timetable.bus_arrivals && timetable.bus_arrivals.length > 0) {
-        const busSection = document.createElement('div');
-        busSection.className = 'timetable-section';
+    const header = document.createElement('div');
+    header.className = 'timetable-card-header';
+    header.innerHTML = `<span class="timetable-card-header-title">${escapeHtml(stopName)}</span><span class="timetable-card-header-subtitle">Next</span>`;
+    wrap.appendChild(header);
 
-        const busHeader = document.createElement('div');
-        busHeader.className = 'timetable-section-header';
-        busHeader.textContent = 'Bus';
-        busSection.appendChild(busHeader);
+    const card = document.createElement('div');
+    card.className = 'timetable-card';
 
-        timetable.bus_arrivals.forEach(arrival => {
-            const row = document.createElement('div');
-            row.className = 'timetable-row';
+    const directionOrder = ['Northbound', 'Southbound', 'Eastbound', 'Westbound', 'Clockwise', 'Anticlockwise', 'Unknown'];
 
-            const icon = document.createElement('span');
-            icon.className = 'timetable-row-icon';
-            icon.textContent = '🚌';
-
-            const details = document.createElement('div');
-            details.className = 'timetable-row-details';
-            details.innerHTML = `
-                <strong>${arrival.lineName || ''}</strong> → ${arrival.destination || ''}
-                <br>
-                <span class="timetable-time">${arrival.timeToStation || ''}s</span>
-            `;
-
-            row.appendChild(icon);
-            row.appendChild(details);
-            busSection.appendChild(row);
-        });
-
-        container.appendChild(busSection);
+    function addRow(line, destination, timeLabel, isTrain) {
+        const row = document.createElement('div');
+        row.className = 'timetable-row';
+        const icon = isTrain ? 'tube' : 'bus';
+        row.innerHTML = `
+            <span class="timetable-row-icon timetable-icon-${icon}" aria-hidden="true"></span>
+            <div class="timetable-row-info">
+                <span class="timetable-row-line">${escapeHtml(String(line))}</span>
+                <span class="timetable-row-dest">${escapeHtml(destination || '')}</span>
+            </div>
+            <div class="timetable-row-time">${escapeHtml(timeLabel)}</div>
+        `;
+        card.appendChild(row);
     }
 
-    if (timetable.train_arrivals && timetable.train_arrivals.length > 0) {
-        const trainSection = document.createElement('div');
-        trainSection.className = 'timetable-section';
-
-        const trainHeader = document.createElement('div');
-        trainHeader.className = 'timetable-section-header';
-        trainHeader.textContent = 'Train';
-        trainSection.appendChild(trainHeader);
-
-        timetable.train_arrivals.forEach(arrival => {
-            const row = document.createElement('div');
-            row.className = 'timetable-row';
-
-            const icon = document.createElement('span');
-            icon.className = 'timetable-row-icon';
-            icon.textContent = '🚆';
-
-            const details = document.createElement('div');
-            details.className = 'timetable-row-details';
-            details.innerHTML = `
-                <strong>${arrival.lineName || ''}</strong> → ${arrival.destination || ''}
-                <br>
-                <span class="timetable-time">${arrival.timeToStation || ''}s</span>
-            `;
-
-            row.appendChild(icon);
-            row.appendChild(details);
-            trainSection.appendChild(row);
+    if (Object.keys(busGrouped).length > 0) {
+        Object.keys(busGrouped).forEach((gid) => {
+            const g = busGrouped[gid];
+            const groupName = g.group_name || stopName;
+            const stops = g.stops || {};
+            Object.keys(stops).forEach((stopLabel) => {
+                const arrivals = stops[stopLabel] || [];
+                const towards = stopLabel !== 'Stop' && stopLabel !== groupName ? stopLabel : '';
+                arrivals.slice(0, 8).forEach((b) => {
+                    const timeLabel = b.time_minutes != null ? `${Math.round(Number(b.time_minutes))} min` : '–';
+                    addRow(b.line || '–', b.destination || towards || '–', timeLabel, false);
+                });
+            });
         });
-
-        container.appendChild(trainSection);
+    } else if (busArrivals.length > 0) {
+        busArrivals.slice(0, 10).forEach((b) => {
+            const timeLabel = b.time_minutes != null ? `${Math.round(Number(b.time_minutes))} min` : '–';
+            addRow(b.line || '–', b.destination || '–', timeLabel, false);
+        });
     }
 
-    chatMessages.appendChild(container);
+    if (Object.keys(trainByDir).length > 0) {
+        const sortedDirs = Object.keys(trainByDir).sort((a, b) => {
+            const i = directionOrder.indexOf(a);
+            const j = directionOrder.indexOf(b);
+            return (i === -1 ? 999 : i) - (j === -1 ? 999 : j);
+        });
+        sortedDirs.forEach((direction) => {
+            const dirTrains = trainByDir[direction] || [];
+            const dirHeader = document.createElement('div');
+            dirHeader.className = 'timetable-direction-header';
+            dirHeader.textContent = direction;
+            card.appendChild(dirHeader);
+            dirTrains.slice(0, 6).forEach((t) => {
+                const timeLabel = t.time_minutes != null ? `${Math.round(Number(t.time_minutes))} min` : '–';
+                const dest = t.destination || '–';
+                const platform = t.platform_number || (t.platform ? String(t.platform).replace(/platform\s*/i, '') : '');
+                const destStr = platform ? `${dest} (Platform ${platform})` : dest;
+                addRow(t.line || '–', destStr, timeLabel, true);
+            });
+        });
+    } else if (trainArrivals.length > 0) {
+        trainArrivals.slice(0, 10).forEach((t) => {
+            const timeLabel = t.time_minutes != null ? `${Math.round(Number(t.time_minutes))} min` : '–';
+            addRow(t.line || '–', t.destination || '–', timeLabel, true);
+        });
+    }
+
+    if (card.children.length === 0) {
+        const empty = document.createElement('div');
+        empty.className = 'timetable-empty';
+        empty.textContent = 'No arrivals in the near future.';
+        card.appendChild(empty);
+    }
+
+    appendReadAloudAndShareButtons(card, messageText);
+    wrap.appendChild(card);
+    chatMessages.appendChild(wrap);
     chatMessages.scrollTop = chatMessages.scrollHeight;
 }
 
-function appendDisruptionCard(disruption) {
-    if (!disruption) return;
+function appendDisruptionCard(disruptionData, messageText) {
+    if (!disruptionData || !chatMessages) return;
+    const lineName = disruptionData.line || disruptionData.route || 'Service';
+    const status = disruptionData.status || 'Status unavailable';
+    const description = disruptionData.description || '';
+    const affected = disruptionData.affected_locations || [];
+    const alternatives = disruptionData.alternatives || [];
 
-    const container = document.createElement('div');
-    container.className = 'disruption-card';
+    const wrap = document.createElement('div');
+    wrap.className = 'message bot-message disruption-cards-wrap';
+
+    const header = document.createElement('div');
+    header.className = 'disruption-card-header';
+    header.innerHTML = `<span class="disruption-card-header-title">${escapeHtml(lineName)}${lineName.toLowerCase().indexOf('line') === -1 && !/^\d+$/.test(lineName) ? ' Line' : ''}</span>`;
+    wrap.appendChild(header);
+
+    const card = document.createElement('div');
+    card.className = 'disruption-card';
 
     const statusRow = document.createElement('div');
     statusRow.className = 'disruption-status-row';
+    const statusClass = status.toLowerCase().indexOf('good') !== -1 ? 'disruption-status-good' : 'disruption-status-issue';
+    statusRow.innerHTML = `<span class="disruption-status-label ${statusClass}">${escapeHtml(status)}</span>`;
+    card.appendChild(statusRow);
 
-    const statusSpan = document.createElement('span');
-    statusSpan.className = disruption.status === 'Good Service' ? 'disruption-status-good' : 'disruption-status-issue';
-    statusSpan.textContent = disruption.status || 'Unknown';
-    statusRow.appendChild(statusSpan);
-
-    container.appendChild(statusRow);
-
-    if (disruption.description) {
-        const descDiv = document.createElement('div');
-        descDiv.className = 'disruption-description';
-        descDiv.textContent = disruption.description;
-        container.appendChild(descDiv);
+    if (description) {
+        const descEl = document.createElement('div');
+        descEl.className = 'disruption-description';
+        descEl.textContent = description;
+        card.appendChild(descEl);
+    }
+    if (affected.length > 0) {
+        const affEl = document.createElement('div');
+        affEl.className = 'disruption-affected';
+        affEl.innerHTML = '<span class="disruption-affected-label">Affected:</span> ' + affected.map((a) => escapeHtml(a)).join('; ');
+        card.appendChild(affEl);
+    }
+    if (alternatives.length > 0) {
+        const altEl = document.createElement('div');
+        altEl.className = 'disruption-alternatives';
+        altEl.innerHTML = '<span class="disruption-alt-label">Alternatives:</span> ' + alternatives.map((a) => escapeHtml(a)).join('; ');
+        card.appendChild(altEl);
     }
 
-    if (disruption.affected_locations && disruption.affected_locations.length > 0) {
-        const affectedDiv = document.createElement('div');
-        affectedDiv.className = 'disruption-affected';
-        affectedDiv.innerHTML = '<strong>Affected:</strong> ' + disruption.affected_locations.join(', ');
-        container.appendChild(affectedDiv);
-    }
-
-    chatMessages.appendChild(container);
+    appendReadAloudAndShareButtons(card, messageText);
+    wrap.appendChild(card);
+    chatMessages.appendChild(wrap);
     chatMessages.scrollTop = chatMessages.scrollHeight;
 }
 
 function handleChatResponse(data) {
-    appendMessage('bot', data.response);
-    storeMessage(data.response, 'bot', {});
-
-    if (data.journeys && data.journeys.length > 0) {
-        appendJourneyCards(data.journeys);
-    }
-
-    if (data.timetable) {
-        appendTimetableCard(data.timetable);
-    }
-
-    if (data.disruption) {
-        appendDisruptionCard(data.disruption);
-    }
-
-    displayMetadata(data.intent, data.confidence, data.entities || {});
-}
-
-function sendPlannedJourney() {
-    const from = fromInput.value.trim();
-    const to = toInput.value.trim();
-
-    if (!from || !to) {
-        alert('Please fill in both From and To fields.');
+    if (data.error) {
+        addMessageAndStore('Sorry, I encountered an error: ' + data.error, 'bot');
         return;
     }
 
-    const payload = {
-        message: '',
-        from: from,
-        to: to,
-        date: dateInput.value || undefined,
-        time: timeInput.value || undefined
-    };
+    if (data.journeys && data.journeys.length > 0) {
+        const journeyOptions = {
+            tflJourneyUrl: data.tfl_journey_url || '',
+            fromId: data.from_id || '',
+            toId: data.to_id || '',
+        };
+        addMessageAndStore(data.response || '', 'bot', { journeys: data.journeys, journeyOptions });
+        appendJourneyCards(data.journeys, data.response || '', journeyOptions);
+        showJourneyInputsIfNeeded();
+        if (journeyInputsSection && journeyInputsSection.classList.contains('hidden')) {
+            journeyInputsSection.classList.remove('hidden');
+            updateJourneyPlannerToggle(true);
+        }
+    } else if (data.timetable || data.disruption) {
+        const payload = {};
+        if (data.timetable) payload.timetable = data.timetable;
+        if (data.disruption) payload.disruption = data.disruption;
+        storeMessage(data.response || '', 'bot', payload);
+        if (data.timetable) appendTimetableCard(data.timetable, data.response);
+        if (data.disruption) appendDisruptionCard(data.disruption, data.response);
+    } else if (data.response) {
+        addMessageAndStore(data.response, 'bot');
+        if (data.disambiguation) {
+            showJourneyInputsIfNeeded();
+            if (journeyInputsSection && journeyInputsSection.classList.contains('hidden')) {
+                journeyInputsSection.classList.remove('hidden');
+                updateJourneyPlannerToggle(true);
+            }
+        }
+    }
 
-    sendChatMessage(payload);
+    updateInfoPanel(data);
 }
 
-function toggleJourneyPlanner() {
-    const isHidden = journeyInputsSection.classList.contains('hidden');
-    if (isHidden) {
-        journeyInputsSection.classList.remove('hidden');
-        journeyPlannerToggle.setAttribute('aria-expanded', 'true');
-        journeyPlannerToggle.textContent = 'Hide journey planner';
-    } else {
-        journeyInputsSection.classList.add('hidden');
-        journeyPlannerToggle.setAttribute('aria-expanded', 'false');
-        journeyPlannerToggle.textContent = 'Show journey planner';
+function sendPlannedJourney() {
+    if (!fromInput || !toInput) return;
+    const from = fromInput.value.trim();
+    const to = toInput.value.trim();
+    const date = dateInput ? dateInput.value : '';
+    const time = timeInput ? timeInput.value : '';
+    const fromId = fromCoord || '';
+    const toId = toCoord || '';
+
+    if (!from || !to) {
+        addMessageAndStore('Please choose both a start and destination before planning.', 'bot');
+        return;
     }
-}
 
-function sendChatMessage(payload) {
-    const message = payload.message || '';
-    const from = payload.from || '';
-    const to = payload.to || '';
-
-    if (!message && !from && !to) return;
-
-    if (message) {
-        appendMessage('user', message);
-        storeMessage(message, 'user', {});
+    let whenPhrase = '';
+    if (date && time) {
+        whenPhrase = ` on ${date} at ${time}`;
+    } else if (time) {
+        whenPhrase = ` at ${time}`;
     }
+
+    const query = `Plan a journey from ${from} to ${to}${whenPhrase}`;
+    addMessageAndStore(query, 'user');
+
+    const typingId = showTypingIndicator();
 
     fetch('/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
+        body: JSON.stringify({ message: query, from, to, date, time, fromId, toId }),
     })
-    .then(res => res.json())
-    .then(data => {
-        handleChatResponse(data);
-    })
-    .catch(err => {
-        appendMessage('bot', 'Error: ' + err.message);
-        console.error(err);
+        .then((res) => res.json())
+        .then((data) => {
+            removeTypingIndicator(typingId);
+            handleChatResponse(data);
+        })
+        .catch(() => {
+            removeTypingIndicator(typingId);
+            addMessageAndStore('Sorry, something went wrong talking to the server.', 'bot');
+        });
+}
+
+// Wire up journey planner controls if present
+if (journeyPlannerToggle) {
+    journeyPlannerToggle.addEventListener('click', toggleJourneyPlanner);
+}
+if (planBtn) {
+    planBtn.addEventListener('click', sendPlannedJourney);
+}
+
+// Sidebar actions
+if (newChatButton) {
+    newChatButton.addEventListener('click', () => {
+        activeChatId = null;
+        clearMessages();
+        highlightActiveChat();
     });
 }
 
-function startVoiceInput() {
-    if (isListening) return;
+if (chatSearchInput) {
+    chatSearchInput.addEventListener('input', (e) => {
+        currentSearchTerm = e.target.value || '';
+        renderChatList(currentSearchTerm);
+    });
+}
 
-    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!SpeechRecognition) {
-        alert('Voice input not supported in this browser');
-        return;
+function setLoggedIn(username) {
+    currentUser = username || null;
+    if (accountLoggedOut && accountLoggedIn && currentUsernameEl) {
+        accountLoggedOut.classList.add('hidden');
+        accountLoggedIn.classList.remove('hidden');
+        currentUsernameEl.textContent = currentUser || '';
     }
+    loadConversations();
+    activeChatId = conversations[0]?.id || null;
+    renderChatList(currentSearchTerm);
+    if (activeChatId) {
+        setActiveChat(activeChatId);
+    } else {
+        clearMessages();
+    }
+}
 
-    isListening = true;
-    voiceInputButton.classList.add('listening');
-    voiceInputButton.textContent = 'Listening...';
+function setLoggedOut() {
+    currentUser = null;
+    if (accountLoggedOut && accountLoggedIn && currentUsernameEl) {
+        accountLoggedOut.classList.remove('hidden');
+        accountLoggedIn.classList.add('hidden');
+        currentUsernameEl.textContent = '';
+    }
+    loadConversations();
+    activeChatId = conversations[0]?.id || null;
+    renderChatList(currentSearchTerm);
+    clearMessages();
+}
 
-    const recognition = new SpeechRecognition();
-    recognition.continuous = false;
-    recognition.interimResults = false;
-    recognition.lang = 'en-US';
+function closeAccountDropdown() {
+    if (accountDropdown) accountDropdown.classList.add('hidden');
+    if (accountMenuButton) accountMenuButton.setAttribute('aria-expanded', 'false');
+}
 
-    recognition.onresult = (event) => {
-        let transcript = '';
-        for (let i = event.resultIndex; i < event.results.length; i++) {
-            transcript += event.results[i][0].transcript;
-        }
-        userInput.value = transcript.trim();
-        isListening = false;
-        voiceInputButton.classList.remove('listening');
-        voiceInputButton.textContent = '🎤 Voice input';
-    };
+function toggleAccountDropdown() {
+    if (!accountDropdown || !accountMenuButton) return;
+    const isOpen = !accountDropdown.classList.contains('hidden');
+    if (isOpen) {
+        accountDropdown.classList.add('hidden');
+        accountMenuButton.setAttribute('aria-expanded', 'false');
+    } else {
+        accountDropdown.classList.remove('hidden');
+        accountMenuButton.setAttribute('aria-expanded', 'true');
+    }
+}
 
-    recognition.onerror = () => {
-        isListening = false;
-        voiceInputButton.classList.remove('listening');
-        voiceInputButton.textContent = '🎤 Voice input';
-    };
+if (accountMenuButton) {
+    accountMenuButton.addEventListener('click', (e) => {
+        e.stopPropagation();
+        toggleAccountDropdown();
+    });
+}
 
-    recognition.onend = () => {
-        isListening = false;
-        voiceInputButton.classList.remove('listening');
-        voiceInputButton.textContent = '🎤 Voice input';
-    };
+document.addEventListener('click', (e) => {
+    if (accountDropdown && !accountDropdown.classList.contains('hidden')) {
+        const wrap = document.querySelector('.account-button-wrap');
+        if (wrap && !wrap.contains(e.target)) closeAccountDropdown();
+    }
+});
 
-    recognition.start();
+if (accountDropdown) {
+    accountDropdown.addEventListener('click', (e) => e.stopPropagation());
+}
+
+if (logoutButton) {
+    logoutButton.addEventListener('click', () => {
+        closeAccountDropdown();
+        fetch('/logout', { method: 'POST' })
+            .finally(() => {
+                setLoggedOut();
+            });
+    });
 }
 
 function getTheme() {
-    return localStorage.getItem(THEME_STORAGE_KEY) || 'light';
+    try {
+        const stored = localStorage.getItem(THEME_STORAGE_KEY);
+        if (stored === 'dark' || stored === 'light') return stored;
+    } catch (e) {
+        // ignore
+    }
+    return window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
 }
 
 function applyTheme(theme) {
     document.documentElement.setAttribute('data-theme', theme);
-    localStorage.setItem(THEME_STORAGE_KEY, theme);
-    const label = themeToggleLabel.textContent;
-    if (theme === 'dark') {
-        themeToggleLabel.textContent = 'Dark';
-    } else {
-        themeToggleLabel.textContent = 'Light';
+    if (themeToggleLabel) {
+        themeToggleLabel.textContent = theme === 'dark' ? 'Dark' : 'Light';
+    }
+    try {
+        localStorage.setItem(THEME_STORAGE_KEY, theme);
+    } catch (e) {
+        // ignore
     }
 }
 
 function toggleTheme() {
-    const current = getTheme();
-    const next = current === 'dark' ? 'light' : 'dark';
-    applyTheme(next);
+    const current = document.documentElement.getAttribute('data-theme') || 'light';
+    applyTheme(current === 'light' ? 'dark' : 'light');
 }
 
-function checkLoggedIn() {
-    return fetch('/me')
-        .then(res => res.json())
-        .then(data => {
-            if (data.username) {
-                currentUser = data.username;
-                loadConversations();
-                renderChatList();
-                accountLoggedOut.classList.add('hidden');
-                accountLoggedIn.classList.remove('hidden');
-                currentUsernameEl.textContent = currentUser;
-                return true;
-            } else {
-                accountLoggedIn.classList.add('hidden');
-                accountLoggedOut.classList.remove('hidden');
-                return false;
-            }
-        })
-        .catch(() => false);
-}
-
-newChatButton.addEventListener('click', () => {
-    activeChatId = null;
-    clearMessages();
-    renderChatList();
-});
-
-chatSearchInput.addEventListener('input', (e) => {
-    currentSearchTerm = e.target.value;
-    renderChatList(currentSearchTerm);
-});
-
-chatFilterAll.addEventListener('click', () => {
-    showStarredOnly = false;
-    chatFilterAll.classList.add('active');
-    chatFilterStarred.classList.remove('active');
-    renderChatList(currentSearchTerm);
-});
-
-chatFilterStarred.addEventListener('click', () => {
-    showStarredOnly = true;
-    chatFilterStarred.classList.add('active');
-    chatFilterAll.classList.remove('active');
-    renderChatList(currentSearchTerm);
-});
-
-logoutButton.addEventListener('click', () => {
-    fetch('/logout', { method: 'POST' })
-        .then(() => {
-            currentUser = null;
-            conversations = [];
-            activeChatId = null;
-            clearMessages();
-            accountLoggedIn.classList.add('hidden');
-            accountLoggedOut.classList.remove('hidden');
-            chatList.innerHTML = '';
-        });
-});
-
-accountMenuButton.addEventListener('click', () => {
-    const isHidden = accountDropdown.classList.contains('hidden');
-    if (isHidden) {
-        accountDropdown.classList.remove('hidden');
-        accountMenuButton.setAttribute('aria-expanded', 'true');
-    } else {
-        accountDropdown.classList.add('hidden');
-        accountMenuButton.setAttribute('aria-expanded', 'false');
-    }
-});
-
-document.addEventListener('click', (e) => {
-    if (!accountMenuButton.contains(e.target) && !accountDropdown.contains(e.target)) {
-        accountDropdown.classList.add('hidden');
-        accountMenuButton.setAttribute('aria-expanded', 'false');
-    }
-});
-
-themeToggle.addEventListener('click', toggleTheme);
-
-voiceInputButton.addEventListener('click', startVoiceInput);
-
-sendButton.addEventListener('click', () => {
-    const message = userInput.value.trim();
-    if (!message) return;
-
-    userInput.value = '';
-    sendChatMessage({ message });
-});
-
-userInput.addEventListener('keypress', (e) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
-        e.preventDefault();
-        sendButton.click();
-    }
-});
-
-journeyPlannerToggle.addEventListener('click', toggleJourneyPlanner);
-planBtn.addEventListener('click', sendPlannedJourney);
-
-document.addEventListener('DOMContentLoaded', () => {
+// Initialize on load
+window.addEventListener('load', () => {
     applyTheme(getTheme());
-    checkLoggedIn();
-    journeyPlannerToggle.classList.remove('hidden');
+    if (themeToggle) {
+        themeToggle.addEventListener('click', toggleTheme);
+    }
+    if (userInput) {
+        userInput.focus();
+    }
+
+    fetch('/me')
+        .then((res) => res.json())
+        .then((data) => {
+            if (data.username) {
+                setLoggedIn(data.username);
+            } else {
+                setLoggedOut();
+            }
+            updateWelcomeMessage();
+        })
+        .catch(() => {
+            setLoggedOut();
+            updateWelcomeMessage();
+        });
 });
