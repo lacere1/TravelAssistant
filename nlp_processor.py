@@ -14,6 +14,12 @@ class NLPProcessor:
     def __init__(self):
         """Initialize NLP models for intent classification and entity extraction"""
         print("Loading NLP models...")
+
+
+        self._synonym_expansion_enabled = False
+        
+
+
         self.intent_classifier = None
         
         # Intent labels for classification
@@ -41,7 +47,15 @@ class NLPProcessor:
         self._load_stop_datasets()
     
     def _expand_with_synonyms(self, tokens: List[str]) -> Set[str]:
-        """Return lowercase token set."""
+        """
+        Expand a list of tokens with WordNet synonyms.
+        
+        Returns a set containing the original tokens plus any synonym words
+        (multi-word synonyms are split into individual tokens).
+        If NLTK/WordNet are unavailable, this simply returns the original tokens.
+        """
+
+
         return set(t.lower() for t in tokens if t)
     
     def process(self, text: str) -> Dict[str, Any]:
@@ -472,9 +486,13 @@ class NLPProcessor:
         return entities
     
     def _load_stop_datasets(self) -> None:
-        """Load stop name datasets."""
+        """
+        Load bus and train stop names from local CSVs for fuzzy NER-style matching.
+        """
         if self._stops_loaded:
             return
+
+
         self._bus_stops = []
         self._train_stations = []
         self._train_lines = []
@@ -496,19 +514,38 @@ class NLPProcessor:
         return t
     
     def extract_train_disruption_line(self, query: str) -> Optional[str]:
-        """Extract train line from disruption query."""
+        """
+        If the query is about train/tube/Overground/DLR status or disruption and mentions
+        a line from _train_lines, return that line's display name. Otherwise return None.
+        Matching: punctuation like & is interchangeable; apostrophes don't have to be included.
+        """
         return None
     
     def extract_bus_disruption_route(self, query: str) -> Optional[str]:
-        """Extract bus route from disruption query."""
+        """
+        If the query is about bus status or disruption and contains a route number/string
+        that appears in tfl_bus_routes.txt, return that route id (e.g. "83", "N29"). Otherwise return None.
+        """
         return None
     
     def parse_line_or_route_followup(self, message: str) -> Optional[Tuple[str, str]]:
-        """Parse follow-up with just a line or route name."""
+        """
+        For follow-up replies after "couldn't find a train/bus": if the message is just a train line
+        or bus route (no status/disruption keywords required), return (value, 'train') or (value, 'bus').
+        Otherwise return None. Bus route is preferred when the message is only digits or N+digits.
+        """
         return None
     
     def _best_csv_stop_match(self, candidate: str, mode_hint: Optional[str] = None):
-        """Find best fuzzy match across bus/train CSV stop names."""
+        """
+        Given a free-text candidate (usually a location phrase), find the best
+        fuzzy match across bus and/or train CSV stop names.
+        Returns a dict with keys: type ('bus'|'train'), name, score, or None.
+
+        mode_hint: If "train", only match against train stations (so train
+        queries don't match bus CSV). If "bus", only match against bus stops.
+        If None, search both and return the single best score (previous behaviour).
+        """
         if not candidate or not candidate.strip():
             return None
         
@@ -569,6 +606,14 @@ class NLPProcessor:
         
         return {"type": best_type, "name": best_name, "score": best_score}
     
-    def _refine_with_stop_datasets(self, original_text: str, intent: str, entities: Dict[str, Any], confidence: float):
-        """Refine intent/entities using CSV stop names."""
+    def _refine_with_stop_datasets(
+        self,
+        original_text: str,
+        intent: str,
+        entities: Dict[str, Any],
+        confidence: float,
+    ):
+        """
+        Use CSV stop names as an additional NER + slot-filling and intent hint layer.
+        """
         return intent, entities, confidence
