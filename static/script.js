@@ -810,6 +810,7 @@ function appendTimetableCard(timetableData, messageText) {
         card.appendChild(empty);
     }
 
+    appendReadAloudAndShareButtons(card, messageText);
     wrap.appendChild(card);
     chatMessages.appendChild(wrap);
     chatMessages.scrollTop = chatMessages.scrollHeight;
@@ -859,6 +860,7 @@ function appendDisruptionCard(disruptionData, messageText) {
         card.appendChild(altEl);
     }
 
+    appendReadAloudAndShareButtons(card, messageText);
     wrap.appendChild(card);
     chatMessages.appendChild(wrap);
     chatMessages.scrollTop = chatMessages.scrollHeight;
@@ -945,6 +947,47 @@ function sendPlannedJourney() {
             addMessageAndStore('Sorry, something went wrong talking to the server.', 'bot');
         });
 }
+
+function initPlacesAutocomplete() {
+    if (!window.google || !google.maps || !google.maps.places) {
+        return;
+    }
+
+    if (fromInput) {
+        const fromAutocomplete = new google.maps.places.Autocomplete(fromInput, {
+            fields: ['geometry', 'name'],
+        });
+        fromAutocomplete.addListener('place_changed', () => {
+            const place = fromAutocomplete.getPlace();
+            if (place && place.geometry && place.geometry.location) {
+                const lat = place.geometry.location.lat();
+                const lng = place.geometry.location.lng();
+                fromCoord = `${lat},${lng}`;
+            } else {
+                fromCoord = '';
+            }
+        });
+    }
+
+    if (toInput) {
+        const toAutocomplete = new google.maps.places.Autocomplete(toInput, {
+            fields: ['geometry', 'name'],
+        });
+        toAutocomplete.addListener('place_changed', () => {
+            const place = toAutocomplete.getPlace();
+            if (place && place.geometry && place.geometry.location) {
+                const lat = place.geometry.location.lat();
+                const lng = place.geometry.location.lng();
+                toCoord = `${lat},${lng}`;
+            } else {
+                toCoord = '';
+            }
+        });
+    }
+}
+
+// Expose callback for Google Places script (if configured)
+window.initPlacesAutocomplete = initPlacesAutocomplete;
 
 // Wire up journey planner controls if present
 if (journeyPlannerToggle) {

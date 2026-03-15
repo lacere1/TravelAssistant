@@ -348,6 +348,45 @@ def _journeys_to_summaries(journeys: List[Dict[str, Any]]) -> List[Dict[str, Any
                 "detail": " – ".join(detail_parts) if detail_parts else "",
                 "duration": leg_duration,
             }
+
+            # Walking: extract step-by-step instructions and path for directions URL
+            raw_mode = (leg.get("mode", {}).get("name") or "").lower()
+            if raw_mode in ("walk", "walking"):
+                steps = instr_obj.get("steps", [])
+                leg_out["steps"] = [
+                    {
+                        "description": s.get("description")
+                        or s.get("detailedDescription")
+                        or s.get("turnInstruction", ""),
+                        "distance": s.get("distance") or 0,
+                    }
+                    for s in (steps if isinstance(steps, list) else [])
+                ]
+                path = leg.get("path", {}) or {}
+                line_str = path.get("lineString", "")
+                if line_str:
+                    points = [p.strip() for p in line_str.split(" ") if p.strip()]
+                    if len(points) >= 2:
+                        leg_out["fromLatLng"] = points[0]
+                        leg_out["toLatLng"] = points[-1]
+            else:
+                # Transit: extract stop names for "View stops"
+                path = leg.get("path", {}) or {}
+                stop_points = path.get("stopPoints", []) or []
+                leg_out["stops"] = []
+                for sp in stop_points:
+                    if isinstance(sp, dict):
+                        name = (
+                            sp.get("name")
+                            or sp.get("commonName")
+                            or sp.get("stationName")
+                            or ""
+                        )
+                        if name:
+                            leg_out["stops"].append(name)
+                    elif isinstance(sp, str):
+                        leg_out["stops"].append(sp)
+
             legs_summary.append(leg_out)
 
         fare_total = None
