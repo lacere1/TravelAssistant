@@ -98,222 +98,44 @@ class TransportDataFetcher:
         return cleaned, main_words, first_word
     
     def _normalize_tube_station_name(self, station_name: str) -> str:
-        """
-        Normalize punctuation and casing for typical tube station names.
-        
-        Handles:
-        - "St." / "St" → "St" (standardize abbreviation)
-        - "&" → "and"
-        - Hyphens and spacing
-        - Title case formatting
-        - Apostrophes (preserved)
-        
-        Args:
-            station_name: Raw station name (e.g., "baker st.", "harrow & wealdstone")
-            
-        Returns:
-            Normalized station name (e.g., "Baker St", "Harrow and Wealdstone")
-        """
+        """Normalize punctuation and casing for tube station names."""
         if not station_name or not station_name.strip():
             return station_name
-        
-        # Start with trimmed input
         normalized = station_name.strip()
-        
-        # Normalize "St." / "St" → "St" (standardize abbreviation without period)
-        # Handle both standalone and in context (e.g., "St. James's", "St Paul's")
         normalized = re.sub(r'\bSt\.\b', 'St', normalized, flags=re.IGNORECASE)
-        normalized = re.sub(r'\bst\b', 'St', normalized)  # Lowercase "st" → "St"
-        
-        # Normalize "&" → "and"
         normalized = re.sub(r'\s*&\s*', ' and ', normalized)
-        
-        # Normalize hyphens - ensure single hyphen with spaces around if needed
-        # But preserve hyphens in compound names (e.g., "Bromley-by-Bow")
-        normalized = re.sub(r'\s*-\s*', '-', normalized)  # Remove spaces around hyphens
-        
-        # Normalize multiple spaces to single space
         normalized = re.sub(r'\s+', ' ', normalized)
-        
-        # Apply title case, but preserve special cases:
-        # - "St" should remain capitalized
-        # - Words after apostrophes should be capitalized (e.g., "James's")
-        # - Words after hyphens should be capitalized (e.g., "by-Bow")
-        # - Small words like "and", "on", "the" in the middle should be lowercase
-        #   (but capitalize if first word)
-        
         words = normalized.split()
         if not words:
             return normalized
-        
-        # Title case each word, with special handling
-        title_words = []
         small_words = {'and', 'on', 'the', 'of', 'by', 'in', 'at', 'to', 'for'}
-        
+        title_words = []
         for i, word in enumerate(words):
-            # Handle hyphenated words
-            if '-' in word:
-                parts = word.split('-')
-                title_parts = []
-                for j, part in enumerate(parts):
-                    if part.lower() == 'st':
-                        title_parts.append('St')
-                    elif j == 0 or part.lower() not in small_words:
-                        title_parts.append(part.capitalize())
-                    else:
-                        title_parts.append(part.lower())
-                title_words.append('-'.join(title_parts))
-            # Handle words with apostrophes
-            elif "'" in word:
-                # Split on apostrophe, capitalize first part, handle second part
-                if word.lower().startswith("st'"):
-                    # Special case: "St's" → "St's"
-                    title_words.append("St" + word[2:].capitalize())
-                else:
-                    parts = word.split("'")
-                    if len(parts) == 2:
-                        title_words.append(parts[0].capitalize() + "'" + parts[1].capitalize())
-                    else:
-                        title_words.append(word.capitalize())
-            # Handle "St" abbreviation
-            elif word.lower() == 'st':
-                title_words.append('St')
-            # Handle regular words
+            if i == 0:
+                title_words.append(word.capitalize())
+            elif word.lower() in small_words:
+                title_words.append(word.lower())
             else:
-                if i == 0:
-                    # First word always capitalized
-                    title_words.append(word.capitalize())
-                elif word.lower() in small_words:
-                    # Small words in middle are lowercase
-                    title_words.append(word.lower())
-                else:
-                    title_words.append(word.capitalize())
-        
-        normalized = ' '.join(title_words)
-        
-        # Final cleanup: remove any extra spaces
-        normalized = re.sub(r'\s+', ' ', normalized).strip()
-        
-        return normalized
-    
-    def _calculate_word_similarity(self, word1: str, word2: str) -> float:
-        """
-        Efficient word similarity calculation handling typos, extra chars, missing chars
-        """
-        w1, w2 = word1.lower(), word2.lower()
-        if w1 == w2:
-            return 1.0
-        
-        # Direct similarity (handles most typos)
-        direct = SequenceMatcher(None, w1, w2).ratio()
-        
-        # Quick checks for early exit
-        if direct > 0.7:
-            return direct
-        
-        # Character set overlap (handles scrambled letters)
-        chars1, chars2 = set(w1), set(w2)
-        char_overlap = len(chars1 & chars2) / max(len(chars1 | chars2), 1) if chars1 | chars2 else 0
-        
-        # First/last character bonus (common typo patterns)
-        first_match = 0.15 if (w1 and w2 and w1[0] == w2[0]) else 0
-        last_match = 0.15 if (len(w1) > 1 and len(w2) > 1 and w1[-1] == w2[-1]) else 0
-        
-        # Length similarity (handles extra/missing characters)
-        len_sim = 1.0 - abs(len(w1) - len(w2)) / max(len(w1), len(w2), 1)
-        
-        # Substring match (one word contains the other - handles partial matches)
-        substring_bonus = 0.3 if (w1 in w2 or w2 in w1) and min(len(w1), len(w2)) >= 3 else 0
-        
-        # Combined score
-        return max(direct, char_overlap * 0.6) + first_match + last_match + (len_sim * 0.1) + substring_bonus
+                title_words.append(word.capitalize())
+        return ' '.join(title_words).strip()
     
     def _find_closest_location_match(self, location: str, all_stops: List[Dict[str, Any]]) -> Optional[str]:
-        """
-        Efficiently find closest matching stop using optimized fuzzy matching
-        Handles typos, extra chars, missing chars, word order changes
-        """
+        """Find closest matching stop using fuzzy matching."""
         if not all_stops:
             return None
-        
-        # Normalize the query once
-        cleaned_loc, main_words, first_word = self._normalize_query(location)
         location_lower = location.lower()
-        
-        if not main_words and not cleaned_loc:
-            return None
-        
         best_match = None
         best_score = 0.0
-        
-        # Pre-process stops for efficiency
         for stop in all_stops:
-            stop_name = stop.get('name', '')
-            if not stop_name:
+            name = stop.get('name', '')
+            if not name:
                 continue
-            
-            stop_lower = stop_name.lower()
-            cleaned_stop, stop_words, _ = self._normalize_query(stop_name)
-            
-            # Calculate multiple similarity scores efficiently
-            scores = []
-            
-            # 1. Full string similarity (exact or close matches)
-            full_match = SequenceMatcher(None, location_lower, stop_lower).ratio()
-            scores.append(full_match)
-            
-            # 2. Cleaned string similarity (removes common words)
-            if cleaned_loc and cleaned_stop:
-                cleaned_match = SequenceMatcher(None, cleaned_loc, cleaned_stop).ratio()
-                scores.append(cleaned_match * 0.98)
-            
-            # 3. Word-level matching (handles word order and typos)
-            if main_words and stop_words:
-                # Best match for each location word in stop words
-                word_scores = []
-                for loc_word in main_words:
-                    best_match_score = max(
-                        self._calculate_word_similarity(loc_word, stop_word)
-                        for stop_word in stop_words
-                    )
-                    word_scores.append(best_match_score)
-                
-                # Average word match score
-                avg_word_score = sum(word_scores) / len(word_scores) if word_scores else 0
-                scores.append(avg_word_score * 0.95)
-                
-                # Coverage: how many location words found in stop
-                coverage = sum(1 for score in word_scores if score > 0.6) / len(word_scores) if word_scores else 0
-                scores.append(coverage * 0.85)
-            
-            # 4. Character-level similarity (handles scrambled words)
-            loc_chars = set(location_lower.replace(' ', '').replace('-', ''))
-            stop_chars = set(stop_lower.replace(' ', '').replace('-', ''))
-            if loc_chars and stop_chars:
-                char_sim = len(loc_chars & stop_chars) / max(len(loc_chars | stop_chars), 1)
-                scores.append(char_sim * 0.5)
-            
-            # 5. Substring/contains match (handles partial matches)
-            if len(location_lower) >= 3:
-                if location_lower in stop_lower or stop_lower in location_lower:
-                    scores.append(0.75)
-            
-            # 6. First word emphasis (first word is usually most important)
-            if first_word and stop_words:
-                first_word_sim = max(
-                    self._calculate_word_similarity(first_word, sw)
-                    for sw in stop_words
-                )
-                scores.append(first_word_sim * 0.9)
-            
-            # Use maximum score (best match across all methods)
-            final_score = max(scores) if scores else 0
-            
-            if final_score > best_score:
-                best_score = final_score
-                best_match = stop_name
-        
-        # Threshold: 0.3 for serious typos (30% similarity)
+            score = SequenceMatcher(None, location_lower, name.lower()).ratio()
+            if location_lower in name.lower() or name.lower() in location_lower:
+                score = max(score, 0.75)
+            if score > best_score:
+                best_score = score
+                best_match = name
         return best_match if best_score > 0.3 else None
     
     def get_tfl_timetable(self, stop_query: str, mode_filter: Optional[str] = None) -> Optional[Dict[str, Any]]:
@@ -379,18 +201,14 @@ class TransportDataFetcher:
             # Check if any stop points were found
             matches = data.get('matches', [])
             
-            # If mode_filter is 'train', check if we have any train/tube stations in results
-            # If not, try variations with "Underground Station" or just the base name
+            # If mode_filter is 'train', check if we have any train/tube stations
+            # If not, try with just the base name (remove "station")
             if matches and mode_filter == 'train':
                 has_train_station = any(
                     any(m in match.get('modes', []) for m in ['tube', 'train', 'dlr', 'overground', 'tram', 'national-rail'])
                     for match in matches
                 )
                 if not has_train_station:
-                    # No train stations found, try variations
-                    query_lower = stop_query.lower()
-                    
-                    # Strategy 1: Try just the base name (remove "station") - this often works better
                     common_words = ['station', 'stop', 'the', 'tube', 'underground', 'metro']
                     query_words = stop_query.split()
                     cleaned_query = ' '.join(w for w in query_words if w.lower() not in common_words).strip()
@@ -402,7 +220,6 @@ class TransportDataFetcher:
                                 cleaned_data = response.json()
                                 cleaned_matches = cleaned_data.get('matches', [])
                                 if cleaned_matches:
-                                    # Check if we now have train stations
                                     has_train = any(
                                         any(m in match.get('modes', []) for m in ['tube', 'train', 'dlr', 'overground', 'tram', 'national-rail'])
                                         for match in cleaned_matches
@@ -411,23 +228,6 @@ class TransportDataFetcher:
                                         matches = cleaned_matches
                         except Exception:
                             pass
-                    
-                    # Strategy 2: Try replacing "station" with "Underground Station"
-                    if not matches or not any(any(m in match.get('modes', []) for m in ['tube', 'train', 'dlr', 'overground', 'tram', 'national-rail']) for match in matches):
-                        if 'station' in query_lower and 'underground' not in query_lower:
-                            # Try replacing "station" with "Underground Station"
-                            underground_query = stop_query.replace('station', 'Underground Station').replace('Station', 'Underground Station')
-                            underground_query = self._normalize_tube_station_name(underground_query)
-                            params['query'] = underground_query
-                            try:
-                                response = requests.get(url, params=params, timeout=10)
-                                if response.status_code == 200:
-                                    underground_data = response.json()
-                                    underground_matches = underground_data.get('matches', [])
-                                    if underground_matches:
-                                        matches = underground_matches
-                            except Exception:
-                                pass
             
             if not matches or len(matches) == 0:
                 # Try with cleaned version of the query (remove common words)
@@ -436,7 +236,6 @@ class TransportDataFetcher:
                 cleaned_query = ' '.join(w for w in query_words if w.lower() not in common_words).strip()
                 
                 if cleaned_query and cleaned_query.lower() != stop_query.lower():
-                    # Try search with cleaned query
                     params['query'] = cleaned_query
                     response = requests.get(url, params=params, timeout=10)
                     if response.status_code == 200:
@@ -447,7 +246,6 @@ class TransportDataFetcher:
                 if (not matches or len(matches) == 0) and mode_filter == 'train':
                     query_lower = stop_query.lower()
                     if 'station' in query_lower or 'underground' not in query_lower:
-                        # Try adding "Underground Station" if not already present
                         if 'underground' not in query_lower:
                             underground_query = stop_query.replace('station', 'Underground Station').replace('Station', 'Underground Station')
                             underground_query = self._normalize_tube_station_name(underground_query)
@@ -463,7 +261,7 @@ class TransportDataFetcher:
                                 except Exception:
                                     pass
                 
-                # If still no matches, try multiple broader search strategies for serious typos
+                # Broader search with first main word
                 if not matches or len(matches) == 0:
                     main_words = [w for w in stop_query.split() if len(w) > 2 and w.lower() not in common_words]
                     
@@ -626,10 +424,8 @@ class TransportDataFetcher:
                             matches = filtered_stops + train_matches
                         # Skip disambiguation - proceed to fetch arrivals for all stops serving the route
                     elif route_was_specified and len(filtered_stops) == 0:
-                        # User specified a route but no stops serve that route - return error with available routes
+                        # Collect available routes from all bus stops
                         available_routes = set()
-                        
-                        # Collect all routes from all bus stops (including children for group stops)
                         for match in bus_stop_matches:
                             stop_lines = match.get('lines', [])
                             for line in stop_lines:
@@ -639,37 +435,9 @@ class TransportDataFetcher:
                                     line_id = str(line)
                                 if line_id:
                                     available_routes.add(line_id)
-                            
-                            # Also check child stops for group stops
-                            stop_id = match.get('id', '')
-                            if stop_id:
-                                try:
-                                    stop_info_url = f"{self.tfl_base_url}/StopPoint/{stop_id}"
-                                    info_params = {
-                                        'app_id': self.tfl_app_id,
-                                        'app_key': self.tfl_app_key,
-                                    }
-                                    info_resp = requests.get(stop_info_url, params=info_params, timeout=3)
-                                    if info_resp.status_code == 200:
-                                        info_data = info_resp.json()
-                                        children = info_data.get('children', [])
-                                        for child in children:
-                                            child_lines = child.get('lines', [])
-                                            for line in child_lines:
-                                                if isinstance(line, dict):
-                                                    line_id = line.get('id', '')
-                                                else:
-                                                    line_id = str(line)
-                                                if line_id:
-                                                    available_routes.add(line_id)
-                                except Exception:
-                                    pass
                         
-                        # Format available routes for display
                         sorted_routes = sorted(available_routes, key=lambda x: (len(x), x))
                         routes_str = ', '.join(sorted_routes) if sorted_routes else 'none'
-                        
-                        # Get the stop name for the error message
                         stop_name = bus_stop_matches[0].get('name', stop_query) if bus_stop_matches else stop_query
                         requested_route = ', '.join(mentioned_routes)
                         
@@ -685,112 +453,10 @@ class TransportDataFetcher:
                 # Only check for disambiguation if user did NOT specify a route
                 # If route was specified, we already filtered and will return all matching stops
                 
-                # If multiple bus stops found and no route specified, check for disambiguation
+                # Simple bus disambiguation: check if stops have different directions
                 if len(bus_stop_matches) > 1 and not route_was_specified:
-                    # For grouped bus stops (e.g. 490G...), break them down into individual child stops
-                    # so each platform/direction becomes its own disambiguation option.
-                    expanded_matches = []
-                    for match in bus_stop_matches:
-                        stop_id = match.get('id', '')
-                        name = match.get('name', stop_query)
-                        # Heuristic: group StopPoints often have 4th char 'G' (e.g. 490G...)
-                        is_group = bool(stop_id and len(stop_id) >= 4 and stop_id[3] == 'G')
-                        if not is_group:
-                            expanded_matches.append(match)
-                            continue
-                        try:
-                            stop_info_url = f"{self.tfl_base_url}/StopPoint/{stop_id}"
-                            info_resp = requests.get(stop_info_url, params=self._tfl_params(), timeout=5)
-                            if info_resp.status_code == 200:
-                                info_data = info_resp.json()
-                                children = info_data.get('children', [])
-                                child_added = False
-                                for child in children:
-                                    if 'bus' not in (child.get('modes') or []):
-                                        continue
-                                    child_match = {
-                                        'id': child.get('id', stop_id),
-                                        'name': name,  # keep base location name
-                                        'towards': child.get('towards') or '',
-                                        'lat': child.get('lat'),
-                                        'lon': child.get('lon'),
-                                        'modes': child.get('modes') or ['bus'],
-                                        'icsId': child.get('icsId', match.get('icsId')),
-                                    }
-                                    expanded_matches.append(child_match)
-                                    child_added = True
-                                # If no child bus stops were found, keep the original group match
-                                if not child_added:
-                                    expanded_matches.append(match)
-                            else:
-                                expanded_matches.append(match)
-                        except Exception:
-                            expanded_matches.append(match)
-                    if expanded_matches:
-                        bus_stop_matches = expanded_matches
-                    # Collect all coordinates from all bus stops
-                    lats = [m.get('lat') for m in bus_stop_matches if m.get('lat') is not None]
-                    lons = [m.get('lon') for m in bus_stop_matches if m.get('lon') is not None]
-                    
-                    needs_disambiguation = False
-                    
-                    # Grouped stops: same station name (or icsId) with different "towards" = direction disambiguation
                     towards_set = set((m.get('towards') or '').strip() for m in bus_stop_matches if (m.get('towards') or '').strip())
                     if len(towards_set) > 1:
-                        needs_disambiguation = True
-                    
-                    # Check if all stops have coordinates (for location-based disambiguation)
-                    if not needs_disambiguation and lats and lons and len(lats) == len(bus_stop_matches) and len(lons) == len(bus_stop_matches):
-                        lat_diff = max(lats) - min(lats) if len(lats) > 1 else 0
-                        lon_diff = max(lons) - min(lons) if len(lons) > 1 else 0
-                        if lat_diff >= 0.05 or lon_diff >= 0.05:
-                            needs_disambiguation = True
-                    elif not needs_disambiguation:
-                        # If coordinates are missing, fall back to name-based disambiguation
-                        # Group by exact name first
-                        stops_by_exact_name = {}
-                        for match in bus_stop_matches:
-                            name = match.get('name', 'Unknown')
-                            if name not in stops_by_exact_name:
-                                stops_by_exact_name[name] = []
-                            stops_by_exact_name[name].append(match)
-                        
-                        # Check if any stops with same exact name have different coordinates
-                        for name, name_matches in stops_by_exact_name.items():
-                            if len(name_matches) > 1:
-                                # Multiple stops with same exact name - check coordinates
-                                name_lats = [m.get('lat') for m in name_matches if m.get('lat') is not None]
-                                name_lons = [m.get('lon') for m in name_matches if m.get('lon') is not None]
-                                
-                                if name_lats and name_lons:
-                                    # Check if lat or lon difference is >= 0.05
-                                    name_lat_diff = max(name_lats) - min(name_lats) if len(name_lats) > 1 else 0
-                                    name_lon_diff = max(name_lons) - min(name_lons) if len(name_lons) > 1 else 0
-                                    
-                                    if name_lat_diff >= 0.05 or name_lon_diff >= 0.05:
-                                        needs_disambiguation = True
-                                        break
-                        
-                        # Also check for multiple distinct base locations (different names) if no coordinate-based disambiguation
-                        if not needs_disambiguation:
-                            # Extract base location names (before "/" or " / ") to identify distinct locations
-                            base_locations = {}
-                            for match in bus_stop_matches:
-                                name = match.get('name', 'Unknown')
-                                # Extract base location (before "/" or " / ")
-                                base_name = name.split('/')[0].split(' / ')[0].strip()
-                                if base_name not in base_locations:
-                                    base_locations[base_name] = []
-                                base_locations[base_name].append(name)
-                            
-                            # If there are multiple distinct base locations, disambiguate
-                            if len(base_locations) > 1:
-                                needs_disambiguation = True
-                    
-                    # If disambiguation needed, return error with enriched stop labels and options for reply handling.
-                    # When Search API does not provide direction (e.g. Tudor Gardens x2), fetch Arrivals per stop
-                    # to get platformName and towards so labels show "Stop AA (towards Willesden)".
-                    if needs_disambiguation:
                         labelled_stops = []
                         disambiguation_options = []
                         for match in bus_stop_matches:
@@ -798,14 +464,6 @@ class TransportDataFetcher:
                             name = match.get('name') or stop_query
                             towards = (match.get('towards') or '').strip()
                             platform = self._platform_from_stop_id(stop_id)
-                            # Enrich from Arrivals when Search didn't give direction (same logic as timetable grouping)
-                            if (not towards or not platform) and stop_id:
-                                arr_platform, arr_towards = self._get_stop_direction_from_arrivals(stop_id)
-                                if arr_platform:
-                                    platform = arr_platform
-                                if arr_towards:
-                                    towards = arr_towards
-                            # Build label so user always sees direction when we have it (like bus_arrivals_grouped stop_label)
                             if platform and towards:
                                 label = f"{name} – Stop {platform} (towards {towards})"
                             elif towards:
@@ -813,24 +471,19 @@ class TransportDataFetcher:
                             elif platform:
                                 label = f"{name} – Stop {platform}"
                             else:
-                                label = self._format_bus_stop_disambiguation_name(match, stop_query, enrich_from_arrivals=False)
+                                label = name
                             labelled_stops.append(label)
                             disambiguation_options.append({
-                                'id': stop_id,
-                                'name': name,
-                                'towards': towards,
-                                'platform': platform,
-                                'label': label
+                                'id': stop_id, 'name': name,
+                                'towards': towards, 'platform': platform, 'label': label
                             })
                         return {
                             'error': 'disambiguation_needed',
-                            'query': stop_query,
-                            'mode': 'bus',
+                            'query': stop_query, 'mode': 'bus',
                             'stations': labelled_stops,
                             'count': len(labelled_stops),
                             'disambiguation_options': disambiguation_options
                         }
-                    # If all stops are at same location (coordinates within 0.05), proceed (show all stops together)
             
             for match in matches:
                 stop_id = match.get('id')
@@ -1049,15 +702,9 @@ class TransportDataFetcher:
         }
 
     def get_tfl_timetable_by_stop_id(
-        self,
-        stop_id: str,
-        mode_filter: Optional[str] = None,
-        stop_name: Optional[str] = None
+        self, stop_id: str, mode_filter: Optional[str] = None, stop_name: Optional[str] = None
     ) -> Optional[Dict[str, Any]]:
-        """
-        Get timetable (arrivals) for a single TFL stop by ID.
-        Used after direction disambiguation when the user has chosen one stop (e.g. 490000153AA).
-        """
+        """Get timetable for a single TFL stop by ID (used after disambiguation)."""
         if not self.has_tfl or not stop_id:
             return None
         mode_filter = mode_filter or 'bus'
@@ -1066,8 +713,7 @@ class TransportDataFetcher:
                 info_url = f"{self.tfl_base_url}/StopPoint/{stop_id}"
                 info_resp = requests.get(info_url, params=self._tfl_params(), timeout=5)
                 if info_resp.status_code == 200:
-                    info = info_resp.json()
-                    stop_name = info.get('commonName') or info.get('name') or stop_id
+                    stop_name = info_resp.json().get('commonName') or info_resp.json().get('name') or stop_id
                 else:
                     stop_name = stop_id
             except Exception:
@@ -1076,8 +722,7 @@ class TransportDataFetcher:
         all_arrivals = []
         for aid in arrival_stop_ids:
             try:
-                arrivals_url = f"{self.tfl_base_url}/StopPoint/{aid}/Arrivals"
-                resp = requests.get(arrivals_url, params=self._tfl_params(), timeout=10)
+                resp = requests.get(f"{self.tfl_base_url}/StopPoint/{aid}/Arrivals", params=self._tfl_params(), timeout=10)
                 if resp.status_code == 200:
                     stop_arrivals = resp.json()
                     if stop_arrivals:
@@ -1091,33 +736,18 @@ class TransportDataFetcher:
                 print(f"Error fetching arrivals for stop {aid}: {e}")
         if not all_arrivals:
             return {'error': 'no_arrivals', 'stop_name': stop_name, 'query': stop_id}
-        return self._build_timetable_from_arrivals(
-            all_arrivals, stop_name, stop_id, mode_filter
-        )
-
-    def _platform_from_stop_id(self, stop_id: str) -> str:
-        """
-        Derive platform/stop letter from TFL stop id (e.g. 490000153AA -> AA, 490000153BB -> BB).
-        """
-        if not stop_id or len(stop_id) < 2:
-            return ''
-        # Common pattern: id ends with two letters for direction (AA, BB, etc.)
-        tail = stop_id[-2:]
-        if tail.isalpha():
-            return tail.upper()
-        return ''
+        return self._build_timetable_from_arrivals(all_arrivals, stop_name, stop_id, mode_filter)
 
     def _get_stop_direction_from_arrivals(self, stop_id: str) -> tuple:
         """
         Fetch Arrivals for a stop and return (platform, towards) from the first prediction.
         Used to enrich disambiguation labels when Search API does not provide direction info.
-        Returns (platform_str, towards_str) - either may be empty.
         """
         if not stop_id or not self.has_tfl:
             return ('', '')
         try:
             arrival_ids = self._expand_to_leaf_bus_stops(stop_id)
-            for aid in arrival_ids[:1]:  # first leaf only
+            for aid in arrival_ids[:1]:
                 url = f"{self.tfl_base_url}/StopPoint/{aid}/Arrivals"
                 resp = requests.get(url, params=self._tfl_params(), timeout=5)
                 if resp.status_code == 200:
@@ -1136,12 +766,7 @@ class TransportDataFetcher:
         self, stop_match: Dict[str, Any], fallback_query: str,
         enrich_from_arrivals: bool = False
     ) -> str:
-        """
-        Build a human-friendly label for a bus stop used in disambiguation prompts.
-        Includes direction (towards) and optional platform (Stop AA/BB) when available.
-        If enrich_from_arrivals is True and towards/platform are missing, fetches Arrivals
-        to get platformName and towards (so e.g. "Tudor Gardens" becomes "Tudor Gardens – Stop AA (towards X)").
-        """
+        """Build a human-friendly label for a bus stop used in disambiguation prompts."""
         base_name = stop_match.get('name') or fallback_query or 'Unknown stop'
         towards = (stop_match.get('towards') or '').strip()
         stop_id = stop_match.get('id') or ''
@@ -1159,6 +784,19 @@ class TransportDataFetcher:
         if platform:
             return f"{base_name} – Stop {platform}"
         return base_name
+
+    def _platform_from_stop_id(self, stop_id: str) -> str:
+        """
+        Derive platform/stop letter from TFL stop id (e.g. 490000153AA -> AA, 490000153BB -> BB).
+        """
+        if not stop_id or len(stop_id) < 2:
+            return ''
+        # Common pattern: id ends with two letters for direction (AA, BB, etc.)
+        tail = stop_id[-2:]
+        if tail.isalpha():
+            return tail.upper()
+        return ''
+
 
     def get_route_recommendation(self, origin: str, destination: str, avoid_tolls: bool = False, avoid_motorways: bool = False) -> Optional[Dict[str, Any]]:
         """
@@ -1181,6 +819,17 @@ class TransportDataFetcher:
                 print(f"TFL Journey Planner error: {e}")
         
         # No API data available
+        return None
+    
+    def get_transit_route(self, origin: str, destination: str) -> Optional[Dict[str, Any]]:
+        """Get public transport route between origin and destination"""
+        if self.has_tfl:
+            try:
+                journey = self._fetch_tfl_journey(origin, destination)
+                if journey:
+                    return journey
+            except Exception as e:
+                print(f"Error fetching transit route: {e}")
         return None
     
     
