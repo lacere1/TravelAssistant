@@ -28,7 +28,7 @@ class TransportDataFetcher:
         if self.has_tfl:
             print("TFL API initialized (App ID and Key configured)")
         if self.use_mock_data:
-            print("Warning: No API keys found.")
+            print("Warning: No API keys found. Using mock traffic data for demonstration.")
     
     def _tfl_params(self) -> Dict[str, str]:
         """Common TfL auth params. app_id is optional; app_key is typically required."""
@@ -68,7 +68,7 @@ class TransportDataFetcher:
             except Exception as e:
                 print(f"TFL API error: {e}")
         
-        # No API data available
+        # No API data available - return None instead of mock data
         return None
     
     def _normalize_query(self, query: str) -> tuple:
@@ -1180,7 +1180,7 @@ class TransportDataFetcher:
             except Exception as e:
                 print(f"TFL Journey Planner error: {e}")
         
-        # No API data available
+        # No API data available - return None instead of mock data
         return None
     
     
@@ -1498,7 +1498,7 @@ class TransportDataFetcher:
                 line_id = value
                 break
         
-        # If no exact match, try the route name directly
+        # If no exact match, try the route name directly (formatted)
         if not line_id:
             line_id = route_lower.replace(' ', '-').replace('_', '-')
         

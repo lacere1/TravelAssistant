@@ -615,6 +615,7 @@ class JourneyChatbot:
         else:
             reply = _journey_reply(True)
             if self.tfl_client.last_url:
+                reply += f"\n\n[debug] TfL URL: {self.tfl_client.last_url}"
 
         out = {"reply": reply, "journeys": journeys}
         if journeys and self.tfl_client.last_url:
@@ -626,7 +627,9 @@ class JourneyChatbot:
     def _apply_full_plan_if_present(self, text: str, user_state: Dict[str, Any]) -> None:
         """
         If the message looks like "Plan a journey from X to Y on 2026-02-16 at 18:00",
-        set fromQuery and toQuery, clear resolution state, and set when if date/time present.
+        set fromQuery and toQuery (stripping date/time from the to-part), clear
+        resolution state so we re-disambiguate for the new locations, and set
+        when if date/time is present. Uses original casing so TfL API gets the same names.
         """
         lowered = text.lower().strip()
         if " from " not in lowered or " to " not in lowered:
@@ -638,20 +641,45 @@ class JourneyChatbot:
             return
         from_part = from_part.strip()
         to_part = to_part.strip()
-        # Strip trailing date/time from to_part
+        # Strip trailing " on YYYY-MM-DD at HH:MM" or " at HH:MM" from to_part so TfL gets just the place.
         to_part = re.sub(
             r"\s+on\s+\d{4}-\d{2}-\d{2}\s+at\s+\d{1,2}:\d{2}\s*$",
-            "", to_part, flags=re.IGNORECASE,
+            "",
+            to_part,
+            flags=re.IGNORECASE,
         )
         to_part = re.sub(
             r"\s+at\s+\d{1,2}:\d{2}\s*$", "", to_part, flags=re.IGNORECASE
         )
         to_part = to_part.strip()
-        user_state["fromQuery"] = from_part
-        user_state["toQuery"] = to_part
+        # Preserve original case for TfL API (it can be case-sensitive for place names)
+        orig = text.strip()
+        try:
+            _, after_from_orig = orig.split(" from ", 1)
+            from_orig, to_orig = after_from_orig.split(" to ", 1)
+            to_orig = re.sub(
+                r"\s+on\s+\d{4}-\d{2}-\d{2}\s+at\s+\d{1,2}:\d{2}\s*$",
+                "",
+                to_orig,
+                flags=re.IGNORECASE,
+            )
+            to_orig = re.sub(
+                r"\s+at\s+\d{1,2}:\d{2}\s*$", "", to_orig, flags=re.IGNORECASE
+            )
+            user_state["fromQuery"] = from_orig.strip()
+            user_state["toQuery"] = to_orig.strip()
+        except ValueError:
+            user_state["fromQuery"] = from_part
+            user_state["toQuery"] = to_part
         for key in (
-            "fromLocationId", "toLocationId", "fromOptions", "toOptions",
-            "fromQuestion", "toQuestion", "askedWhen", "when",
+            "fromLocationId",
+            "toLocationId",
+            "fromOptions",
+            "toOptions",
+            "fromQuestion",
+            "toQuestion",
+            "askedWhen",
+            "when",
         ):
             user_state.pop(key, None)
         when = _parse_on_date_time(text)
@@ -659,14 +687,27 @@ class JourneyChatbot:
             user_state["when"] = when
 
     def _maybe_extract_initial_intent(self, text: str, user_state: Dict[str, Any]):
-        """Look for patterns like 'from X to Y' in the initial sentence."""
+        """
+        Look for patterns like 'from X to Y' in the initial sentence.
+        Only sets from/to if not already set (setdefault).
+        """
         lowered = text.lower()
         if " from " in lowered and " to " in lowered:
             try:
                 _, after_from = lowered.split(" from ", 1)
                 from_part, to_part = after_from.split(" to ", 1)
-                to_part = re.sub(r"\s+on\s+\d{4}-\d{2}-\d{2}\s+at\s+\d{1,2}:\d{2}\s*$", "", to_part, flags=re.IGNORECASE)
-                to_part = re.sub(r"\s+at\s+\d{1,2}:\d{2}\s*$", "", to_part, flags=re.IGNORECASE)
+                to_part = re.sub(
+                    r"\s+on\s+\d{4}-\d{2}-\d{2}\s+at\s+\d{1,2}:\d{2}\s*$",
+                    "",
+                    to_part,
+                    flags=re.IGNORECASE,
+                )
+                to_part = re.sub(
+                    r"\s+at\s+\d{1,2}:\d{2}\s*$",
+                    "",
+                    to_part,
+                    flags=re.IGNORECASE,
+                )
                 user_state.setdefault("fromQuery", from_part.strip())
                 user_state.setdefault("toQuery", to_part.strip())
             except ValueError:
@@ -712,6 +753,7 @@ class JourneyChatbot:
                 # silently continue – next call will progress the flow
                 reply = "Okay."
                 if self.tfl_client.last_url:
+                    reply += f"\n\n[debug] TfL URL: {self.tfl_client.last_url}"
                 return {
                     "reply": reply,
                     "journeys": [],
@@ -738,6 +780,7 @@ class JourneyChatbot:
                 "Could you rephrase or give a nearby station or area?"
             )
             if self.tfl_client.last_url:
+                reply += f"\n\n[debug] TfL URL: {self.tfl_client.last_url}"
             return {
                 "reply": reply,
                 "journeys": [],
@@ -748,6 +791,7 @@ class JourneyChatbot:
             user_state[chosen_id_key] = options[0]["id"]
             reply = f"Got it: {options[0]['name']}."
             if self.tfl_client.last_url:
+                reply += f"\n\n[debug] TfL URL: {self.tfl_client.last_url}"
             return {
                 "reply": reply,
                 "journeys": [],
@@ -763,6 +807,7 @@ class JourneyChatbot:
 
         reply = question
         if self.tfl_client.last_url:
+            reply += f"\n\n[debug] TfL URL: {self.tfl_client.last_url}"
         return {
             "reply": reply,
             "journeys": [],

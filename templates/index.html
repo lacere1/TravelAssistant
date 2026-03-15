@@ -34,11 +34,18 @@
             </div>
 
             <div id="chatListFilter" class="chat-list-filter" role="group" aria-label="Chat list filter">
+                <button type="button" id="chatFilterAll" class="chat-list-filter-btn active" aria-pressed="true">All</button>
+                <button type="button" id="chatFilterStarred" class="chat-list-filter-btn" aria-pressed="false">Starred</button>
             </div>
 
             <div class="sidebar-section">
                 <div class="sidebar-section-title">Your chats</div>
+                <div id="chatListDeleteSelectedBar" class="chat-list-delete-selected-bar hidden">
+                    <span class="chat-list-delete-selected-count">0</span> selected
+                    <button type="button" class="chat-list-delete-selected-btn">Delete selected</button>
+                </div>
                 <ul id="chatList" class="chat-list" aria-label="Saved chats">
+                    <!-- Filled dynamically -->
                 </ul>
             </div>
 
@@ -51,12 +58,15 @@
 
                 <div id="accountLoggedIn" class="account-logged-in hidden">
                     <div class="account-button-wrap">
+                        <input type="file" id="avatarFileInput" class="avatar-file-input" accept="image/*" aria-hidden="true">
                         <button type="button" id="accountMenuButton" class="account-menu-button" aria-expanded="false" aria-haspopup="true" aria-label="Account menu">
                             <span class="account-menu-avatar" id="accountMenuAvatar" aria-hidden="true">👤</span>
                             <span id="currentUsername" class="account-menu-username"></span>
                             <span class="account-menu-chevron" aria-hidden="true">▼</span>
                         </button>
                         <div id="accountDropdown" class="account-dropdown hidden">
+                            <button type="button" id="changeAvatarButton" class="account-dropdown-item">Change profile picture</button>
+                            <button type="button" id="removeAvatarButton" class="account-dropdown-item account-dropdown-item-subtle hidden">Remove profile picture</button>
                             <button type="button" id="logoutButton" class="account-dropdown-item">Sign out</button>
                         </div>
                     </div>
@@ -80,6 +90,8 @@
                     </div>
                 </div>
             </header>
+            <div id="shareFeedbackToast" class="share-feedback-toast share-feedback-hidden" aria-live="polite">Copied to clipboard</div>
+
             <div class="main-layout">
                 <div class="chat-column">
                     <div class="chat-container">
@@ -167,6 +179,10 @@
                                 placeholder="Ask about traffic, delays, routes..." 
                                 autocomplete="off"
                             >
+                            <button type="button" id="voiceInputButton" class="voice-btn" aria-label="Voice input (speak to type)" title="Voice input">
+                                <span class="voice-btn-icon" aria-hidden="true">🎤</span>
+                                <span class="voice-btn-label">Voice input</span>
+                            </button>
                             <button id="sendButton">Send</button>
                         </div>
                     </div>

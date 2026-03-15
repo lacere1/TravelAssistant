@@ -179,6 +179,27 @@ header h1 {
     font-size: 0.9rem;
 }
 
+.share-feedback-toast {
+    position: fixed;
+    bottom: 24px;
+    left: 50%;
+    transform: translateX(-50%);
+    padding: 10px 20px;
+    background: var(--text-primary);
+    color: var(--bg-page);
+    border-radius: 8px;
+    font-size: 0.9rem;
+    box-shadow: var(--shadow);
+    z-index: 1000;
+    transition: opacity 0.25s, transform 0.25s;
+}
+
+.share-feedback-toast.share-feedback-hidden {
+    opacity: 0;
+    pointer-events: none;
+    transform: translateX(-50%) translateY(10px);
+}
+
 .theme-toggle {
     border-radius: 999px;
 }
@@ -938,7 +959,102 @@ header h1 {
     transform: translateY(0);
 }
 
-/* Side panel */
+/* Voice input button */
+.voice-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    height: 48px;
+    padding: 0 14px;
+    border: 2px solid var(--input-border);
+    border-radius: 999px;
+    background: var(--bg-input);
+    color: var(--text-primary);
+    font-size: 1rem;
+    cursor: pointer;
+    transition: background 0.2s, border-color 0.2s, transform 0.2s;
+    flex-shrink: 0;
+}
+
+.voice-btn-icon {
+    font-size: 1.2rem;
+}
+
+.voice-btn-label {
+    font-size: 0.9rem;
+}
+
+@media (max-width: 768px) {
+    .voice-btn-label {
+        display: none;
+    }
+    .voice-btn {
+        width: 48px;
+        padding: 0;
+    }
+}
+
+.voice-btn:hover {
+    border-color: var(--input-focus);
+    background: var(--shortcut-item-hover);
+}
+
+.voice-btn.voice-btn-listening {
+    background: rgba(220, 53, 69, 0.15);
+    border-color: #dc3545;
+    animation: voice-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes voice-pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.7; }
+}
+
+/* Read-aloud button on bot messages */
+.message-actions-wrap {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 10px;
+    padding-top: 8px;
+    border-top: 1px solid var(--msg-bot-border);
+}
+
+.message-actions-wrap.message-actions-inside-card {
+    padding-left: 16px;
+    padding-right: 16px;
+    padding-bottom: 12px;
+}
+
+.message-action-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 12px;
+    border: 1px solid var(--message-action-border);
+    border-radius: 8px;
+    background: var(--message-action-bg);
+    color: var(--text-secondary);
+    font-size: 0.85rem;
+    cursor: pointer;
+    transition: background 0.2s, color 0.2s;
+}
+
+.message-action-btn:hover {
+    background: var(--shortcut-item-hover);
+    color: var(--text-primary);
+}
+
+.message-action-icon {
+    font-size: 1rem;
+}
+
+.message-action-label {
+    font-size: 0.85rem;
+}
+
+.side-panel {
     width: 220px;
     flex: 0 0 220px;
     background: var(--bg-side-panel);

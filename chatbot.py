@@ -6,6 +6,7 @@ from nlp_processor import NLPProcessor
 from transport_api import TransportDataFetcher
 import json
 import re
+from difflib import SequenceMatcher
 from typing import Dict, Optional, Any, List, Tuple
 
 class TrafficChatbot:
@@ -22,7 +23,8 @@ class TrafficChatbot:
             # When we asked "couldn't find a train/bus" - user can reply with just a line/route name
             'awaiting_disruption_line': None,  # 'train' | 'bus' when waiting for follow-up line/route
         }
-
+        # Per-user preference/history for disambiguation (last chosen stop, frequent stops)
+        self._user_preferences: Dict[str, Dict[str, Any]] = {}  # user_key -> { "last_chosen_stop_id", "frequent_stops": { stop_id: count } }
         print("Traffic Chatbot initialized successfully")
     
     def process_message(
@@ -154,6 +156,11 @@ class TrafficChatbot:
             (3, r'\b(3|three|third|3rd)\b'),
             (4, r'\b(4|four|fourth|4th)\b'),
             (5, r'\b(5|five|fifth|5th)\b'),
+            (6, r'\b(6|six|sixth|6th)\b'),
+            (7, r'\b(7|seven|seventh|7th)\b'),
+            (8, r'\b(8|eight|eighth|8th)\b'),
+            (9, r'\b(9|nine|ninth|9th)\b'),
+            (10, r'\b(10|ten|tenth|10th)\b'),
         ]
         for idx, pattern in number_phrases:
             if idx <= len(options) and re.search(pattern, text_norm):
@@ -212,6 +219,22 @@ class TrafficChatbot:
         # Resolve to an option (reuse existing logic)
         selected = self._resolve_disambiguation_reply(user_message, options)
         if selected is None:
+            # Fuzzy fallback: best label/towards match by similarity
+            best_opt = None
+            best_score = 0.0
+            for opt in options:
+                label = (opt.get('label') or opt.get('name') or '').lower()
+                towards = (opt.get('towards') or '').lower()
+                platform = (opt.get('platform') or '').lower()
+                for candidate in [label, towards, platform]:
+                    if not candidate or len(candidate) < 2:
+                        continue
+                    sim = SequenceMatcher(None, text, candidate).ratio()
+                    if sim > best_score:
+                        best_score = sim
+                        best_opt = opt
+            if best_opt is not None and best_score >= 0.5:
+                return ('choose_option', best_opt, best_score)
             return ('unclear', None, 0.0)
 
         # Assign confidence by match type (platform > towards > number)
@@ -226,6 +249,42 @@ class TrafficChatbot:
             # numeric match
             confidence = 0.85
         return ('choose_option', selected, confidence)
+
+    def _reorder_options_by_preference(
+        self, options: List[Dict[str, Any]], user_key: Optional[str]
+    ) -> List[Dict[str, Any]]:
+        """Reorder disambiguation options so last chosen and frequent stops appear first."""
+        if not options or not user_key:
+            return list(options)
+        prefs = self._user_preferences.get(user_key)
+        if not prefs:
+            return list(options)
+        last_id = prefs.get('last_chosen_stop_id')
+        frequent = prefs.get('frequent_stops') or {}
+
+        def sort_key(opt: Dict[str, Any]) -> Tuple[int, int]:
+            oid = opt.get('id') or ''
+            if oid == last_id:
+                first = 0
+            else:
+                first = 1
+            count = frequent.get(oid, 0)
+            return (first, -count)
+
+        return sorted(options, key=sort_key)
+
+    def _update_user_preference(
+        self, user_key: Optional[str], stop_id: str, stop_name: str
+    ) -> None:
+        """Record that this user chose this stop (for last chosen + frequent stops)."""
+        if not user_key or not stop_id:
+            return
+        prefs = self._user_preferences.setdefault(user_key, {
+            'last_chosen_stop_id': None,
+            'frequent_stops': {},
+        })
+        prefs['last_chosen_stop_id'] = stop_id
+        prefs['frequent_stops'][stop_id] = prefs['frequent_stops'].get(stop_id, 0) + 1
 
     def _build_disambiguation_prompt(self, disamb: Dict[str, Any]) -> Dict[str, Any]:
         """Build the disambiguation prompt from stored state (bus direction, train station, or train platform/direction)."""
@@ -468,7 +527,38 @@ class TrafficChatbot:
         route = entities.get('route')
         timetable_mode = entities.get('timetable_mode', 'both')  # bus, train, or both
         
-        # Persist the cleaned location back into entities
+        # If we have a canonical CSV stop match, constrain the location to words
+        # that actually appear in that stop name. This trims noisy phrases like
+        # "get the bus to Lavender Avenue" down to just "Lavender Avenue" before
+        # we hit the TfL search API.
+        csv_stop_name = entities.get('csv_stop_name')
+        if csv_stop_name:
+            if not location:
+                # Fall back to canonical CSV name when no location was extracted
+                location = csv_stop_name
+            else:
+                # Keep only CSV stop-name words that are present in the extracted location,
+                # but only when the user didn't add distinguishing words (e.g. "Frognal Rail"
+                # in "Finchley Road and Frognal Rail Station" vs CSV "Finchley Road").
+                def _tokenize(text: str) -> List[str]:
+                    return re.findall(r"[A-Za-z0-9']+", text)
+
+                csv_tokens = _tokenize(csv_stop_name)
+                csv_tokens_lower = {t.lower() for t in csv_tokens}
+                loc_tokens = _tokenize(location)
+                loc_tokens_lower = {t.lower() for t in loc_tokens}
+                # Words in user's location that aren't in the CSV match (e.g. "frognal", "rail")
+                loc_extra = [t for t in loc_tokens if t.lower() not in csv_tokens_lower]
+                stopwords = {'the', 'to', 'a', 'an'}
+                loc_extra_significant = [w for w in loc_extra if len(w) >= 3 and w.lower() not in stopwords]
+                # Only truncate when user didn't specify a more specific station name
+                if not loc_extra_significant:
+                    filtered_tokens = [t for t in csv_tokens if t.lower() in loc_tokens_lower]
+                    if filtered_tokens:
+                        location = " ".join(filtered_tokens)
+
+        # Persist the cleaned location back into entities so callers and
+        # downstream state can see the canonical stop wording.
         if location:
             entities['location'] = location
 
@@ -532,8 +622,13 @@ class TrafficChatbot:
                 
                 # Bus or train disambiguation: store state and handle replies
                 if disambiguation_options:
+                    ordered_options = (
+                        self._reorder_options_by_preference(disambiguation_options, user_key)
+                        if mode == 'bus'
+                        else disambiguation_options
+                    )
                     self.conversation_state['timetable_disambiguation'] = {
-                        'options': disambiguation_options,
+                        'options': ordered_options,
                         'query': query,
                         'timetable_mode': timetable_mode or mode
                     }

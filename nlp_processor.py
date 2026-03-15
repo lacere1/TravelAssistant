@@ -153,7 +153,7 @@ class NLPProcessor:
         text_lower = text.lower()
         # Tokenize and expand with WordNet synonyms (if available)
         tokens = re.findall(r'\w+', text_lower)
-        expanded_words = self._expand_with_synonyms(tokens)
+        expanded_words = set(t.lower() for t in tokens if t)
 
         # Concept sets for synonym-aware matching
         traffic_concepts = {'traffic', 'congestion', 'jam'}
