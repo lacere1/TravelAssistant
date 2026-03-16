@@ -9,20 +9,30 @@ import os
 from difflib import SequenceMatcher
 from typing import Dict, List, Any, Set, Optional, Tuple
 
+try:
+    # Optional NLTK + WordNet support for synonym expansion
+    import nltk  # type: ignore[import]
+    from nltk.corpus import wordnet as wn  # type: ignore[import]
+    _NLTK_AVAILABLE = True
+except Exception as e:
+    print(f"NLTK not available for synonym expansion: {e}")
+    wn = None  # type: ignore[assignment]
+    _NLTK_AVAILABLE = False
+
 
 class NLPProcessor:
     def __init__(self):
         """Initialize NLP models for intent classification and entity extraction"""
         print("Loading NLP models...")
-
-
+        # Earlier-stage behaviour: skip synonym expansion entirely to keep
+        # intent detection logic simple and self-contained.
         self._synonym_expansion_enabled = False
         
-
-
+        # Earlier-stage behaviour: skip loading transformer models and rely
+        # entirely on the rule-based intent classifier below.
         self.intent_classifier = None
         
-        # Intent labels for classification
+        # Intent labels for classification (excluding removed/deprecated intents)
         self.intent_labels = [
             "check_current_conditions",
             "ask_traffic_status",
@@ -54,8 +64,8 @@ class NLPProcessor:
         (multi-word synonyms are split into individual tokens).
         If NLTK/WordNet are unavailable, this simply returns the original tokens.
         """
-
-
+        # In this rollback version we only use the original lowercase tokens
+        # and do not attempt external WordNet lookups.
         return set(t.lower() for t in tokens if t)
     
     def process(self, text: str) -> Dict[str, Any]:
@@ -71,12 +81,15 @@ class NLPProcessor:
         original_text = text
         # Normalize text
         text = text.strip().lower()
+        print(f"[NLP] Incoming text: {original_text!r}")
         
         # Intent classification
         intent, confidence = self._classify_intent(text)
+        print(f"[NLP] Final intent: {intent}, confidence: {confidence:.3f}")
         
         # Entity extraction (primary NER + slot filling)
         entities = self._extract_entities(text)
+        print(f"[NLP] Extracted entities: {entities}")
         
         # Secondary, CSV-backed NER + intent refinement based on stop names
         intent, entities, confidence = self._refine_with_stop_datasets(
@@ -127,11 +140,13 @@ class NLPProcessor:
                 result = self.intent_classifier(text, self.intent_labels)
                 intent = result['labels'][0]
                 confidence = result['scores'][0]
+                print(f"[NLP] Transformer intent: {intent}, confidence: {confidence:.3f}")
 
                 # If overall confidence is low, fall back to synonym-aware rule-based intent
                 # instead of trusting the transformer classification.
                 if confidence < 0.6:
                     rule_intent, rule_confidence = self._rule_based_intent(text)
+                    print(f"[NLP] Low transformer confidence; using rule-based intent: {rule_intent}, confidence: {rule_confidence:.3f}")
                     return rule_intent, rule_confidence
                 
                 # If transformer gives low confidence and it's a questionable classification,
@@ -139,6 +154,7 @@ class NLPProcessor:
                 if confidence < 0.5 and 'traffic' in text_lower:
                     rule_intent, rule_confidence = self._rule_based_intent(text)
                     if rule_confidence > 0.8:
+                        print(f"[NLP] Overriding transformer with rule-based traffic intent: {rule_intent}, confidence: {rule_confidence:.3f}")
                         return rule_intent, rule_confidence
                 
                 return intent, confidence
@@ -153,7 +169,9 @@ class NLPProcessor:
         text_lower = text.lower()
         # Tokenize and expand with WordNet synonyms (if available)
         tokens = re.findall(r'\w+', text_lower)
-        expanded_words = set(t.lower() for t in tokens if t)
+        expanded_words = self._expand_with_synonyms(tokens)
+        print(f"[NLP] Rule-based tokens: {tokens}")
+        print(f"[NLP] Rule-based expanded_words: {sorted(expanded_words)}")
 
         # Concept sets for synonym-aware matching
         traffic_concepts = {'traffic', 'congestion', 'jam'}
@@ -183,10 +201,12 @@ class NLPProcessor:
         
         # Greeting patterns
         if has_greeting_concept or any(word in text_lower for word in ['hello', 'hi', 'hey', 'greetings']):
+            print("[NLP] Rule-based matched: greeting")
             return 'greeting', 0.9
         
         # Goodbye patterns
         if has_goodbye_concept or any(word in text_lower for word in ['bye', 'goodbye', 'see you', 'farewell']):
+            print("[NLP] Rule-based matched: goodbye")
             return 'goodbye', 0.9
         
         # G) Public transport disruption + multimodal
@@ -201,8 +221,10 @@ class NLPProcessor:
                 'disruption on the tube', 'disruption on tube', 'public transport'
             ]
         ):
+            print("[NLP] Rule-based matched: ask_transit_disruption")
             return 'ask_transit_disruption', 0.85
         if any(phrase in text_lower for phrase in ['faster than driving', 'public transport faster', 'multimodal', 'park and ride']):
+            print("[NLP] Rule-based matched: ask_multimodal")
             return 'ask_multimodal', 0.85
 
         # G2) Transit timetable/times - check early before generic traffic queries
@@ -213,6 +235,7 @@ class NLPProcessor:
                 'train or bus times', 'timetable', 'next bus', 'next train', 'when is the next'
             ]
         ):
+            print("[NLP] Rule-based matched: ask_timetable")
             return 'ask_timetable', 0.9
         
         # C) ETA / arrival time (delay queries only)
@@ -220,6 +243,7 @@ class NLPProcessor:
             phrase in text_lower
             for phrase in ['delay', 'how long', 'wait time', 'stuck', 'slow']
         ):
+            print("[NLP] Rule-based matched: ask_delay")
             return 'ask_delay', 0.85
         
         # A) Current conditions
@@ -228,20 +252,25 @@ class NLPProcessor:
             phrase in text_lower
             for phrase in ['what is the traffic like', 'what\'s the traffic like', 'traffic like in', 'traffic like on']
         ):
+            print("[NLP] Rule-based matched: ask_traffic_status (pattern)")
             return 'ask_traffic_status', 0.9
         if any(
             phrase in text_lower
             for phrase in ['how\'s traffic', 'traffic right now', 'traffic now', 'traffic status', 'traffic condition', 'moving', 'congestion near']
         ) or has_traffic_concept:
+            print("[NLP] Rule-based matched: check_current_conditions")
             return 'check_current_conditions', 0.85
         # Generic "is the" pattern
         if 'is the' in text_lower and ('traffic' in text_lower or has_traffic_concept):
+            print("[NLP] Rule-based matched: ask_traffic_status (is the)")
             return 'ask_traffic_status', 0.85
         if 'traffic' in text_lower or has_traffic_concept or any(phrase in text_lower for phrase in ['how is traffic']):
+            print("[NLP] Rule-based matched: ask_traffic_status (generic)")
             return 'ask_traffic_status', 0.85
         
         # Other patterns (congestion-specific)
         if has_traffic_concept or any(phrase in text_lower for phrase in ['congestion', 'jam', 'busy', 'crowded']):
+            print("[NLP] Rule-based matched: ask_congestion")
             return 'ask_congestion', 0.85
         
         return 'unknown', 0.5
@@ -492,7 +521,9 @@ class NLPProcessor:
         if self._stops_loaded:
             return
 
-
+        # Earlier-stage behaviour: do not rely on external CSV datasets yet.
+        # Keep attributes initialised but empty so callers can safely access
+        # them without triggering file I/O.
         self._bus_stops = []
         self._train_stations = []
         self._train_lines = []

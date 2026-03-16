@@ -11,6 +11,8 @@ const entitiesDisplay = document.getElementById('entitiesDisplay');
 const newChatButton = document.getElementById('newChatButton');
 const chatSearchInput = document.getElementById('chatSearchInput');
 const chatList = document.getElementById('chatList');
+const chatFilterAll = document.getElementById('chatFilterAll');
+const chatFilterStarred = document.getElementById('chatFilterStarred');
 const loginLink = document.getElementById('loginLink');
 const logoutButton = document.getElementById('logoutButton');
 const accountLoggedOut = document.getElementById('accountLoggedOut');
@@ -50,6 +52,8 @@ let conversations = [];
 let activeChatId = null;
 let isRestoringMessages = false;
 let currentSearchTerm = '';
+let showStarredOnly = false;
+let selectedChatIds = new Set();
 
 function getStorageKey() {
     return currentUser ? `${STORAGE_KEY_BASE}:${currentUser}` : STORAGE_KEY_BASE;
@@ -66,6 +70,7 @@ function migrateConversation(convo) {
 }
 
 function loadConversations() {
+    selectedChatIds.clear();
     try {
         const raw = localStorage.getItem(getStorageKey());
         const loaded = raw ? JSON.parse(raw) : [];
@@ -132,6 +137,7 @@ function formatLastMessageTime(updatedAt) {
 
 function deleteChat(chatId) {
     conversations = conversations.filter((c) => c.id !== chatId);
+    selectedChatIds.delete(chatId);
     if (activeChatId === chatId) {
         activeChatId = conversations[0]?.id || null;
         if (activeChatId) setActiveChat(activeChatId);
@@ -139,6 +145,22 @@ function deleteChat(chatId) {
     }
     saveConversations();
     renderChatList(currentSearchTerm);
+    updateDeleteSelectedBar();
+}
+
+function deleteSelectedChats() {
+    if (selectedChatIds.size === 0) return;
+    const wasActive = activeChatId && selectedChatIds.has(activeChatId);
+    conversations = conversations.filter((c) => !selectedChatIds.has(c.id));
+    selectedChatIds.clear();
+    if (wasActive) {
+        activeChatId = conversations[0]?.id || null;
+        if (activeChatId) setActiveChat(activeChatId);
+        else if (chatMessages) clearMessages();
+    }
+    saveConversations();
+    renderChatList(currentSearchTerm);
+    updateDeleteSelectedBar();
 }
 
 function renameChat(chatId) {
@@ -150,6 +172,21 @@ function renameChat(chatId) {
         saveConversations();
         renderChatList(currentSearchTerm);
     }
+}
+
+function toggleStar(chatId) {
+    const convo = conversations.find((c) => c.id === chatId);
+    if (!convo) return;
+    convo.starred = !convo.starred;
+    saveConversations();
+    renderChatList(currentSearchTerm);
+}
+
+function toggleChatSelected(chatId) {
+    if (selectedChatIds.has(chatId)) selectedChatIds.delete(chatId);
+    else selectedChatIds.add(chatId);
+    renderChatList(currentSearchTerm);
+    updateDeleteSelectedBar();
 }
 
 function getConversationTranscript(chatId) {
@@ -209,6 +246,14 @@ function showShareFeedback(message) {
             el.classList.add('share-feedback-hidden');
         }, 2000);
     }
+}
+
+function updateDeleteSelectedBar() {
+    const bar = document.getElementById('chatListDeleteSelectedBar');
+    if (!bar) return;
+    bar.classList.toggle('hidden', selectedChatIds.size === 0);
+    const countEl = bar.querySelector('.chat-list-delete-selected-count');
+    if (countEl) countEl.textContent = selectedChatIds.size;
 }
 
 function getWelcomeMessageHtml() {
@@ -283,12 +328,14 @@ function renderChatList(filterText) {
     if (!chatList) return;
     const term = (filterText || '').toLowerCase();
     let filtered = conversations.filter((c) => !term || (c.title || '').toLowerCase().includes(term));
+    if (showStarredOnly) filtered = filtered.filter((c) => c.starred);
     const sorted = [...filtered].sort((a, b) => {
         if (a.starred !== b.starred) return a.starred ? -1 : 1;
         return (b.updatedAt || 0) - (a.updatedAt || 0);
     });
 
     chatList.innerHTML = '';
+    if (showStarredOnly && sorted.length === 0) {
         const empty = document.createElement('li');
         empty.className = 'chat-list-empty';
         empty.textContent = 'No starred chats';
@@ -298,12 +345,16 @@ function renderChatList(filterText) {
         const li = document.createElement('li');
         li.className = 'chat-list-item';
         li.dataset.chatId = convo.id;
+        if (selectedChatIds.has(convo.id)) li.classList.add('chat-list-item-selected');
 
         const checkbox = document.createElement('button');
         checkbox.type = 'button';
         checkbox.className = 'chat-list-item-checkbox';
+        checkbox.setAttribute('aria-label', selectedChatIds.has(convo.id) ? 'Deselect' : 'Select');
+        checkbox.innerHTML = selectedChatIds.has(convo.id) ? '✓' : '';
         checkbox.addEventListener('click', (e) => {
             e.stopPropagation();
+            toggleChatSelected(convo.id);
         });
 
         const starBtn = document.createElement('button');
@@ -313,6 +364,7 @@ function renderChatList(filterText) {
         starBtn.textContent = convo.starred ? '★' : '☆';
         starBtn.addEventListener('click', (e) => {
             e.stopPropagation();
+            toggleStar(convo.id);
         });
 
         const content = document.createElement('div');
@@ -403,6 +455,7 @@ if (chatListDeleteSelectedBar) {
     if (deleteSelectedBtn) {
         deleteSelectedBtn.addEventListener('click', (e) => {
             e.stopPropagation();
+            deleteSelectedChats();
         });
     }
 }
@@ -1221,6 +1274,32 @@ if (newChatButton) {
 if (chatSearchInput) {
     chatSearchInput.addEventListener('input', (e) => {
         currentSearchTerm = e.target.value || '';
+        renderChatList(currentSearchTerm);
+    });
+}
+
+function updateChatListFilterButtons() {
+    if (chatFilterAll) {
+        chatFilterAll.classList.toggle('active', !showStarredOnly);
+        chatFilterAll.setAttribute('aria-pressed', String(!showStarredOnly));
+    }
+    if (chatFilterStarred) {
+        chatFilterStarred.classList.toggle('active', showStarredOnly);
+        chatFilterStarred.setAttribute('aria-pressed', String(showStarredOnly));
+    }
+}
+
+if (chatFilterAll) {
+    chatFilterAll.addEventListener('click', () => {
+        showStarredOnly = false;
+        updateChatListFilterButtons();
+        renderChatList(currentSearchTerm);
+    });
+}
+if (chatFilterStarred) {
+    chatFilterStarred.addEventListener('click', () => {
+        showStarredOnly = true;
+        updateChatListFilterButtons();
         renderChatList(currentSearchTerm);
     });
 }

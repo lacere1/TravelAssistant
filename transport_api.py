@@ -21,12 +21,19 @@ class TransportDataFetcher:
         self.tfl_app_key = os.environ.get('TFL_APP_KEY', '')
         self.tfl_base_url = 'https://api.tfl.gov.uk'
         
+        # Google Maps API (optional, requires API key)
+        self.google_api_key = os.environ.get('GOOGLE_MAPS_API_KEY', '')
+        self.google_maps_base_url = 'https://maps.googleapis.com/maps/api'
+        
         # Check which APIs are available
         self.has_tfl = bool(self.tfl_app_id and self.tfl_app_key)
-        self.use_mock_data = not self.has_tfl
+        self.has_google = bool(self.google_api_key)
+        self.use_mock_data = not self.has_tfl and not self.has_google
         
         if self.has_tfl:
             print("TFL API initialized (App ID and Key configured)")
+        if self.has_google:
+            print("Google Maps API initialized")
         if self.use_mock_data:
             print("Warning: No API keys found. Using mock traffic data for demonstration.")
     
@@ -43,7 +50,7 @@ class TransportDataFetcher:
         """
         If stop_id is a StopPoint group/area, expand to leaf bus stop IDs.
 
-        Returns the stop ID directly — group expansion is handled
+        In this earlier-stage version we keep things simple and just return
         the id we were given so timetable logic can still call this helper
         without needing the full StopPoint hierarchy traversal.
         """
@@ -67,6 +74,15 @@ class TransportDataFetcher:
                     return tfl_data
             except Exception as e:
                 print(f"TFL API error: {e}")
+        
+        # Try Google Maps API
+        if self.has_google:
+            try:
+                google_data = self._fetch_google_route_data(route)
+                if google_data:
+                    return google_data
+            except Exception as e:
+                print(f"Google Maps API error: {e}")
         
         # No API data available - return None instead of mock data
         return None
@@ -467,9 +483,56 @@ class TransportDataFetcher:
                 if not matches or len(matches) == 0:
                     main_words = [w for w in stop_query.split() if len(w) > 2 and w.lower() not in common_words]
                     
-                    # Strategy: Use first main word only (broad)
+                    # Strategy 1: Use first main word only (very broad)
                     if main_words:
                         broader_query = main_words[0]
+                        params['query'] = broader_query
+                        response = requests.get(url, params=params, timeout=10)
+                        if response.status_code == 200:
+                            broader_data = response.json()
+                            broader_matches = broader_data.get('matches', [])
+                            if broader_matches:
+                                closest_match = self._find_closest_location_match(stop_query, broader_matches)
+                                if closest_match:
+                                    params['query'] = closest_match
+                                    response = requests.get(url, params=params, timeout=10)
+                                    if response.status_code == 200:
+                                        data = response.json()
+                                        matches = data.get('matches', [])
+                    
+                    # Strategy 2: Try each word individually and collect all results
+                    if not matches and main_words:
+                        all_broader_matches = []
+                        for word in main_words[:3]:  # Try up to 3 main words
+                            params['query'] = word
+                            response = requests.get(url, params=params, timeout=10)
+                            if response.status_code == 200:
+                                word_data = response.json()
+                                word_matches = word_data.get('matches', [])
+                                all_broader_matches.extend(word_matches)
+                        
+                        if all_broader_matches:
+                            # Remove duplicates
+                            seen_ids = set()
+                            unique_matches = []
+                            for match in all_broader_matches:
+                                stop_id = match.get('id')
+                                if stop_id and stop_id not in seen_ids:
+                                    seen_ids.add(stop_id)
+                                    unique_matches.append(match)
+                            
+                            if unique_matches:
+                                closest_match = self._find_closest_location_match(stop_query, unique_matches)
+                                if closest_match:
+                                    params['query'] = closest_match
+                                    response = requests.get(url, params=params, timeout=10)
+                                    if response.status_code == 200:
+                                        data = response.json()
+                                        matches = data.get('matches', [])
+                    
+                    # Strategy 3: Try with first 2 main words if we have multiple
+                    if not matches and len(main_words) >= 2:
+                        broader_query = ' '.join(main_words[:2])
                         params['query'] = broader_query
                         response = requests.get(url, params=params, timeout=10)
                         if response.status_code == 200:
@@ -1180,6 +1243,15 @@ class TransportDataFetcher:
             except Exception as e:
                 print(f"TFL Journey Planner error: {e}")
         
+        # Try Google Maps Directions API
+        if self.has_google:
+            try:
+                google_route = self._fetch_google_directions(origin, destination, avoid_tolls=avoid_tolls)
+                if google_route:
+                    return google_route
+            except Exception as e:
+                print(f"Google Maps Directions error: {e}")
+        
         # No API data available - return None instead of mock data
         return None
     
@@ -1460,6 +1532,70 @@ class TransportDataFetcher:
         return None
     
     
+    def _find_closest_line_match(self, route: str, available_lines: List[str]) -> Optional[str]:
+        """
+        Find the closest matching line name using fuzzy matching
+        Handles typos, extra chars, missing chars for line names
+        """
+        if not available_lines:
+            return None
+        
+        route_lower = route.lower().strip()
+        best_match = None
+        best_score = 0.0
+        
+        # Common words to remove
+        common_words = {'line', 'tube', 'the', 'underground', 'metro'}
+        cleaned_route = ' '.join(w for w in route_lower.split() if w not in common_words).strip()
+        
+        for line_name in available_lines:
+            line_lower = line_name.lower().replace('-', ' ').replace('_', ' ')
+            cleaned_line = ' '.join(w for w in line_lower.split() if w not in common_words).strip()
+            
+            scores = []
+            
+            # Direct similarity
+            scores.append(SequenceMatcher(None, route_lower, line_lower).ratio())
+            
+            # Cleaned similarity
+            if cleaned_route and cleaned_line:
+                scores.append(SequenceMatcher(None, cleaned_route, cleaned_line).ratio() * 0.98)
+            
+            # Word similarity
+            route_words = cleaned_route.split() if cleaned_route else route_lower.split()
+            line_words = cleaned_line.split() if cleaned_line else line_lower.split()
+            
+            if route_words and line_words:
+                word_scores = []
+                for rw in route_words:
+                    best_match_score = max(
+                        self._calculate_word_similarity(rw, lw)
+                        for lw in line_words
+                    )
+                    word_scores.append(best_match_score)
+                if word_scores:
+                    scores.append(sum(word_scores) / len(word_scores) * 0.95)
+            
+            # Character set overlap
+            route_chars = set(route_lower.replace(' ', '').replace('-', ''))
+            line_chars = set(line_lower.replace(' ', '').replace('-', ''))
+            if route_chars and line_chars:
+                char_sim = len(route_chars & line_chars) / max(len(route_chars | line_chars), 1)
+                scores.append(char_sim * 0.5)
+            
+            # Substring match
+            if route_lower in line_lower or line_lower in route_lower:
+                scores.append(0.75)
+            
+            final_score = max(scores) if scores else 0
+            
+            if final_score > best_score:
+                best_score = final_score
+                best_match = line_name
+        
+        # Threshold: 0.4 for line names (lines are shorter, so need higher threshold)
+        return best_match if best_score > 0.4 else None
+    
     def _fetch_tfl_line_status(self, route: str) -> Optional[Dict[str, Any]]:
         """
         Fetch line status from TFL API
@@ -1498,7 +1634,49 @@ class TransportDataFetcher:
                 line_id = value
                 break
         
-        # If no exact match, try the route name directly (formatted)
+        # If no exact match, try fuzzy matching against known lines
+        if not line_id:
+            # Get list of all known line names for fuzzy matching
+            all_line_names = list(line_mapping.keys())
+            closest_match = self._find_closest_line_match(route, all_line_names)
+            if closest_match:
+                line_id = line_mapping.get(closest_match)
+        
+        # If still no match, try getting all lines from API and fuzzy match
+        if not line_id:
+            try:
+                # Try to get all tube lines from API for fuzzy matching
+                url = f"{self.tfl_base_url}/Line/mode/tube"
+                params = {
+                    'app_id': self.tfl_app_id,
+                    'app_key': self.tfl_app_key
+                }
+                response = requests.get(url, params=params, timeout=10)
+                if response.status_code == 200:
+                    all_lines_data = response.json()
+                    if isinstance(all_lines_data, list):
+                        available_line_ids = [line.get('id', '') for line in all_lines_data]
+                        available_line_names = [line.get('name', '') for line in all_lines_data if line.get('name')]
+                        
+                        # Try fuzzy matching against API line names
+                        if available_line_names:
+                            closest_match = self._find_closest_line_match(route, available_line_names)
+                            if closest_match:
+                                # Find the ID for the matched name
+                                for line_data in all_lines_data:
+                                    if line_data.get('name') == closest_match:
+                                        line_id = line_data.get('id')
+                                        break
+                        
+                        # If still no match, try matching against IDs
+                        if not line_id:
+                            closest_id_match = self._find_closest_line_match(route, available_line_ids)
+                            if closest_id_match:
+                                line_id = closest_id_match
+            except Exception:
+                pass
+        
+        # Last resort: try the route name directly (formatted)
         if not line_id:
             line_id = route_lower.replace(' ', '-').replace('_', '-')
         
@@ -1730,5 +1908,62 @@ class TransportDataFetcher:
             print(f"Error fetching TFL journey: {e}")
             return None
     
+    def _fetch_google_route_data(self, route: str) -> Optional[Dict[str, Any]]:
+        """Fetch route data from Google Maps API"""
+        # This would require geocoding the route name first
+        # For now, return None to fall back to mock data
+        return None
+    
+    def _fetch_google_directions(self, origin: str, destination: str, avoid_tolls: bool = False) -> Optional[Dict[str, Any]]:
+        """Fetch directions from Google Maps API"""
+        try:
+            url = f"{self.google_maps_base_url}/directions/json"
+            params = {
+                'origin': origin,
+                'destination': destination,
+                'key': self.google_api_key,
+                'departure_time': 'now',
+                'traffic_model': 'best_guess'
+            }
+            
+            if avoid_tolls:
+                params['avoid'] = 'tolls'
+            
+            response = requests.get(url, params=params, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+            
+            if data.get('routes') and len(data['routes']) > 0:
+                route = data['routes'][0]
+                leg = route['legs'][0]
+                
+                duration_seconds = leg.get('duration_in_traffic', leg.get('duration', {})).get('value', 0)
+                duration_minutes = round(duration_seconds / 60)
+                distance_meters = leg.get('distance', {}).get('value', 0)
+                distance_km = round(distance_meters / 1000, 1)
+                
+                # Determine traffic level
+                normal_duration = leg.get('duration', {}).get('value', duration_seconds)
+                delay_seconds = duration_seconds - normal_duration
+                
+                if delay_seconds < 300:  # Less than 5 minutes
+                    traffic_level = 'light'
+                elif delay_seconds < 900:  # Less than 15 minutes
+                    traffic_level = 'moderate'
+                else:
+                    traffic_level = 'heavy'
+                
+                return {
+                    'origin': origin,
+                    'destination': destination,
+                    'distance_km': distance_km,
+                    'duration_minutes': duration_minutes,
+                    'traffic_level': traffic_level,
+                    'timestamp': datetime.now().isoformat(),
+                    'source': 'Google Maps'
+                }
+        except Exception as e:
+            print(f"Error fetching Google directions: {e}")
+            return None
     
     

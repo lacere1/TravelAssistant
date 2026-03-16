@@ -1091,6 +1091,264 @@ header h1 {
     margin-bottom: 2px;
 }
 
+/* -------- Text shortcuts: scrollable, themed -------- */
+.shortcut-section {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    margin-top: 16px;
+    background: var(--shortcut-bg);
+    border-radius: 10px;
+    border: 1px solid var(--shortcut-border);
+    padding: 14px 16px;
+    box-shadow: var(--shadow-sm);
+}
+
+.shortcut-header {
+    flex-shrink: 0;
+    margin-bottom: 12px;
+}
+
+.shortcut-title {
+    font-size: 1rem;
+    font-weight: 600;
+    color: var(--text-primary);
+    margin-bottom: 4px;
+}
+
+.shortcut-subtitle {
+    font-size: 0.8rem;
+    color: var(--text-secondary);
+    line-height: 1.35;
+}
+
+.shortcut-subtitle strong {
+    color: var(--text-primary);
+}
+
+.shortcut-form {
+    flex-shrink: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    margin-bottom: 12px;
+}
+
+.shortcut-field {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.shortcut-field label {
+    font-size: 0.8rem;
+    font-weight: 500;
+    color: var(--text-secondary);
+}
+
+.shortcut-field input {
+    padding: 8px 10px;
+    border-radius: 8px;
+    border: 1px solid var(--input-border);
+    background: var(--bg-input);
+    color: var(--text-primary);
+    font-size: 0.9rem;
+    outline: none;
+}
+
+.shortcut-field input::placeholder {
+    color: var(--text-muted);
+}
+
+.shortcut-field input:focus {
+    border-color: var(--input-focus);
+}
+
+.shortcut-actions {
+    flex-shrink: 0;
+}
+
+#shortcut-save-btn {
+    padding: 8px 14px;
+    font-size: 0.9rem;
+    background: var(--msg-user-bg);
+    color: var(--text-inverse);
+    border: none;
+    border-radius: 8px;
+    cursor: pointer;
+    font-weight: 500;
+}
+
+#shortcut-save-btn:hover {
+    opacity: 0.9;
+}
+
+.shortcut-list-wrap {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    overflow: hidden;
+    background: var(--shortcut-item-hover);
+    border-radius: 8px;
+    padding: 10px 12px;
+    border: 1px solid var(--shortcut-border);
+}
+
+.shortcut-list-wrap:has(.shortcut-list) {
+    min-height: 200px;
+}
+
+.shortcut-list-title {
+    font-size: 0.8rem;
+    font-weight: 600;
+    color: var(--text-secondary);
+    margin-bottom: 8px;
+    flex-shrink: 0;
+}
+
+.shortcut-list-hint-inline {
+    font-weight: 400;
+    color: var(--text-muted);
+    font-size: 0.75rem;
+}
+
+.shortcut-list {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+    overflow-y: scroll;
+    overflow-x: hidden;
+    height: 200px;
+    max-height: 200px;
+    min-height: 80px;
+    flex-shrink: 0;
+    -webkit-overflow-scrolling: touch;
+}
+
+/* High-contrast scrollbar for "Your words" so it's always visible */
+.shortcut-list::-webkit-scrollbar {
+    width: 14px;
+}
+
+.shortcut-list::-webkit-scrollbar-track {
+    background: #d0d0d0;
+    border-radius: 7px;
+    margin: 4px 0;
+}
+
+[data-theme="dark"] .shortcut-list::-webkit-scrollbar-track {
+    background: #475569;
+}
+
+.shortcut-list::-webkit-scrollbar-thumb {
+    background: #555;
+    border-radius: 7px;
+    min-height: 40px;
+    border: 3px solid #d0d0d0;
+}
+
+.shortcut-list::-webkit-scrollbar-thumb:hover {
+    background: #333;
+}
+
+[data-theme="dark"] .shortcut-list::-webkit-scrollbar-thumb {
+    background: #94a3b8;
+    border-color: #475569;
+}
+
+[data-theme="dark"] .shortcut-list::-webkit-scrollbar-thumb:hover {
+    background: #cbd5e1;
+}
+
+.shortcut-list::-webkit-scrollbar-corner {
+    background: #d0d0d0;
+}
+
+/* Firefox: visible scrollbar */
+@supports (scrollbar-width: auto) {
+    .shortcut-list {
+        scrollbar-width: auto;
+        scrollbar-color: #555 #d0d0d0;
+    }
+}
+
+[data-theme="dark"] .shortcut-list {
+    scrollbar-color: #94a3b8 #475569;
+}
+
+.shortcut-list-item,
+.shortcut-list-empty {
+    padding: 8px 10px;
+    border-radius: 8px;
+    font-size: 0.85rem;
+    color: var(--text-primary);
+    margin-bottom: 4px;
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    flex-wrap: wrap;
+    background: var(--shortcut-item-bg);
+}
+
+.shortcut-list-item:hover {
+    background: var(--shortcut-item-hover);
+}
+
+.shortcut-key {
+    font-weight: 600;
+    color: var(--accent);
+    flex-shrink: 0;
+}
+
+.shortcut-arrow {
+    color: var(--text-muted);
+    font-size: 0.8rem;
+    flex-shrink: 0;
+}
+
+.shortcut-value {
+    flex: 1 1 120px;
+    min-width: 0;
+    color: var(--text-secondary);
+    word-break: normal;
+    overflow-wrap: break-word;
+    white-space: normal;
+    line-height: 1.35;
+}
+
+.shortcut-delete-btn {
+    flex-shrink: 0;
+    width: 24px;
+    height: 24px;
+    padding: 0;
+    border: none;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--text-muted);
+    cursor: pointer;
+    font-size: 0.9rem;
+    line-height: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.shortcut-delete-btn:hover {
+    background: var(--shortcut-item-hover);
+    color: var(--text-primary);
+}
+
+.shortcut-hint {
+    flex-shrink: 0;
+    display: block;
+    margin-top: 8px;
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    line-height: 1.35;
+}
+
 /* Scrollbar styling (themed) */
 .chat-messages::-webkit-scrollbar {
     width: 8px;

@@ -107,7 +107,7 @@ def chat():
         date_str = (data.get('date') or '').strip() or None
         time_str = (data.get('time') or '').strip() or None
 
-
+        # Earlier-stage behaviour: use the raw text values directly.
         user_key = _current_user_key()
         user_message = user_message_raw
         from_text = from_text_raw
@@ -183,7 +183,18 @@ def chat():
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/suggest')
+def suggest():
+    """
+    Optional autocomplete endpoint that proxies to TfL's Place Search.
+    Currently not used by the main UI, but available for future enhancements.
+    """
+    query = (request.args.get('q') or '').strip()
+    if not query:
+        return jsonify([])
 
+    options = tfl_journey_client.search_places(query)
+    return jsonify(options)
 
 
 @app.route('/health', methods=['GET'])
