@@ -100,6 +100,7 @@
                                 <div class="message-content">
                                     <p>Hi, I'm your travel assistant. I can help you with:</p>
                                     <ul>
+                                        <li>Current traffic and congestion on your route</li>
                                         <li>Rough delay expectations</li>
                                         <li>Choosing a good time to set off</li>
                                         <li>Simple route suggestions</li>
@@ -201,12 +202,62 @@
                         </div>
                     </div>
 
-                    <!-- Side-panel space reserved for future features -->
+                    <section
+                        id="shortcut-section"
+                        class="shortcut-section"
+                        aria-label="Text shortcuts"
+                    >
+                        <div class="shortcut-header">
+                            <h2 class="shortcut-title">Text shortcuts</h2>
+                            <p class="shortcut-subtitle">
+                                Define words like <strong>home</strong> or <strong>uni</strong> that expand to real places. Your saved words are listed in <strong>Your words</strong> below.
+                            </p>
+                        </div>
+                        <div class="shortcut-form">
+                            <div class="shortcut-field">
+                                <label for="shortcut-key-input">Word</label>
+                                <input
+                                    id="shortcut-key-input"
+                                    type="text"
+                                    autocomplete="off"
+                                    placeholder="e.g. home"
+                                />
+                            </div>
+                            <div class="shortcut-field">
+                                <label for="shortcut-value-input">Means</label>
+                                <input
+                                    id="shortcut-value-input"
+                                    type="text"
+                                    autocomplete="off"
+                                    placeholder="e.g. Neasden Station"
+                                />
+                            </div>
+                            <div class="shortcut-actions">
+                                <button id="shortcut-save-btn" type="button">
+                                    Save word
+                                </button>
+                            </div>
+                        </div>
+                        <div class="shortcut-list-wrap">
+                            <div class="shortcut-list-title">Your words <span class="shortcut-list-hint-inline">(scroll if many)</span></div>
+                            <ul id="shortcut-list" class="shortcut-list">
+                                <!-- Filled dynamically -->
+                            </ul>
+                            <small class="shortcut-hint">
+                                Sign in to add and see your words. They are used automatically in chat and the journey planner.
+                            </small>
+                        </div>
+                    </section>
                 </aside>
             </div>
         </div>
     </div>
 
     <script src="{{ url_for('static', filename='script.js') }}"></script>
+    <script
+        async
+        defer
+        src="https://maps.googleapis.com/maps/api/js?key={{ google_places_api_key }}&libraries=places&callback=initPlacesAutocomplete"
+    ></script>
 </body>
 </html>

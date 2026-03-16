@@ -36,6 +36,12 @@ const dateInput = document.getElementById('date-input');
 const timeInput = document.getElementById('time-input');
 const planBtn = document.getElementById('plan-btn');
 
+// Text shortcut UI elements
+const shortcutKeyInput = document.getElementById('shortcut-key-input');
+const shortcutValueInput = document.getElementById('shortcut-value-input');
+const shortcutSaveBtn = document.getElementById('shortcut-save-btn');
+const shortcutList = document.getElementById('shortcut-list');
+
 // Theme toggle
 const themeToggle = document.getElementById('themeToggle');
 const themeToggleLabel = document.getElementById('themeToggleLabel');
@@ -263,6 +269,7 @@ function getWelcomeMessageHtml() {
     return `
         <p>${greeting}</p>
         <ul>
+            <li>Current traffic and congestion on your route</li>
             <li>Rough delay expectations</li>
             <li>Choosing a good time to set off</li>
             <li>Simple route suggestions</li>
@@ -597,7 +604,23 @@ function addMessage(text, sender) {
     contentDiv.innerHTML = formattedText;
 
     if (sender === 'bot' && text) {
-        // No extra per-message controls at this stage.
+        const actionsWrap = document.createElement('div');
+        actionsWrap.className = 'message-actions-wrap';
+        const readAloudBtn = document.createElement('button');
+        readAloudBtn.type = 'button';
+        readAloudBtn.className = 'message-action-btn';
+        readAloudBtn.setAttribute('aria-label', 'Read aloud');
+        readAloudBtn.innerHTML = '<span class="message-action-icon" aria-hidden="true">🔊</span><span class="message-action-label">Read aloud</span>';
+        readAloudBtn.addEventListener('click', () => speakMessageText(text));
+        const shareBtn = document.createElement('button');
+        shareBtn.type = 'button';
+        shareBtn.className = 'message-action-btn';
+        shareBtn.setAttribute('aria-label', 'Share this message');
+        shareBtn.innerHTML = '<span class="message-action-icon" aria-hidden="true">📤</span><span class="message-action-label">Share</span>';
+        shareBtn.addEventListener('click', () => shareMessageText(text));
+        actionsWrap.appendChild(readAloudBtn);
+        actionsWrap.appendChild(shareBtn);
+        contentDiv.appendChild(actionsWrap);
     }
 
     messageDiv.appendChild(contentDiv);
@@ -609,14 +632,61 @@ function addMessage(text, sender) {
 
 function appendReadAloudAndShareButtons(container, text) {
     if (!container) return;
+    const useText = (text && String(text).trim()) ? String(text).trim() : 'No content to read or share.';
+    const actionsWrap = document.createElement('div');
+    actionsWrap.className = 'message-actions-wrap';
+    if (container.classList && (container.classList.contains('timetable-card') || container.classList.contains('disruption-card'))) {
+        actionsWrap.classList.add('message-actions-inside-card');
+    }
+    const readAloudBtn = document.createElement('button');
+    readAloudBtn.type = 'button';
+    readAloudBtn.className = 'message-action-btn';
+    readAloudBtn.setAttribute('aria-label', 'Read aloud');
+    readAloudBtn.innerHTML = '<span class="message-action-icon" aria-hidden="true">🔊</span><span class="message-action-label">Read aloud</span>';
+    readAloudBtn.addEventListener('click', () => speakMessageText(useText));
+    const shareBtn = document.createElement('button');
+    shareBtn.type = 'button';
+    shareBtn.className = 'message-action-btn';
+    shareBtn.setAttribute('aria-label', 'Share this message');
+    shareBtn.innerHTML = '<span class="message-action-icon" aria-hidden="true">📤</span><span class="message-action-label">Share</span>';
+    shareBtn.addEventListener('click', () => shareMessageText(useText));
+    actionsWrap.appendChild(readAloudBtn);
+    actionsWrap.appendChild(shareBtn);
+    container.appendChild(actionsWrap);
 }
 
 function speakMessageText(text) {
-    return;
+    if (!text || !window.speechSynthesis) return;
+    window.speechSynthesis.cancel();
+    const u = new SpeechSynthesisUtterance(text);
+    u.rate = 0.95;
+    u.pitch = 1;
+    const voices = speechSynthesis.getVoices();
+    const en = voices.find((v) => v.lang.startsWith('en'));
+    if (en) u.voice = en;
+    window.speechSynthesis.speak(u);
 }
 
 function shareMessageText(text) {
-    return;
+    const trimmed = typeof text === 'string' ? text.trim() : '';
+    if (!trimmed) {
+        showShareFeedback('Nothing to share');
+        return;
+    }
+    try {
+        if (typeof navigator.share === 'function') {
+            navigator.share({
+                title: 'Travel assistant',
+                text: trimmed,
+            }).then(() => showShareFeedback('Shared')).catch((err) => {
+                if (err.name !== 'AbortError') copyMessageToClipboard(trimmed);
+            });
+        } else {
+            copyMessageToClipboard(trimmed);
+        }
+    } catch (e) {
+        copyMessageToClipboard(trimmed);
+    }
 }
 
 function copyMessageToClipboard(text) {
@@ -808,25 +878,46 @@ function buildStopsHtml(stops) {
     return list.outerHTML;
 }
 
+/**
+ * Build a journey card from the journey-planner summary format (journey_planner.py).
+ * Expects: { departure, arrival, duration, legs: [{ mode, detail, duration, steps?, stops?, ... }], fare_pence? }
+ */
 function buildJourneyCard(journey) {
     const card = document.createElement('div');
     card.className = 'journey-card';
 
     const farePounds = journey.fare_pence != null ? (journey.fare_pence / 100).toFixed(2) : null;
 
+    // Top section: Departure, Arrival, Duration (and optional Fare) – same structure as JourneySummary in journey_planner.py
     const top = document.createElement('div');
     top.className = 'journey-card-top';
     top.innerHTML = `
-    <div class="journey-card-times">
-      <span class="journey-card-time-range">${journey.departure} – ${journey.arrival}</span>
-      ${farePounds != null ? `<span class="journey-card-fare">£${farePounds} off peak</span>` : ''}
+    <div class="journey-card-summary">
+      <div class="journey-card-row">
+        <span class="journey-card-label">Departure</span>
+        <span class="journey-card-value">${escapeHtml(journey.departure || '—')}</span>
+      </div>
+      <div class="journey-card-row">
+        <span class="journey-card-label">Arrival</span>
+        <span class="journey-card-value">${escapeHtml(journey.arrival || '—')}</span>
+      </div>
+      <div class="journey-card-row">
+        <span class="journey-card-label">Duration</span>
+        <span class="journey-card-value"><strong>${journey.duration != null ? journey.duration : '—'}</strong> mins</span>
+      </div>
+      ${farePounds != null ? `<div class="journey-card-row"><span class="journey-card-label">Fare</span><span class="journey-card-value journey-card-fare">£${farePounds} (off peak)</span></div>` : ''}
     </div>
-    <div class="journey-card-duration"><strong>${journey.duration}</strong> mins</div>
   `;
     card.appendChild(top);
 
+    // Legs: each leg as mode + detail + duration (JourneyLeg format from journey_planner.py)
     const timeline = document.createElement('div');
     timeline.className = 'journey-card-timeline';
+    const legsHeading = document.createElement('div');
+    legsHeading.className = 'journey-card-legs-heading';
+    legsHeading.textContent = 'Route';
+    timeline.appendChild(legsHeading);
+
     journey.legs.forEach((leg, i) => {
         const isLast = i === journey.legs.length - 1;
         const lineClass = getLegLineClass(leg.mode);
@@ -838,6 +929,7 @@ function buildJourneyCard(journey) {
         const hasStops = !isWalk && leg.stops?.length;
         const showLink = hasDirections || hasStops;
         const linkText = isWalk ? 'View directions' : 'View stops';
+        const detailText = leg.detail ? `${leg.mode || 'Leg'} – ${leg.detail}` : (leg.mode || 'Leg');
         const row = document.createElement('div');
         row.className = 'journey-card-leg';
         row.dataset.legIndex = String(i);
@@ -854,7 +946,7 @@ function buildJourneyCard(journey) {
         ${!isLast ? `<div class="${lineClass}"></div>` : ''}
       </div>
       <div class="journey-card-leg-right">
-        <div class="journey-card-leg-detail">${leg.detail || leg.mode}</div>
+        <div class="journey-card-leg-detail">${escapeHtml(detailText)}</div>
         <div class="journey-card-leg-meta">
           ${legMins !== '' ? `${legMins} min` : ''}
           ${showLink ? `<a href="#" class="journey-leg-link" data-link-type="${isWalk ? 'directions' : 'stops'}">${linkText}</a>` : ''}
@@ -874,7 +966,7 @@ function buildJourneyCard(journey) {
       <div class="leg-icon dest"></div>
     </div>
     <div class="journey-card-leg-right">
-      <div class="journey-card-leg-detail">${destLabel}</div>
+      <div class="journey-card-leg-detail">${escapeHtml(destLabel)}</div>
     </div>
   `;
     timeline.appendChild(destRow);
@@ -925,12 +1017,11 @@ function appendJourneyCards(journeys, debugText, options) {
                         expandable.innerHTML = buildDirectionsHtml(steps);
                         expandable.classList.remove('hidden');
                         link.textContent = 'Hide directions';
-                    } else if (fromLatLng && toLatLng) {
-                        const url = 'https://www.google.com/maps/dir/?api=1&origin=' + encodeURIComponent(fromLatLng) + '&destination=' + encodeURIComponent(toLatLng) + '&travelmode=walking';
-                        window.open(url, '_blank');
                     } else {
-                        const w = link.closest('.journey-cards-wrap');
-                        if (w?.dataset?.mapUrl) window.open(w.dataset.mapUrl, '_blank');
+                        // No inline steps and no external maps allowed; show a gentle note instead.
+                        expandable.innerHTML = '<div class="journey-leg-note">Directions are not available to open in an external map here.</div>';
+                        expandable.classList.remove('hidden');
+                        link.textContent = 'Hide directions';
                     }
                 } else {
                     expandable.classList.add('hidden');
@@ -960,11 +1051,8 @@ function appendJourneyCards(journeys, debugText, options) {
 
         const btn = e.target.closest('.journey-card-btn');
         if (!btn) return;
-        const actions = btn.closest('.journey-card-actions');
-        const idx = Array.prototype.indexOf.call(actions.children, btn);
-        const w = btn.closest('.journey-cards-wrap');
-        if (idx === 0 && w?.dataset?.tflUrl) window.open(w.dataset.tflUrl, '_blank');
-        else if (idx === 1 && w?.dataset?.mapUrl) window.open(w.dataset.mapUrl, '_blank');
+        // Map and external journey views are disabled to keep everything inside the app.
+        return;
     });
 
     if (debugText && debugText.includes('[debug]')) {
@@ -1131,6 +1219,100 @@ function appendDisruptionCard(disruptionData, messageText) {
     chatMessages.scrollTop = chatMessages.scrollHeight;
 }
 
+function renderTimetableDisambiguationMap(disamb) {
+    if (!disamb || !Array.isArray(disamb.options) || disamb.options.length === 0) return;
+    if (!window.google || !google.maps) return;
+
+    const botMessages = chatMessages ? chatMessages.querySelectorAll('.message.bot-message') : null;
+    if (!botMessages || botMessages.length === 0) return;
+    const lastBot = botMessages[botMessages.length - 1];
+    const content = lastBot.querySelector('.message-content');
+    if (!content) return;
+
+    // Remove any existing disambiguation map in this message
+    const existing = content.querySelector('.timetable-disamb-map');
+    if (existing) existing.remove();
+
+    const mapWrap = document.createElement('div');
+    mapWrap.className = 'timetable-disamb-map';
+    content.appendChild(mapWrap);
+
+    // Collect valid coordinates, if present on options (bus stops or train stations)
+    const points = disamb.options
+        .map((opt, index) => {
+            const lat = typeof opt.lat === 'number' ? opt.lat : (opt.lat ? Number(opt.lat) : NaN);
+            const lon = typeof opt.lon === 'number' ? opt.lon : (opt.lon ? Number(opt.lon) : NaN);
+            if (!isFinite(lat) || !isFinite(lon)) return null;
+            return {
+                position: { lat, lng: lon },
+                label: String(index + 1),
+                title: opt.label || opt.name || '',
+            };
+        })
+        .filter(Boolean);
+
+    // Case 1: we have explicit coordinates (bus or multi-station train disambiguation)
+    if (points.length) {
+        const map = new google.maps.Map(mapWrap, {
+            center: points[0].position,
+            zoom: 15,
+            mapTypeControl: false,
+            streetViewControl: false,
+            fullscreenControl: false,
+            clickableIcons: false, // prevent default POI popups with "View on Google Maps"
+        });
+
+        const bounds = new google.maps.LatLngBounds();
+        points.forEach((pt) => {
+            const marker = new google.maps.Marker({
+                position: pt.position,
+                map,
+                label: pt.label,
+                title: pt.title,
+            });
+            bounds.extend(pt.position);
+        });
+
+        if (!bounds.isEmpty()) {
+            map.fitBounds(bounds);
+        }
+        return;
+    }
+
+    // Case 2: train platform/direction disambiguation with no per-option coords:
+    // show a single marker for the station itself using geocoding of disamb.query.
+    if (disamb.train_direction_disambiguation && disamb.query) {
+        const geocoder = new google.maps.Geocoder();
+        geocoder.geocode({ address: disamb.query }, (results, status) => {
+            if (status !== 'OK' || !results || !results[0]) {
+                content.removeChild(mapWrap);
+                return;
+            }
+            const loc = results[0].geometry.location;
+            const center = { lat: loc.lat(), lng: loc.lng() };
+            const map = new google.maps.Map(mapWrap, {
+                center,
+                zoom: 16,
+                mapTypeControl: false,
+                streetViewControl: false,
+                fullscreenControl: false,
+                clickableIcons: false,
+            });
+            // Single marker for the station
+            // (no label number needed; there is only one physical station here)
+            new google.maps.Marker({
+                position: center,
+                map,
+                title: disamb.query,
+            });
+        });
+        return;
+    }
+
+    // No coordinates and no query to geocode; remove empty container.
+    content.removeChild(mapWrap);
+}
+
 function handleChatResponse(data) {
     if (data.error) {
         addMessageAndStore('Sorry, I encountered an error: ' + data.error, 'bot');
@@ -1166,6 +1348,16 @@ function handleChatResponse(data) {
                 updateJourneyPlannerToggle(true);
             }
         }
+    }
+
+    // When the backend is asking "Which direction for '<query>'?" for bus timetable,
+    // show an embedded map with the candidate stops.
+    if (data.timetable_disambiguation) {
+        renderTimetableDisambiguationMap(data.timetable_disambiguation);
+    }
+    // When journey planner asks "Which place did you mean?" with options that have coordinates, show map.
+    if (data.journey_disambiguation && data.journey_disambiguation.options && data.journey_disambiguation.options.length > 0) {
+        renderTimetableDisambiguationMap(data.journey_disambiguation);
     }
 
     updateInfoPanel(data);
@@ -1218,13 +1410,27 @@ function initPlacesAutocomplete() {
         return;
     }
 
+    // Restrict Google Places autocomplete to Greater London area
+    const londonBounds = new google.maps.LatLngBounds(
+        // Approximate SW and NE corners of Greater London
+        new google.maps.LatLng(51.28, -0.489),
+        new google.maps.LatLng(51.686, 0.236)
+    );
+
     if (fromInput) {
         const fromAutocomplete = new google.maps.places.Autocomplete(fromInput, {
             fields: ['geometry', 'name'],
+            bounds: londonBounds,
+            strictBounds: true,
         });
         fromAutocomplete.addListener('place_changed', () => {
             const place = fromAutocomplete.getPlace();
-            if (place && place.geometry && place.geometry.location) {
+            if (
+                place &&
+                place.geometry &&
+                place.geometry.location &&
+                londonBounds.contains(place.geometry.location)
+            ) {
                 const lat = place.geometry.location.lat();
                 const lng = place.geometry.location.lng();
                 fromCoord = `${lat},${lng}`;
@@ -1237,10 +1443,17 @@ function initPlacesAutocomplete() {
     if (toInput) {
         const toAutocomplete = new google.maps.places.Autocomplete(toInput, {
             fields: ['geometry', 'name'],
+            bounds: londonBounds,
+            strictBounds: true,
         });
         toAutocomplete.addListener('place_changed', () => {
             const place = toAutocomplete.getPlace();
-            if (place && place.geometry && place.geometry.location) {
+            if (
+                place &&
+                place.geometry &&
+                place.geometry.location &&
+                londonBounds.contains(place.geometry.location)
+            ) {
                 const lat = place.geometry.location.lat();
                 const lng = place.geometry.location.lng();
                 toCoord = `${lat},${lng}`;
@@ -1505,9 +1718,110 @@ window.addEventListener('load', () => {
                 setLoggedOut();
             }
             updateWelcomeMessage();
+            // Once we know who we are, load any saved shortcuts.
+            loadShortcuts();
         })
         .catch(() => {
             setLoggedOut();
             updateWelcomeMessage();
+            loadShortcuts();
         });
 });
+
+// -------- Text shortcuts (user-defined words like "home", "uni") -----------
+
+function renderShortcuts(shortcuts) {
+    if (!shortcutList) return;
+    shortcutList.innerHTML = '';
+    if (!Array.isArray(shortcuts) || shortcuts.length === 0) {
+        const li = document.createElement('li');
+        li.className = 'shortcut-list-empty';
+        li.textContent = currentUser
+            ? 'No words yet. Add one above (Word + Means, then Save word).'
+            : 'Sign in to add and see your words here.';
+        shortcutList.appendChild(li);
+        return;
+    }
+
+    shortcuts.forEach((item) => {
+        const li = document.createElement('li');
+        li.className = 'shortcut-list-item';
+        const key = item.key || '';
+        const value = item.value || '';
+        li.innerHTML = `
+            <span class="shortcut-key">${escapeHtml(key)}</span>
+            <span class="shortcut-arrow">→</span>
+            <span class="shortcut-value">${escapeHtml(value)}</span>
+            <button type="button" class="shortcut-delete-btn" aria-label="Remove shortcut for ${escapeHtml(key)}">✕</button>
+        `;
+        const deleteBtn = li.querySelector('.shortcut-delete-btn');
+        if (deleteBtn) {
+            deleteBtn.addEventListener('click', () => {
+                deleteShortcut(key);
+            });
+        }
+        shortcutList.appendChild(li);
+    });
+}
+
+function loadShortcuts() {
+    fetch('/shortcuts')
+        .then((res) => res.json())
+        .then((data) => {
+            renderShortcuts(data);
+        })
+        .catch(() => {
+            // Ignore errors; shortcuts are optional sugar.
+        });
+}
+
+function saveShortcut() {
+    if (!shortcutKeyInput || !shortcutValueInput) return;
+    const key = (shortcutKeyInput.value || '').trim();
+    const value = (shortcutValueInput.value || '').trim();
+    if (!key || !value) {
+        // eslint-disable-next-line no-alert
+        alert('Please fill in both the word and what it should mean.');
+        return;
+    }
+
+    fetch('/shortcuts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ key, value }),
+    })
+        .then((res) => res.json())
+        .then((data) => {
+            if (data.error) {
+                // eslint-disable-next-line no-alert
+                alert(data.error);
+                return;
+            }
+            shortcutKeyInput.value = '';
+            shortcutValueInput.value = '';
+            loadShortcuts();
+        })
+        .catch(() => {
+            // eslint-disable-next-line no-alert
+            alert('Could not save shortcut. Please try again.');
+        });
+}
+
+function deleteShortcut(key) {
+    if (!key) return;
+    fetch(`/shortcuts/${encodeURIComponent(key)}`, {
+        method: 'DELETE',
+    })
+        .then((res) => res.json())
+        .then(() => {
+            loadShortcuts();
+        })
+        .catch(() => {
+            // eslint-disable-next-line no-alert
+            alert('Could not remove that shortcut. Please try again.');
+        });
+}
+
+if (shortcutSaveBtn) {
+    shortcutSaveBtn.addEventListener('click', saveShortcut);
+}

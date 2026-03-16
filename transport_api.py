@@ -48,13 +48,60 @@ class TransportDataFetcher:
 
     def _expand_to_leaf_bus_stops(self, stop_id: str) -> List[str]:
         """
-        If stop_id is a StopPoint group/area, expand to leaf bus stop IDs.
-
-        In this earlier-stage version we keep things simple and just return
-        the id we were given so timetable logic can still call this helper
-        without needing the full StopPoint hierarchy traversal.
+        If stop_id is a StopPoint group/area (often 490G...), expand to leaf bus stop IDs (often 4900...).
+        Falls back to [stop_id] if expansion isn't possible.
         """
-        return [stop_id] if stop_id else []
+        if not stop_id:
+            return []
+
+        # Heuristic: for bus, "leaf" stops commonly have 4th char '0' (e.g. 4900....)
+        # Groups commonly have 4th char 'G' (e.g. 490G....). :contentReference[oaicite:3]{index=3}
+        def is_leaf_bus_stop(s: str) -> bool:
+            return len(s) >= 4 and s[3] == "0"
+
+        if is_leaf_bus_stop(stop_id):
+            return [stop_id]
+
+        visited = set()
+        leaf_ids: List[str] = []
+        queue: List[str] = [stop_id]
+
+        while queue:
+            current = queue.pop(0)
+            if not current or current in visited:
+                continue
+            visited.add(current)
+
+            if is_leaf_bus_stop(current):
+                leaf_ids.append(current)
+                continue
+
+            # Try to fetch children
+            url = f"{self.tfl_base_url}/StopPoint/{current}"
+            try:
+                r = requests.get(url, params=self._tfl_params(), timeout=10)
+                if r.status_code != 200:
+                    continue
+                data = r.json()
+            except Exception:
+                continue
+
+            children = data.get("children") or []
+            for child in children:
+                cid = child.get("id")
+                if cid and cid not in visited:
+                    queue.append(cid)
+
+        # De-dupe but preserve order
+        seen = set()
+        leaf_ids_unique = []
+        for x in leaf_ids:
+            if x not in seen:
+                seen.add(x)
+                leaf_ids_unique.append(x)
+
+        # If we couldn't expand, just return the original
+        return leaf_ids_unique if leaf_ids_unique else [stop_id]
     
     def get_route_traffic(self, route: str) -> Optional[Dict[str, Any]]:
         """
@@ -591,6 +638,9 @@ class TransportDataFetcher:
                                 'id': match.get('id', ''),
                                 'name': raw_name,
                                 'label': name,
+                                # Coordinates so frontend can show station map when disambiguating
+                                'lat': match.get('lat'),
+                                'lon': match.get('lon'),
                             })
                     # If user's query uniquely matches one option (e.g. "Finchley Road and Frognal Rail Station"),
                     # use it and skip disambiguation
@@ -883,7 +933,10 @@ class TransportDataFetcher:
                                 'name': name,
                                 'towards': towards,
                                 'platform': platform,
-                                'label': label
+                                'label': label,
+                                # Pass through coordinates so the frontend can show a map
+                                'lat': match.get('lat'),
+                                'lon': match.get('lon'),
                             })
                         return {
                             'error': 'disambiguation_needed',
@@ -921,8 +974,11 @@ class TransportDataFetcher:
                 # Decide which StopPoint IDs to hit for Arrivals
                 arrival_stop_ids = [stop_id]
 
-                # For buses, expand group StopPoints (490G...) into leaf bus stops (4900...) :contentReference[oaicite:4]{index=4}
-                if has_bus:
+                # For buses, expand group StopPoints (490G...) into leaf bus stops (4900...).
+                # When the timetable query is specifically for trains/tubes, we must not
+                # apply the bus-only heuristic, otherwise we lose train platforms (e.g.
+                # hubs like HUBEUS would expand only to bus stops and drop tube modes).
+                if has_bus and mode_filter != 'train':
                     arrival_stop_ids = self._expand_to_leaf_bus_stops(stop_id)
 
                 for arrival_id in arrival_stop_ids:
@@ -940,6 +996,10 @@ class TransportDataFetcher:
                                     arr["_stop_id"] = arrival_id
                                     arr["_query_stop_id"] = stop_id  # original searched id (often the group)
                                     arr["_group_name"] = stop_name
+                                    # Pass through approximate stop coordinates for map rendering (if present on match)
+                                    if match.get("lat") is not None and match.get("lon") is not None:
+                                        arr["_stop_lat"] = match.get("lat")
+                                        arr["_stop_lon"] = match.get("lon")
                                 all_arrivals.extend(stop_arrivals)
                     except Exception as e:
                         print(f"Error fetching arrivals for stop {arrival_id}: {e}")
@@ -999,6 +1059,9 @@ class TransportDataFetcher:
         """
         bus_arrivals: List[Dict[str, Any]] = []
         train_arrivals: List[Dict[str, Any]] = []
+        # Approximate coordinates for the stop/group as a whole (if provided on arrivals)
+        stop_lat: Optional[float] = None
+        stop_lon: Optional[float] = None
 
         def extract_direction(platform_name: str, destination: str) -> str:
             if not platform_name:
@@ -1027,6 +1090,13 @@ class TransportDataFetcher:
 
         for arr in all_arrivals:
             mode_name = arr.get('modeName', '').lower()
+            if stop_lat is None and arr.get("_stop_lat") is not None and arr.get("_stop_lon") is not None:
+                try:
+                    stop_lat = float(arr.get("_stop_lat"))
+                    stop_lon = float(arr.get("_stop_lon"))
+                except Exception:
+                    stop_lat = None
+                    stop_lon = None
             time_to_station = arr.get('timeToStation', 0)
             minutes = round(time_to_station / 60, 1)
             platform_name = arr.get('platformName', '')
@@ -1102,6 +1172,8 @@ class TransportDataFetcher:
         return {
             'stop_name': stop_name,
             'stop_id': first_stop_id,
+            'stop_lat': stop_lat,
+            'stop_lon': stop_lon,
             'bus_arrivals': bus_arrivals,
             'train_arrivals': train_arrivals,
             'bus_arrivals_by_destination': buses_by_destination,
@@ -1124,6 +1196,7 @@ class TransportDataFetcher:
         if not self.has_tfl or not stop_id:
             return None
         mode_filter = mode_filter or 'bus'
+        info = None
         if not stop_name:
             try:
                 info_url = f"{self.tfl_base_url}/StopPoint/{stop_id}"
@@ -1135,7 +1208,40 @@ class TransportDataFetcher:
                     stop_name = stop_id
             except Exception:
                 stop_name = stop_id
-        arrival_stop_ids = self._expand_to_leaf_bus_stops(stop_id)
+
+        # Decide which StopPoint IDs to query for arrivals.
+        # - For train/tube: if this is a hub (e.g. HUBEUS), expand to child
+        #   StopPoints that actually have train/tube modes (e.g. 940GZZLUEUS).
+        #   Otherwise, query the given stop_id directly.
+        # - For bus: keep using the bus-only expansion (490G... -> 4900...).
+        if mode_filter == 'train':
+            arrival_stop_ids = [stop_id]
+            try:
+                # Only attempt hub expansion when we either just fetched info,
+                # or when the id clearly looks like a hub (prefix HUB).
+                if info is None and stop_id.startswith("HUB"):
+                    info_url = f"{self.tfl_base_url}/StopPoint/{stop_id}"
+                    info_resp = requests.get(info_url, params=self._tfl_params(), timeout=5)
+                    if info_resp.status_code == 200:
+                        info = info_resp.json()
+                if info and stop_id.startswith("HUB"):
+                    children = info.get("children") or []
+                    train_child_ids = [
+                        c.get("id")
+                        for c in children
+                        if c.get("id") and any(
+                            m in (c.get("modes") or [])
+                            for m in ['tube', 'train', 'dlr', 'overground', 'tram', 'national-rail']
+                        )
+                    ]
+                    if train_child_ids:
+                        arrival_stop_ids = train_child_ids
+            except Exception:
+                # Fall back to querying the hub id directly; the caller will
+                # handle the "no_arrivals" case if nothing comes back.
+                arrival_stop_ids = [stop_id]
+        else:
+            arrival_stop_ids = self._expand_to_leaf_bus_stops(stop_id)
         all_arrivals = []
         for aid in arrival_stop_ids:
             try:

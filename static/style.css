@@ -1552,12 +1552,44 @@ header h1 {
 }
 
 .journey-card-top {
-    display: flex;
-    justify-content: space-between;
-    align-items: flex-start;
     margin-bottom: 16px;
     padding-bottom: 12px;
     border-bottom: 1px solid var(--border-main);
+}
+
+/* Journey summary: Departure, Arrival, Duration, Fare – matches journey_planner.py JourneySummary */
+.journey-card-summary {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px 24px;
+}
+
+.journey-card-row {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+}
+
+.journey-card-label {
+    font-size: 0.8rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.02em;
+    color: var(--text-secondary);
+}
+
+.journey-card-value {
+    font-size: 1rem;
+    color: var(--text-primary);
+}
+
+.journey-card-value strong {
+    font-size: 1.15rem;
+}
+
+.journey-card-fare {
+    font-size: 0.9rem;
+    color: var(--text-secondary);
 }
 
 .journey-card-times {
@@ -1572,11 +1604,6 @@ header h1 {
     color: var(--text-primary);
 }
 
-.journey-card-fare {
-    font-size: 0.85rem;
-    color: var(--text-secondary);
-}
-
 .journey-card-duration {
     font-size: 1rem;
     color: var(--text-primary);
@@ -1585,6 +1612,16 @@ header h1 {
 
 .journey-card-duration strong {
     font-size: 1.25rem;
+}
+
+.journey-card-legs-heading {
+    font-size: 0.8rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.02em;
+    color: var(--text-secondary);
+    margin-bottom: 8px;
+    margin-left: 40px;
 }
 
 .journey-card-timeline {
@@ -1904,6 +1941,16 @@ header h1 {
     text-align: center;
     color: var(--text-muted);
     font-size: 0.9rem;
+}
+
+.timetable-disamb-map {
+    width: 100%;
+    max-width: 420px;
+    height: 260px;
+    margin: 10px 0 4px 0;
+    border-radius: 12px;
+    overflow: hidden;
+    border: 1px solid var(--border-main);
 }
 
 /* -------- Disruption / status card - app theme -------- */

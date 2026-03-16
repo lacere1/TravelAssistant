@@ -2,9 +2,13 @@ from flask import Flask, render_template, request, jsonify, session
 from datetime import datetime
 import os
 import re
+from dotenv import load_dotenv
+
+# Load environment variables from the .env file in the project root
+load_dotenv()
 
 from chatbot import TrafficChatbot
-from journey_planner import JourneyChatbot
+from journey_planner import JourneyChatbot, TflJourneyClient
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev-secret-key-change-in-production')
@@ -13,9 +17,14 @@ app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev-secret-key-change-i
 # In production you would use a database and password hashing.
 USERS = {}
 
+# Very simple in-memory store for user-defined text shortcuts.
+# In production this should live in persistent storage.
+USER_SHORTCUTS = {}
+
 # Initialize chatbots
 traffic_chatbot = TrafficChatbot()
 journey_chatbot = JourneyChatbot()
+tfl_journey_client = TflJourneyClient()
 
 
 @app.route('/')
@@ -44,6 +53,69 @@ def me():
 def _current_user_key() -> str:
     """Return the key used for per-user in-memory state."""
     return session.get('username') or '_anon'
+
+
+def _apply_shortcuts_to_text(username: str, text: str) -> str:
+    """
+    Apply user-defined shortcuts to a free-text string.
+    Replaces whole-word matches of each shortcut (case-insensitive).
+    """
+    shortcuts_for_user = USER_SHORTCUTS.get(username) or {}
+    if not shortcuts_for_user or not text:
+        return text
+
+    result = text
+    for raw_key, replacement in shortcuts_for_user.items():
+        if not raw_key or not replacement:
+            continue
+        # \b ensures we only match whole words like "home", not "homework"
+        escaped_key = re.escape(raw_key)
+        pattern = re.compile(rf"\b{escaped_key}\b", flags=re.IGNORECASE)
+        result = pattern.sub(replacement, result)
+    return result
+
+
+@app.route('/shortcuts', methods=['GET', 'POST'])
+def shortcuts():
+    """
+    Simple JSON API for managing user-defined text shortcuts.
+    GET  -> list current user's shortcuts
+    POST -> create/update a shortcut: { "key": "home", "value": "Neasden Station" }
+    """
+    username = _current_user_key()
+
+    if request.method == 'GET':
+        shortcuts_for_user = USER_SHORTCUTS.get(username) or {}
+        return jsonify([
+            {'key': k, 'value': v}
+            for k, v in sorted(shortcuts_for_user.items())
+        ])
+
+    data = request.get_json(force=True) or {}
+    key = (data.get('key') or '').strip()
+    value = (data.get('value') or '').strip()
+
+    if not key or not value:
+        return jsonify({'error': 'Both key and value are required.'}), 400
+
+    shortcuts_for_user = USER_SHORTCUTS.setdefault(username, {})
+    shortcuts_for_user[key.lower()] = value
+
+    return jsonify({'ok': True, 'key': key.lower(), 'value': value})
+
+
+@app.route('/shortcuts/<key>', methods=['DELETE'])
+def delete_shortcut(key):
+    """Delete a single shortcut for the current user."""
+    username = _current_user_key()
+    shortcuts_for_user = USER_SHORTCUTS.get(username) or {}
+    key_lower = (key or '').lower()
+
+    if key_lower in shortcuts_for_user:
+        del shortcuts_for_user[key_lower]
+        return jsonify({'ok': True})
+
+    return jsonify({'error': 'Shortcut not found.'}), 404
 
 
 @app.route('/login', methods=['POST'])
@@ -78,14 +150,41 @@ def logout():
     return jsonify({'ok': True})
 
 
+def _journey_planner_entities(state: dict) -> dict:
+    """Build entities dict for the info panel from journey planner state."""
+    entities = {}
+    if not state:
+        return entities
+    if state.get("fromQuery"):
+        entities["from"] = state["fromQuery"]
+    if state.get("toQuery"):
+        entities["to"] = state["toQuery"]
+    when = state.get("when")
+    if when and isinstance(when, dict):
+        dt = when.get("datetime")
+        if hasattr(dt, "strftime"):
+            entities["when"] = dt.strftime("%Y-%m-%d %H:%M")
+        elif dt is not None:
+            entities["when"] = str(dt)
+    if state.get("fromLocationId"):
+        entities["from_id"] = state["fromLocationId"]
+    if state.get("toLocationId"):
+        entities["to_id"] = state["toLocationId"]
+    return entities
+
+
 def _looks_like_journey_message(text: str) -> bool:
     """
     Heuristic: decide if a free-text message is asking to plan a journey.
-    This lets us route to the JourneyChatbot when appropriate while
-    keeping the existing traffic assistant for everything else.
+    The word "plan" (e.g. "plan a journey", "plan my journey") triggers
+    Journey Planner intent. Also "from X to Y" and "get to" route here.
     """
     t = (text or '').lower()
     if ' from ' in t and ' to ' in t:
+        return True
+    if 'plan' in t and (
+        'journey' in t or 'trip' in t or 'route' in t or ' from ' in t or ' to ' in t or 'get to' in t
+    ):
         return True
     if 'plan a journey' in t or 'plan journey' in t or 'get to' in t:
         return True
@@ -107,11 +206,11 @@ def chat():
         date_str = (data.get('date') or '').strip() or None
         time_str = (data.get('time') or '').strip() or None
 
-        # Earlier-stage behaviour: use the raw text values directly.
+        # Apply user-defined shortcuts before routing the message.
         user_key = _current_user_key()
-        user_message = user_message_raw
-        from_text = from_text_raw
-        to_text = to_text_raw
+        user_message = _apply_shortcuts_to_text(user_key, user_message_raw)
+        from_text = _apply_shortcuts_to_text(user_key, from_text_raw)
+        to_text = _apply_shortcuts_to_text(user_key, to_text_raw)
 
         now = datetime.utcnow()
 
@@ -130,38 +229,61 @@ def chat():
                 username=username,
             )
 
+            entities = {"from": from_text, "to": to_text}
+            if date_str and time_str:
+                entities["when"] = f"{date_str} {time_str}"
+            if from_id:
+                entities["from_id"] = from_id
+            if to_id:
+                entities["to_id"] = to_id
             return jsonify({
                 # Main text used by existing frontend
-                'response': jp_response.get('reply', ''),
+                "response": jp_response.get("reply", ""),
                 # Journey-specific payload for the planner UI
-                'journeys': jp_response.get('journeys', []),
-                'tfl_journey_url': jp_response.get('tfl_journey_url'),
-                'disambiguation': jp_response.get('disambiguation', False),
-                'from_id': from_id or '',
-                'to_id': to_id or '',
+                "journeys": jp_response.get("journeys", []),
+                "tfl_journey_url": jp_response.get("tfl_journey_url"),
+                "disambiguation": jp_response.get("disambiguation", False),
+                "state": jp_response.get("state", {}),
+                "from_id": from_id or "",
+                "to_id": to_id or "",
                 # Basic intent/metadata so the existing info panel still works
-                'intent': 'journey_planner',
-                'entities': {
-                    'from': from_text,
-                    'to': to_text,
-                },
-                'confidence': 1.0,
+                "intent": "journey_planner",
+                "entities": entities,
+                "confidence": 1.0,
             })
 
-        # 2) If the free-text clearly looks like a journey query, use the journey planner.
+        # 2) If we're in the middle of journey planning (e.g. asked "Where from?", waiting for "3", or for "neasden station"), use the journey planner.
+        jp_state = journey_chatbot.state.get("global") or {}
+        if jp_state.get("journey_planning_active") or jp_state.get("fromOptions") or jp_state.get("toOptions"):
+            jp_response = journey_chatbot.handle_message(user_message, now=now, username=username)
+            return jsonify({
+                "response": jp_response.get("reply", ""),
+                "journeys": jp_response.get("journeys", []),
+                "tfl_journey_url": jp_response.get("tfl_journey_url"),
+                "disambiguation": jp_response.get("disambiguation", False),
+                "journey_disambiguation": jp_response.get("place_disambiguation"),
+                "state": jp_response.get("state", {}),
+                "intent": "journey_planner",
+                "entities": _journey_planner_entities(jp_response.get("state", {})),
+                "confidence": 0.95,
+            })
+
+        # 3) If the free-text clearly looks like a journey query, use the journey planner.
         if _looks_like_journey_message(user_message):
             jp_response = journey_chatbot.handle_message(user_message, now=now, username=username)
             return jsonify({
-                'response': jp_response.get('reply', ''),
-                'journeys': jp_response.get('journeys', []),
-                'tfl_journey_url': jp_response.get('tfl_journey_url'),
-                'disambiguation': jp_response.get('disambiguation', False),
-                'intent': 'journey_planner',
-                'entities': {},
-                'confidence': 0.95,
+                "response": jp_response.get("reply", ""),
+                "journeys": jp_response.get("journeys", []),
+                "tfl_journey_url": jp_response.get("tfl_journey_url"),
+                "disambiguation": jp_response.get("disambiguation", False),
+                "journey_disambiguation": jp_response.get("place_disambiguation"),
+                "state": jp_response.get("state", {}),
+                "intent": "journey_planner",
+                "entities": _journey_planner_entities(jp_response.get("state", {})),
+                "confidence": 0.95,
             })
 
-        # 3) Fallback: use the existing traffic chatbot for everything else.
+        # 4) Fallback: use the existing traffic chatbot for everything else.
         if not user_message:
             return jsonify({'error': 'No message provided'}), 400
 
@@ -178,6 +300,7 @@ def chat():
             'disambiguation': False,
             'timetable': traffic_response.get('timetable'),
             'disruption': traffic_response.get('disruption'),
+            'timetable_disambiguation': traffic_response.get('timetable_disambiguation'),
         })
     except Exception as e:
         return jsonify({'error': str(e)}), 500

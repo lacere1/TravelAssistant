@@ -24,13 +24,34 @@ class NLPProcessor:
     def __init__(self):
         """Initialize NLP models for intent classification and entity extraction"""
         print("Loading NLP models...")
-        # Earlier-stage behaviour: skip synonym expansion entirely to keep
-        # intent detection logic simple and self-contained.
-        self._synonym_expansion_enabled = False
+        # Enable synonym expansion only if NLTK/WordNet are available
+        self._synonym_expansion_enabled = _NLTK_AVAILABLE
         
-        # Earlier-stage behaviour: skip loading transformer models and rely
-        # entirely on the rule-based intent classifier below.
+        # Use a lightweight model for intent classification
+        # We'll use a zero-shot classifier that can work without fine-tuning
+        # Try smaller model first, fallback to larger if needed
         self.intent_classifier = None
+        model_options = [
+            "typeform/distilbert-base-uncased-mnli",  # Smaller, faster
+            "facebook/bart-large-mnli"  # Larger, more accurate
+        ]
+        
+        for model_name in model_options:
+            try:
+                print(f"Attempting to load model: {model_name}")
+                self.intent_classifier = pipeline(
+                    "zero-shot-classification",
+                    model=model_name,
+                    device=-1  # Use CPU (set to 0 for GPU if available)
+                )
+                print(f"Successfully loaded model: {model_name}")
+                break
+            except Exception as e:
+                print(f"Could not load {model_name}: {e}")
+                continue
+        
+        if self.intent_classifier is None:
+            print("Warning: Could not load any transformer model. Using rule-based fallback.")
         
         # Intent labels for classification (excluding removed/deprecated intents)
         self.intent_labels = [
@@ -64,9 +85,39 @@ class NLPProcessor:
         (multi-word synonyms are split into individual tokens).
         If NLTK/WordNet are unavailable, this simply returns the original tokens.
         """
-        # In this rollback version we only use the original lowercase tokens
-        # and do not attempt external WordNet lookups.
-        return set(t.lower() for t in tokens if t)
+        expanded: Set[str] = set(t.lower() for t in tokens if t)
+        
+        if not self._synonym_expansion_enabled or not wn:
+            return expanded
+        
+        for token in list(expanded):
+            # Skip very short tokens to avoid noisy expansions
+            if len(token) < 3:
+                continue
+            before_token = set(expanded)
+            try:
+                for synset in wn.synsets(token):  # type: ignore[union-attr]
+                    for lemma in synset.lemmas():
+                        name = lemma.name().replace("_", " ").lower()
+                        if not name:
+                            continue
+                        # Split multi-word synonyms like "traffic jam"
+                        for part in name.split():
+                            if part:
+                                expanded.add(part)
+                added_for_token = sorted(expanded - before_token)
+                if added_for_token:
+                    print(f"[NLP] Synonyms added for '{token}': {added_for_token}")
+            except LookupError:
+                # WordNet data not downloaded/available; disable further attempts
+                print("WordNet corpus not available; disabling synonym expansion.")
+                self._synonym_expansion_enabled = False
+                break
+            except Exception:
+                # Any other NLTK-related issue: fail gracefully and continue
+                continue
+        
+        return expanded
     
     def process(self, text: str) -> Dict[str, Any]:
         """
@@ -520,15 +571,116 @@ class NLPProcessor:
         """
         if self._stops_loaded:
             return
+        
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        bus_path = os.path.join(base_dir, "bus_stops.csv")
+        train_path = os.path.join(base_dir, "train_stops.csv")
+        bus_routes_path = os.path.join(base_dir, "tfl_bus_routes.txt")
+        
+        bus_names: List[str] = []
+        train_names: List[str] = []
+        
+        # Bus stops CSV: expect a 'CommonName' column
+        try:
+            if os.path.exists(bus_path):
+                try:
+                    with open(bus_path, newline="", encoding="utf-8-sig") as f:
+                        reader = csv.DictReader(f)
+                        for row in reader:
+                            raw_name = (row.get("CommonName") or "").strip()
+                            if not raw_name:
+                                continue
+                            # Remove trailing postcode/extra info in brackets, e.g. "Stop Name (NW10 4XYZ)" -> "Stop Name"
+                            name = re.sub(r"\s*\([^)]*\)\s*$", "", raw_name).strip()
+                            if name:
+                                bus_names.append(name)
+                except UnicodeDecodeError:
+                    with open(bus_path, newline="", encoding="cp1252") as f:
+                        reader = csv.DictReader(f)
+                        for row in reader:
+                            raw_name = (row.get("CommonName") or "").strip()
+                            if not raw_name:
+                                continue
+                            name = re.sub(r"\s*\([^)]*\)\s*$", "", raw_name).strip()
+                            if name:
+                                bus_names.append(name)
+        except Exception as e:
+            print(f"[NLP] Failed to load bus_stops.csv: {e}")
 
-        # Earlier-stage behaviour: do not rely on external CSV datasets yet.
-        # Keep attributes initialised but empty so callers can safely access
-        # them without triggering file I/O.
-        self._bus_stops = []
-        self._train_stations = []
-        self._train_lines = []
-        self._bus_routes = set()
+        # Train stops CSV: Network, Line, Line Colour, Station (station name from 'Station' column)
+        try:
+            if os.path.exists(train_path):
+                # Prefer 'Station'; fallback to 'Stop' or 'Name' if structure changed
+                def _train_station_name(row: dict) -> str:
+                    raw = (row.get("Station") or row.get("Stop") or row.get("Name") or "").strip()
+                    if not raw:
+                        return ""
+                    return re.sub(r"\s*\([^)]*\)\s*$", "", raw).strip()
+
+                try:
+                    with open(train_path, newline="", encoding="utf-8-sig") as f:
+                        reader = csv.DictReader(f)
+                        for row in reader:
+                            name = _train_station_name(row)
+                            if name:
+                                train_names.append(name)
+                except UnicodeDecodeError:
+                    with open(train_path, newline="", encoding="cp1252") as f:
+                        reader = csv.DictReader(f)
+                        for row in reader:
+                            name = _train_station_name(row)
+                            if name:
+                                train_names.append(name)
+                # Deduplicate: same station can appear on multiple lines (Network/Line)
+                train_names = list(dict.fromkeys(train_names))
+        except Exception as e:
+            print(f"[NLP] Failed to load train_stops.csv: {e}")
+
+        self._bus_stops = bus_names
+        self._train_stations = train_names
+        # London Underground, Overground, and DLR line names (canonical display names)
+        self._train_lines = [
+            # London Underground
+            "Bakerloo",
+            "Central",
+            "Circle",
+            "District",
+            "Hammersmith & City",
+            "Jubilee",
+            "Metropolitan",
+            "Northern",
+            "Piccadilly",
+            "Victoria",
+            "Waterloo & City",
+            # London Overground (network and named lines)
+            "London Overground",
+            "Windrush",
+            "Lioness",
+            "Mildmay",
+            "Suffragette",
+            "Weaver",
+            "Liberty",
+            # DLR (Docklands Light Railway)
+            "DLR",
+            "Docklands Light Railway",
+        ]
+        # TfL bus route ids (e.g. "1", "83", "N29") for bus disruption extraction
+        bus_route_ids: Set[str] = set()
+        try:
+            if os.path.exists(bus_routes_path):
+                with open(bus_routes_path, encoding="utf-8") as f:
+                    for line in f:
+                        rid = line.strip()
+                        if rid:
+                            bus_route_ids.add(rid)
+                            bus_route_ids.add(rid.upper())
+        except Exception as e:
+            print(f"[NLP] Failed to load tfl_bus_routes.txt: {e}")
+        self._bus_routes = bus_route_ids
         self._stops_loaded = True
+        print(
+            f"[NLP] Loaded {len(self._bus_stops)} bus stops and {len(self._train_stations)} train stations from CSV files."
+        )
     
     # Keywords that indicate a status/disruption query (train or bus)
     _DISRUPTION_KEYWORDS = (
@@ -550,6 +702,32 @@ class NLPProcessor:
         a line from _train_lines, return that line's display name. Otherwise return None.
         Matching: punctuation like & is interchangeable; apostrophes don't have to be included.
         """
+        if not query or not self._train_lines:
+            return None
+        q = self._normalize_for_line_match(query)
+        if not any(kw in q for kw in self._DISRUPTION_KEYWORDS):
+            return None
+
+        # First try exact/substring matching, then fall back to fuzzy similarity
+        best_name: Optional[str] = None
+        best_score: float = 0.0
+
+        for line_name in self._train_lines:
+            norm_line = self._normalize_for_line_match(line_name)
+            if not norm_line:
+                continue
+            # Strong match when the normalized line name appears directly in the query
+            if norm_line in q:
+                return line_name
+            # Fuzzy fallback: allow small typos like "bakerlo" for "bakerloo"
+            score = SequenceMatcher(None, q, norm_line).ratio()
+            if score > best_score:
+                best_score = score
+                best_name = line_name
+
+        # Accept moderately strong fuzzy matches (small spelling mistakes)
+        if best_name is not None and best_score >= 0.80:
+            return best_name
         return None
     
     def extract_bus_disruption_route(self, query: str) -> Optional[str]:
@@ -557,6 +735,16 @@ class NLPProcessor:
         If the query is about bus status or disruption and contains a route number/string
         that appears in tfl_bus_routes.txt, return that route id (e.g. "83", "N29"). Otherwise return None.
         """
+        if not query or not self._bus_routes:
+            return None
+        q_lower = query.lower()
+        if not any(kw in q_lower for kw in self._DISRUPTION_KEYWORDS):
+            return None
+        # Find candidate route tokens: N? digits (e.g. 83, N29)
+        candidates = re.findall(r'\b([Nn]?\d{1,3})\b', query)
+        for c in candidates:
+            if c.upper() in self._bus_routes or c in self._bus_routes:
+                return c.upper() if c.upper() in self._bus_routes else c
         return None
     
     def parse_line_or_route_followup(self, message: str) -> Optional[Tuple[str, str]]:
@@ -565,6 +753,32 @@ class NLPProcessor:
         or bus route (no status/disruption keywords required), return (value, 'train') or (value, 'bus').
         Otherwise return None. Bus route is preferred when the message is only digits or N+digits.
         """
+        if not message or not message.strip():
+            return None
+        msg = message.strip()
+        q = self._normalize_for_line_match(msg)
+        # Bus: single token that is in _bus_routes (e.g. "83", "N29")
+        bus_candidates = re.findall(r'\b([Nn]?\d{1,3})\b', msg)
+        if len(bus_candidates) == 1 and (bus_candidates[0].upper() in self._bus_routes or bus_candidates[0] in self._bus_routes):
+            return (bus_candidates[0].upper() if bus_candidates[0].upper() in self._bus_routes else bus_candidates[0], 'bus')
+        # Train: message matches, is contained in, or is a close fuzzy match to a _train_lines name
+        best_name: Optional[str] = None
+        best_score: float = 0.0
+        for line_name in self._train_lines:
+            norm_line = self._normalize_for_line_match(line_name)
+            if not norm_line:
+                continue
+            # Exact / substring matches are preferred
+            if norm_line == q or norm_line in q or (q in norm_line and len(q) >= 3):
+                return (line_name, 'train')
+            # Fuzzy fallback: tolerate minor typos in short replies like "victora"
+            score = SequenceMatcher(None, q, norm_line).ratio()
+            if score > best_score:
+                best_score = score
+                best_name = line_name
+
+        if best_name is not None and best_score >= 0.80:
+            return (best_name, 'train')
         return None
     
     def _best_csv_stop_match(self, candidate: str, mode_hint: Optional[str] = None):
@@ -646,5 +860,110 @@ class NLPProcessor:
     ):
         """
         Use CSV stop names as an additional NER + slot-filling and intent hint layer.
+        
+        - Detect if the user text closely matches a known bus or train stop.
+        - Infer whether this is a bus or train timetable query.
+        - Cooperate with existing rule-based / transformer intent detection and
+          with the downstream disambiguation engine in the TFL API.
         """
+        text_lower = original_text.lower()
+
+        # Only run this refinement when the user is clearly talking about
+        # buses/trains (regardless of whether they say "times"/"timetable").
+        has_bus_words = any(w in text_lower for w in ["bus", "coach"])
+        has_train_words = any(
+            w in text_lower
+            for w in ["train", "tube", "rail", "overground", "dlr", "underground"]
+        )
+        if not (has_bus_words or has_train_words):
+            return intent, entities, confidence
+
+        # When user said only train (or only bus), search that CSV only so we
+        # don't match the same place name to the other mode (e.g. "train times
+        # for Baker Street" must match train_stops.csv, not bus_stops.csv).
+        mode_hint = None
+        if has_train_words and not has_bus_words:
+            mode_hint = "train"
+        elif has_bus_words and not has_train_words:
+            mode_hint = "bus"
+
+        # Prefer an already extracted location; otherwise fall back to the whole text
+        candidate = entities.get("location") or original_text
+        match = self._best_csv_stop_match(candidate, mode_hint=mode_hint)
+        # Accept moderately strong fuzzy matches so that small typos / variations
+        # in stop names are still recognized, without being overly permissive.
+        if not match or match.get("score", 0.0) < 0.80:
+            # No strong stop-name match; keep existing interpretation
+            return intent, entities, confidence
+        
+        stop_type = match["type"]
+        stop_name = match["name"]
+        score = match.get("score", 0.0)
+        print(f"[NLP][CSV] Matched stop '{stop_name}' (type={stop_type}, score={score:.3f}) from CSVs")
+        
+        current_mode = entities.get("timetable_mode")
+        inferred_mode = None
+        
+        # Decide timetable mode primarily from the CSV type,
+        # but respect an existing compatible mode if already set.
+        if stop_type == "bus":
+            if current_mode in (None, "bus", "both"):
+                inferred_mode = "bus"
+            else:
+                inferred_mode = current_mode
+        elif stop_type == "train":
+            if current_mode in (None, "train", "both"):
+                inferred_mode = "train"
+            else:
+                inferred_mode = current_mode
+        
+        if not inferred_mode:
+            return intent, entities, confidence
+        
+        # Fill/normalize NER slots for downstream dialogue state tracking.
+        # IMPORTANT: we *do not* overwrite the user's original location phrase
+        # if we already have one (e.g. "oxford street", "high road"). Instead:
+        # - keep the user's extracted phrase in entities["location"] so prompts
+        #   and TfL queries use exactly what they typed
+        # - store the CSV-backed canonical stop name separately so downstream
+        #   code can still use it if needed.
+        #
+        # Only when there was no prior location extracted do we fall back to
+        # using the canonical stop name as the location.
+        display_name = stop_name
+        candidate_lower = (candidate or "").lower()
+        stop_lower = stop_name.lower()
+        if stop_type == "bus":
+            if "station" in candidate_lower and "station" not in stop_lower:
+                display_name = f"{stop_name} Station"
+        elif stop_type == "train":
+            # Keep "underground station" or "station" in the query for TfL API
+            if "underground station" in candidate_lower and "underground station" not in stop_lower:
+                display_name = f"{stop_name} Underground Station"
+            elif "station" in candidate_lower and "station" not in stop_lower:
+                display_name = f"{stop_name} Station"
+
+        existing_location = (entities.get("location") or "").strip()
+        if not existing_location:
+            # No location was previously extracted – use the canonical stop name.
+            entities["location"] = display_name
+        else:
+            # Preserve the user's phrase and keep the CSV stop separately.
+            entities["csv_stop_name"] = display_name
+
+        entities["timetable_mode"] = inferred_mode
+        entities["timetable_stop_source"] = f"{stop_type}_csv"
+        print(
+            f"[NLP][CSV] Using '{stop_name}' as location with timetable_mode='{inferred_mode}' "
+            f"(source={stop_type}_csv)"
+        )
+        
+        # For queries that mention bus/train plus a recognized stop, we want to
+        # take the same path as "bus times for ..." / "train times for ...".
+        # So, unless the user is clearly asking about disruption rather than times,
+        # treat this as a timetable query.
+        if "disruption" not in text_lower and "status" not in text_lower:
+            intent = "ask_timetable"
+            confidence = max(confidence, 0.9)
+        
         return intent, entities, confidence

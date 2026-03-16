@@ -44,6 +44,128 @@ class TrafficChatbot:
         Returns:
             dict: Response with message, intent, entities, and confidence
         """
+        # Dialogue State Tracking: if we're waiting for bus/train disambiguation, treat this as a reply
+        disamb = self.conversation_state.get('timetable_disambiguation')
+        if disamb and isinstance(disamb, dict):
+            intent, selected, confidence = self._classify_disambiguation_reply(
+                user_message.strip(), disamb.get('options', [])
+            )
+
+            if intent == 'cancel':
+                mode_text = 'train' if disamb.get('timetable_mode') == 'train' else 'bus'
+                self.conversation_state['timetable_disambiguation'] = None
+                response_message = {
+                    'primary': "No problem.",
+                    'details': None,
+                    'alternatives': [],
+                    'next_steps': f"Ask for {mode_text} times again whenever you like."
+                }
+                return {
+                    'message': self._format_response(response_message, 'ask_timetable', {}),
+                    'intent': 'ask_timetable',
+                    'entities': {},
+                    'confidence': 1.0,
+                    'conversation_state': self.conversation_state.copy()
+                }
+
+            if intent == 'choose_option' and selected is not None and confidence >= 0.5:
+                # User chose an option; either fetch timetable by stop (bus/train station) or filter by direction (train platform/direction)
+                is_train_direction = disamb.get('train_direction_disambiguation') is True
+                self.conversation_state['timetable_disambiguation'] = None
+                timetable_mode = disamb.get('timetable_mode', 'bus')
+                if is_train_direction:
+                    # Filter existing timetable data by chosen direction; no re-fetch
+                    stored_data = disamb.get('timetable_data') or {}
+                    chosen_direction = selected.get('id') or selected.get('direction') or selected.get('name')
+                    all_trains = stored_data.get('train_arrivals', [])
+                    filtered_trains = [t for t in all_trains if (t.get('direction') or '') == chosen_direction]
+                    filtered_by_direction = {chosen_direction: filtered_trains[:10]} if filtered_trains else {}
+                    timetable_data = {
+                        'stop_name': stored_data.get('stop_name', disamb.get('query', '')),
+                        'train_arrivals': filtered_trains,
+                        'train_arrivals_by_direction': filtered_by_direction,
+                        'bus_arrivals': [],
+                        'bus_arrivals_by_destination': {},
+                        'bus_arrivals_grouped': {},
+                    }
+                else:
+                    self._update_user_preference(user_key, selected['id'], selected.get('name'))
+                    timetable_data = self.transport_api.get_tfl_timetable_by_stop_id(
+                        selected['id'], mode_filter=timetable_mode, stop_name=selected.get('name')
+                    )
+                if timetable_data and isinstance(timetable_data, dict) and 'error' not in timetable_data:
+                    response_message = self._format_timetable_response(timetable_data, timetable_mode)
+                    response_message['timetable_data'] = timetable_data
+                    formatted = self._format_response(response_message, 'ask_timetable', {})
+                    return {
+                        'message': formatted,
+                        'intent': 'ask_timetable',
+                        'entities': {},
+                        'confidence': min(0.95, 0.7 + confidence * 0.25),
+                        'conversation_state': self.conversation_state.copy(),
+                        'timetable': timetable_data,
+                    }
+                if not is_train_direction and isinstance(timetable_data, dict) and timetable_data.get('error') == 'no_arrivals':
+                    stop_name = timetable_data.get('stop_name', selected.get('name', ''))
+                    self.conversation_state['timetable_disambiguation'] = None
+                    response_message = {
+                        'primary': f"No arrivals currently available for {stop_name}.",
+                        'details': None,
+                        'alternatives': [],
+                        'next_steps': "Try again later or check another stop."
+                    }
+                    return {
+                        'message': self._format_response(response_message, 'ask_timetable', {}),
+                        'intent': 'ask_timetable',
+                        'entities': {},
+                        'confidence': 0.9,
+                        'conversation_state': self.conversation_state.copy()
+                    }
+                # Fall through to normal processing if API failed (only for stop disambiguation, not train direction)
+                if not is_train_direction:
+                    self.conversation_state['timetable_disambiguation'] = disamb  # restore
+            else:
+                # Unclear or low-confidence reply: re-prompt with the same options
+                prompt = self._build_disambiguation_prompt(disamb)
+                primary = prompt['primary']
+                if intent == 'unclear' or confidence < 0.5:
+                    primary = "I didn't quite get that. " + primary
+                response_message = {
+                    'primary': primary,
+                    'details': prompt.get('details'),
+                    'alternatives': [],
+                    'next_steps': prompt.get('next_steps')
+                }
+                formatted = self._format_response(response_message, 'ask_timetable', {})
+                return {
+                    'message': formatted,
+                    'intent': 'ask_timetable',
+                    'entities': {},
+                    'confidence': confidence,
+                    'conversation_state': self.conversation_state.copy()
+                }
+        
+        # Follow-up: user replying with just a line/route after "couldn't find a train/bus"
+        awaiting = self.conversation_state.get('awaiting_disruption_line')
+        if awaiting and user_message and hasattr(self.nlp, 'parse_line_or_route_followup'):
+            parsed = self.nlp.parse_line_or_route_followup(user_message)
+            if parsed is not None:
+                value, kind = parsed
+                self.conversation_state['awaiting_disruption_line'] = None
+                synthetic = f"bus status {value}" if kind == 'bus' else f"train status {value}"
+                response_message = self._handle_transit_multimodal({}, synthetic)
+                if isinstance(response_message, dict) and 'awaiting_line' in response_message:
+                    response_message.pop('awaiting_line')
+                formatted_response = self._format_response(response_message, 'ask_transit_disruption', {})
+                self._update_conversation_state({}, 'ask_transit_disruption')
+                return {
+                    'message': formatted_response,
+                    'intent': 'ask_transit_disruption',
+                    'entities': {},
+                    'confidence': 0.9,
+                    'conversation_state': self.conversation_state.copy()
+                }
+        
         # Step 1: NLP Processing - Intent and Entity Extraction
         nlp_result = self.nlp.process(user_message)
         intent = nlp_result['intent']
@@ -69,6 +191,9 @@ class TrafficChatbot:
             'conversation_state': self.conversation_state.copy(),
             'timetable': response_message.get('timetable_data'),
             'disruption': response_message.get('disruption'),
+            # Expose current timetable disambiguation state (if any) so the frontend
+            # can render rich UI like embedded maps for "Which direction for ...?"
+            'timetable_disambiguation': self.conversation_state.get('timetable_disambiguation'),
         }
     
     def _update_conversation_state(self, entities: Dict[str, str], intent: str):
@@ -804,6 +929,10 @@ class TrafficChatbot:
                             'label': label,
                             'direction': direction,
                             'platform': platform_num or None,
+                            # Reuse stop-level coordinates when available so the frontend
+                            # can still show the station on a map for platform choices.
+                            'lat': timetable_data.get('stop_lat'),
+                            'lon': timetable_data.get('stop_lon'),
                         })
                     self.conversation_state['timetable_disambiguation'] = {
                         'options': train_direction_options,
@@ -1072,6 +1201,37 @@ class TrafficChatbot:
                         'alternatives': [],
                         'next_steps': None
                     }
+        
+        # Multimodal route comparison (drive vs transit)
+        origin = entities.get('origin') or self.conversation_state.get('origin')
+        destination = entities.get('destination') or self.conversation_state.get('destination')
+        
+        if origin and destination:
+            drive_route = self.transport_api.get_route_recommendation(origin, destination)
+            transit_route = self.transport_api.get_transit_route(origin, destination)
+            
+            if drive_route and transit_route:
+                drive_time = drive_route.get('duration_minutes', 0)
+                transit_time = transit_route.get('duration_minutes', 0)
+                
+                if transit_time < drive_time:
+                    primary = f"Public transport faster: {transit_time} min vs {drive_time} min driving"
+                else:
+                    primary = f"Driving faster: {drive_time} min vs {transit_time} min transit"
+                
+                details = f"Drive: {drive_time} min | Transit: {transit_time} min"
+                
+                # Suggest park-and-ride if applicable
+                alternatives = []
+                if transit_time < drive_time * 1.5:  # Transit not much slower
+                    alternatives.append(f"Consider park-and-ride: drive part way, then take transit")
+                
+                return {
+                    'primary': primary,
+                    'details': details,
+                    'alternatives': alternatives,
+                    'next_steps': None
+                }
         
         return {
             'primary': f"Checking transit status for {location or 'your area'}...",
