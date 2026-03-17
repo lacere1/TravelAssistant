@@ -150,6 +150,26 @@ def logout():
     return jsonify({'ok': True})
 
 
+@app.route('/new_chat', methods=['POST'])
+def new_chat():
+    """
+    Reset all conversational state for the current user.
+
+    Called by the frontend "New chat" button so that intents, slots, and all
+    journey-planning context are cleared and the next message starts a fresh
+    conversation.
+    """
+    user_key = _current_user_key()
+
+    # Reset traffic assistant FSM + per-user conversation state.
+    traffic_chatbot.reset_user(user_key)
+
+    # Reset journey planner's internal state.
+    journey_chatbot.reset()
+
+    return jsonify({'ok': True})
+
+
 def _journey_planner_entities(state: dict) -> dict:
     """Build entities dict for the info panel from journey planner state."""
     entities = {}
@@ -176,18 +196,60 @@ def _journey_planner_entities(state: dict) -> dict:
 def _looks_like_journey_message(text: str) -> bool:
     """
     Heuristic: decide if a free-text message is asking to plan a journey.
-    The word "plan" (e.g. "plan a journey", "plan my journey") triggers
-    Journey Planner intent. Also "from X to Y" and "get to" route here.
+    The word "plan" (e.g. "plan a journey", "plan my journey") should trigger
+    Journey Planner intent, but timetable-style phrases like "bus times from X
+    to Y" should stay with the timetable intent instead of being treated as
+    journey planning.
     """
-    t = (text or '').lower()
-    if ' from ' in t and ' to ' in t:
+    t = (text or '').lower().strip()
+    if not t:
+        return False
+
+    # Explicitly exclude timetable-style queries from journey-planner routing.
+    timetable_phrases = [
+        'bus times',
+        'train times',
+        'tube times',
+        'timetable',
+        'next bus',
+        'next train',
+        'bus or train times',
+        'train or bus times',
+    ]
+    if any(p in t for p in timetable_phrases):
+        return False
+
+    # Strong journey-planner cues.
+    if 'plan a journey' in t or 'plan journey' in t:
         return True
     if 'plan' in t and (
-        'journey' in t or 'trip' in t or 'route' in t or ' from ' in t or ' to ' in t or 'get to' in t
+        'journey' in t or 'trip' in t or 'route' in t or 'get to' in t
     ):
         return True
-    if 'plan a journey' in t or 'plan journey' in t or 'get to' in t:
+
+    # Any message with both "from" and "to" that isn't a timetable query
+    # is almost certainly a journey request ("from X to Y" in any word order).
+    if ' from ' in t and ' to ' in t:
         return True
+
+    # Destination-only journey phrases.
+    dest_phrases = [
+        'take me to', 'directions to', 'navigate to',
+        'get me to', 'need to get to', 'route to',
+        'go to', 'get to',
+    ]
+    if any(p in t for p in dest_phrases):
+        return True
+
+    # "take me from X", "directions from X to Y", "route from X to Y" etc.
+    action_phrases = [
+        'take me from', 'directions from', 'navigate from',
+        'route from', 'need to get from', 'how do i get from',
+        'how to get from', 'get from',
+    ]
+    if any(p in t for p in action_phrases):
+        return True
+
     return False
 
 
@@ -215,6 +277,23 @@ def chat():
         now = datetime.utcnow()
 
         username = session.get('username')
+
+        # Run the NLP pipeline once per request so we can:
+        # - detect journey origin/destination slots even when the text does not
+        #   obviously look like a journey query, and
+        # - reuse these slots for either the journey planner or the traffic bot.
+        nlp_result = None
+        nlp_origin = None
+        nlp_destination = None
+        try:
+            nlp_result = traffic_chatbot.nlp.process(user_message)
+            nlp_entities = nlp_result.get("entities", {}) if isinstance(nlp_result, dict) else {}
+            nlp_origin = nlp_entities.get("origin")
+            nlp_destination = nlp_entities.get("destination")
+            if nlp_origin or nlp_destination:
+                print(f"[app] NLP slots: origin={nlp_origin!r} destination={nlp_destination!r}")
+        except Exception as _nlp_err:
+            print(f"[app] NLP extraction error (non-fatal): {_nlp_err}")
 
         # 1) If we have structured journey inputs, always use the journey planner.
         if from_text and to_text:
@@ -268,9 +347,31 @@ def chat():
                 "confidence": 0.95,
             })
 
-        # 3) If the free-text clearly looks like a journey query, use the journey planner.
-        if _looks_like_journey_message(user_message):
-            jp_response = journey_chatbot.handle_message(user_message, now=now, username=username)
+        # 3) If the free-text clearly looks like a journey query OR the NLP
+        #    extractor found a journey origin/destination (even if only one of
+        #    them), route to the journey planner. The JourneyChatbot will reuse
+        #    any provided slot and ask targeted follow-up questions for the
+        #    missing side (e.g. "Where are you travelling from?" or "Where are
+        #    you travelling to?").
+        looks_like_journey = _looks_like_journey_message(user_message)
+        nlp_intent = (nlp_result or {}).get("intent") if isinstance(nlp_result, dict) else None
+        has_partial_journey_slots = bool(
+            (nlp_origin and not nlp_destination) or (nlp_destination and not nlp_origin)
+        )
+        should_use_journey_planner = bool(
+            looks_like_journey
+            or nlp_intent == "journey_planning"
+            or has_partial_journey_slots
+        )
+
+        if should_use_journey_planner:
+            jp_response = journey_chatbot.handle_message(
+                user_message,
+                now=now,
+                username=username,
+                nlp_origin=nlp_origin,
+                nlp_destination=nlp_destination,
+            )
             return jsonify({
                 "response": jp_response.get("reply", ""),
                 "journeys": jp_response.get("journeys", []),

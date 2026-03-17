@@ -2,10 +2,24 @@ Flask==3.0.0
 requests==2.31.0
 numpy==1.24.3
 scikit-learn==1.3.2
-transformers==4.35.2
+python-dotenv==1.0.0
+
+# ---- Intent classification (new: sentence-transformer + sklearn) ----
+sentence-transformers==2.2.2
+# torch is a dependency of sentence-transformers; pin if needed
 torch==2.1.1
-sentencepiece==0.1.99
-protobuf==4.25.1
-# Spark NLP for date/time extraction in journey planner (optional; requires Java/JDK 8+ at runtime)
-pyspark>=3.3.0,<3.6
-spark-nlp>=5.3.0,<6.0
+huggingface-hub==0.10.1
+
+# ---- NER: SpaCy for general entity recognition ----
+spacy==3.7.2
+# Download the model after install: python -m spacy download en_core_web_sm
+
+# ---- Date/time parsing (Microsoft Recognizers-Text) ----
+recognizers-text-suite
+emoji==1.7.0  # recognizers-text depends on UNICODE_EMOJI, removed in emoji 2.x
+
+# ---- Legacy: Hugging Face transformers (optional fallback only) ----
+# Uncomment if you want the old zero-shot classifier as a deep fallback:
+# transformers==4.35.2
+# sentencepiece==0.1.99
+# protobuf==4.25.1

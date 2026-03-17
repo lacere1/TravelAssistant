@@ -1,9 +1,12 @@
 """
 Smart Traffic Query Assistant - Main Chatbot Core
-Handles NLP processing, traffic data fetching, and ML predictions
+Handles NLP processing, traffic data fetching, and ML predictions.
+
+Updated to use FSM-based DialogStateTracker for per-user state management.
 """
 from nlp_processor import NLPProcessor
 from transport_api import TransportDataFetcher
+from dialog_state import DialogStateTracker, DialogState, DisambiguationContext, UserState
 import json
 import re
 from difflib import SequenceMatcher
@@ -14,18 +17,90 @@ class TrafficChatbot:
         """Initialize chatbot with NLP, API, and ML components"""
         self.nlp = NLPProcessor()
         self.transport_api = TransportDataFetcher()
-        # Conversation state - track ongoing context
+
+        # ---- New: FSM-based per-user dialog state tracker ----
+        # The DialogStateTracker manages per-user state with explicit FSM transitions.
+        # For backward compatibility, self.conversation_state still works as before
+        # but is now per-user (keyed by user_key in process_message).
+        self.state_tracker = DialogStateTracker(session_timeout_minutes=30)
+
+        # Per-user conversation state dicts (replaces the single global dict).
+        # Each user gets their own dict, preventing concurrent-user state corruption.
+        self._user_conversation_states: Dict[str, Dict[str, Any]] = {}
+
+        # Default conversation state for backward compat (used when no user_key)
         self.conversation_state: Dict[str, Any] = {
             'origin': None,
             'destination': None,
-            # Dialogue state for bus stop direction disambiguation (DST)
-            'timetable_disambiguation': None,  # when set: { 'options': [...], 'query': str, 'timetable_mode': str }
-            # When we asked "couldn't find a train/bus" - user can reply with just a line/route name
-            'awaiting_disruption_line': None,  # 'train' | 'bus' when waiting for follow-up line/route
+            'timetable_disambiguation': None,
+            'awaiting_disruption_line': None,
         }
-        # Per-user preference/history for disambiguation (last chosen stop, frequent stops)
-        self._user_preferences: Dict[str, Dict[str, Any]] = {}  # user_key -> { "last_chosen_stop_id", "frequent_stops": { stop_id: count } }
+
+        # Per-user preference/history for disambiguation
+        self._user_preferences: Dict[str, Dict[str, Any]] = {}
+
         print("Traffic Chatbot initialized successfully")
+
+    def reset_user(self, user_key: Optional[str] = None) -> None:
+        """
+        Reset all conversation and dialog state for a given user.
+
+        Used by the UI "new chat" action so a conversation can start from a
+        completely clean slate while still preserving long-term preferences
+        tracked inside DialogStateTracker (e.g. frequent stops).
+        """
+        key = user_key or "_anon"
+
+        # Reset FSM state (clears intents/entities and transient dialog flags).
+        if self.state_tracker.has_state(key):
+            self.state_tracker.reset_state(key)
+
+        # Reset legacy per-user conversation dict to its initial shape.
+        if key in self._user_conversation_states:
+            self._user_conversation_states[key] = {
+                'origin': None,
+                'destination': None,
+                'timetable_disambiguation': None,
+                'awaiting_disruption_line': None,
+            }
+
+        # Clear per-user disambiguation preferences (last chosen stop, frequencies).
+        if key in self._user_preferences:
+            self._user_preferences.pop(key, None)
+
+    def _get_user_conversation_state(self, user_key: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Get the conversation state dict for a specific user.
+        Creates a fresh state if the user doesn't have one yet.
+        This replaces the old global self.conversation_state with per-user state.
+        """
+        key = user_key or "_anon"
+        if key not in self._user_conversation_states:
+            self._user_conversation_states[key] = {
+                'origin': None,
+                'destination': None,
+                'timetable_disambiguation': None,
+                'awaiting_disruption_line': None,
+            }
+        return self._user_conversation_states[key]
+
+    def _get_user_state(self, user_key: Optional[str] = None) -> UserState:
+        """Get the FSM state for a user (for new code paths)."""
+        key = user_key or "_anon"
+        return self.state_tracker.get_state(key)
+
+    def _sync_fsm_from_dict(self, user_key: Optional[str] = None) -> None:
+        """Sync the FSM state from the per-user conversation dict."""
+        key = user_key or "_anon"
+        conv_state = self._get_user_conversation_state(key)
+        self.state_tracker.from_legacy_dict(key, conv_state)
+
+    def _sync_dict_from_fsm(self, user_key: Optional[str] = None) -> None:
+        """Sync the per-user conversation dict from the FSM state."""
+        key = user_key or "_anon"
+        fsm_legacy = self.state_tracker.to_legacy_dict(key)
+        conv_state = self._get_user_conversation_state(key)
+        conv_state.update(fsm_legacy)
     
     def process_message(
         self,
@@ -34,7 +109,11 @@ class TrafficChatbot:
         username: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
-        Process user message and generate response
+        Process user message and generate response.
+
+        Uses FSM-based DialogStateTracker for per-user state management.
+        The state machine determines whether we're in the middle of a
+        disambiguation flow, awaiting a disruption line, etc.
 
         Args:
             user_message: User's natural language query
@@ -44,6 +123,16 @@ class TrafficChatbot:
         Returns:
             dict: Response with message, intent, entities, and confidence
         """
+        # ---- Per-user state (replaces global self.conversation_state) ----
+        # Use per-user conversation state dict instead of the old global dict.
+        # Point self.conversation_state at this user's dict for the duration of
+        # this call, so all the existing code that reads/writes
+        # self.conversation_state works correctly per-user.
+        self.conversation_state = self._get_user_conversation_state(user_key)
+
+        # Also sync FSM state for new code paths
+        user_fsm_state = self._get_user_state(user_key)
+
         # Dialogue State Tracking: if we're waiting for bus/train disambiguation, treat this as a reply
         disamb = self.conversation_state.get('timetable_disambiguation')
         if disamb and isinstance(disamb, dict):
@@ -495,14 +584,14 @@ class TrafficChatbot:
         # A) Current conditions
         if intent == 'ask_traffic_status' or intent == 'check_current_conditions':
             return self._handle_traffic_status(entities)
-        # G) Public transport disruption + multimodal
-        elif intent == 'ask_transit_disruption' or intent == 'ask_multimodal':
+        # G) Public transport disruption
+        elif intent == 'ask_transit_disruption':
             resp = self._handle_transit_multimodal(entities, original_message)
             if isinstance(resp, dict) and 'awaiting_line' in resp:
                 self.conversation_state['awaiting_disruption_line'] = resp.pop('awaiting_line')
             return resp
         # G2) Transit timetable/times
-        elif intent == 'ask_timetable' or intent == 'ask_transit_times':
+        elif intent == 'ask_timetable':
             return self._handle_timetable(entities, user_key=user_key, original_message=original_message)
         
         # Existing intents (personalised when username is present)
@@ -510,12 +599,12 @@ class TrafficChatbot:
             primary = f"Hello{', ' + username if username else ''}! I'm your Smart Traffic Assistant."
             return {
                 'primary': primary,
-                'details': "I can help you with traffic status, delays, routes, incidents, closures, parking, and more. What would you like to know?",
+                'details': "I can help you with public transport timetables, service disruptions, and journey planning. What would you like to know?",
                 'alternatives': [],
                 'next_steps': None
             }
         elif intent == 'goodbye':
-            primary = f"Goodbye{', ' + username if username else ''}! Drive safely!"
+            primary = f"Goodbye{', ' + username if username else ''}! Safe travels!"
             return {
                 'primary': primary,
                 'details': None,
@@ -1245,19 +1334,22 @@ class TrafficChatbot:
         # Try to extract any location/route info and provide generic response
         location = entities.get('location')
         route = entities.get('route')
+        origin = entities.get('origin')
+        destination = entities.get('destination')
         
-        if location or route:
-            target = location or route
+        if location or route or origin or destination:
+            # Prefer journey-style slots for the target if present.
+            target = destination or origin or location or route
             return {
                 'primary': f"I didn't fully understand your question about {target}.",
-                'details': "Please rephrase and try asking about traffic status, delays, routes, incidents, closures, congestion, or public transport.",
+                'details': "Please rephrase and try asking about public transport timetables, service disruptions, or journey planning.",
                 'alternatives': [],
                 'next_steps': "What would you like to know about " + target + "?"
             }
         else:
             return {
                 'primary': "I didn't understand that request.",
-                'details': "Please rephrase your question. I can help with traffic status, delays, routes, incidents, closures, congestion, transit disruptions, timetables, and more.",
+                'details': "Please rephrase your question. I can help with public transport timetables, service disruptions, and journey planning.",
                 'alternatives': [],
-                'next_steps': "Try asking: 'What's the traffic like on Highway 101?' or 'Fastest route from A to B?'"
+                'next_steps': "Try asking: 'Bus times for Oxford Circus', 'Is the Northern line running?', or 'Plan a journey from Neasden to Oxford Circus.'"
             }

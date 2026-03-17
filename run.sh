@@ -1,0 +1,8 @@
+#!/bin/bash
+echo "Starting Smart Traffic Query Assistant..."
+echo ""
+echo "Installing dependencies (if needed)..."
+pip install -r requirements.txt
+echo ""
+echo "Starting Flask server..."
+python app.py
