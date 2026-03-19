@@ -16,8 +16,7 @@ import csv
 from typing import Dict, Any, List, Set, Optional, Tuple
 from difflib import SequenceMatcher
 
-from journey_slot_extractor import get_extractor as _get_journey_extractor
-
+from tfl_stop_datasets import TRAIN_LINES, load_bus_routes, load_bus_stops, load_train_stations
 
 class NERProcessor:
     """
@@ -72,90 +71,12 @@ class NERProcessor:
         """Load TfL-specific domain knowledge from CSVs."""
         if self._stops_loaded:
             return
-
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-        bus_path = os.path.join(base_dir, "bus_stops.csv")
-        train_path = os.path.join(base_dir, "train_stops.csv")
-        bus_routes_path = os.path.join(base_dir, "tfl_bus_routes.txt")
-
-        # Load bus stops
-        bus_names: List[str] = []
-        try:
-            if os.path.exists(bus_path):
-                encoding = "utf-8-sig"
-                try:
-                    with open(bus_path, newline="", encoding=encoding) as f:
-                        reader = csv.DictReader(f)
-                        for row in reader:
-                            raw_name = (row.get("CommonName") or "").strip()
-                            if raw_name:
-                                name = re.sub(r"\s*\([^)]*\)\s*$", "", raw_name).strip()
-                                if name:
-                                    bus_names.append(name)
-                except UnicodeDecodeError:
-                    with open(bus_path, newline="", encoding="cp1252") as f:
-                        reader = csv.DictReader(f)
-                        for row in reader:
-                            raw_name = (row.get("CommonName") or "").strip()
-                            if raw_name:
-                                name = re.sub(r"\s*\([^)]*\)\s*$", "", raw_name).strip()
-                                if name:
-                                    bus_names.append(name)
-        except Exception as e:
-            print(f"[NER] Failed to load bus_stops.csv: {e}")
-
-        # Load train stations
-        train_names: List[str] = []
-        try:
-            if os.path.exists(train_path):
-                def _get_station_name(row: dict) -> str:
-                    raw = (row.get("Station") or row.get("Stop") or row.get("Name") or "").strip()
-                    return re.sub(r"\s*\([^)]*\)\s*$", "", raw).strip() if raw else ""
-
-                try:
-                    with open(train_path, newline="", encoding="utf-8-sig") as f:
-                        reader = csv.DictReader(f)
-                        for row in reader:
-                            name = _get_station_name(row)
-                            if name:
-                                train_names.append(name)
-                except UnicodeDecodeError:
-                    with open(train_path, newline="", encoding="cp1252") as f:
-                        reader = csv.DictReader(f)
-                        for row in reader:
-                            name = _get_station_name(row)
-                            if name:
-                                train_names.append(name)
-                train_names = list(dict.fromkeys(train_names))
-        except Exception as e:
-            print(f"[NER] Failed to load train_stops.csv: {e}")
-
-        # Load bus route IDs
-        bus_route_ids: Set[str] = set()
-        try:
-            if os.path.exists(bus_routes_path):
-                with open(bus_routes_path, encoding="utf-8") as f:
-                    for line in f:
-                        rid = line.strip()
-                        if rid:
-                            bus_route_ids.add(rid)
-                            bus_route_ids.add(rid.upper())
-        except Exception as e:
-            print(f"[NER] Failed to load tfl_bus_routes.txt: {e}")
-
-        self._bus_stops = bus_names
-        self._train_stations = train_names
-        self._bus_routes = bus_route_ids
-
-        # London Underground, Overground, and DLR line names
-        self._train_lines = [
-            "Bakerloo", "Central", "Circle", "District",
-            "Hammersmith & City", "Jubilee", "Metropolitan",
-            "Northern", "Piccadilly", "Victoria", "Waterloo & City",
-            "London Overground", "Windrush", "Lioness", "Mildmay",
-            "Suffragette", "Weaver", "Liberty",
-            "DLR", "Docklands Light Railway", "Elizabeth",
-        ]
+        # These domain lists are loaded from a dedicated dataset module so that
+        # `NERProcessor` can be treated as a fallback component.
+        self._bus_stops = load_bus_stops()
+        self._train_stations = load_train_stations()
+        self._bus_routes = load_bus_routes()
+        self._train_lines = list(TRAIN_LINES)
 
         self._stops_loaded = True
         print(
@@ -193,82 +114,10 @@ class NERProcessor:
         if spacy_entities:
             entities.update(spacy_entities)
 
-        # ---- Phase 2: Journey origin/destination via rule-based slot extractor ----
-        # JourneySlotExtractor uses ordered grammar rules (from X to Y, to Y from X,
-        # between X and Y, leaving from X, arriving at Y, etc.) and optionally
-        # grounds results via Google Places API.
-        #
-        # We apply an additional filter so that origin/destination phrases never
-        # start with verbs or pronouns and do not contain internal verbs (to avoid
-        # extracting control phrases like "plan a journey" as destinations).
-        try:
-            journey_extractor = _get_journey_extractor()
-            if journey_extractor.ready:
-                slots = journey_extractor.extract_journey_slots(text)
+        # Journey origin/destination etc. come from the LLM when available;
+        # this path only runs when the LLM is unavailable (see nlp_processor.process).
 
-                def _slot_is_valid_place_phrase(phrase: Optional[str]) -> bool:
-                    """
-                    Return True if *phrase* looks like a place name rather than a control phrase.
-                    Rules:
-                      - if it starts with a verb or pronoun → reject
-                      - if it contains any verb (non-initial) → reject (checked via SpaCy POS when available)
-                    """
-                    if not phrase:
-                        return False
-                    raw = phrase.strip()
-                    if not raw:
-                        return False
-                    first_word = raw.split()[0].lower().strip(" '\"“”‘’(),.")
-                    bad_starts = {
-                        # Pronouns / determiners
-                        "i", "i'm", "im", "me", "you", "we", "they", "he", "she", "it",
-                        "my", "your", "our", "their", "his", "her", "its",
-                        "this", "that", "these", "those",
-                        # Common journey verbs
-                        "go", "going", "get", "getting", "take", "taking",
-                        "plan", "planning", "travel", "travelling", "traveling",
-                        "leave", "leaving", "depart", "departing",
-                        "start", "starting", "head", "heading", "navigate",
-                        "navigating", "walk", "walking", "drive", "driving",
-                        "catch", "catching", "need", "needing", "want", "wanting",
-                        "know", "see", "make", "do", "be", "have",
-                    }
-                    if first_word in bad_starts:
-                        return False
-
-                    # Use SpaCy POS tagging when available to detect internal verbs.
-                    if self._spacy_available and self._spacy_nlp is not None:
-                        try:
-                            doc = self._spacy_nlp(raw)
-                            for i, token in enumerate(doc):
-                                # If the first token is VERB/AUX/PRON, we already rejected via bad_starts.
-                                if i == 0:
-                                    continue
-                                if token.pos_ in ("VERB", "AUX"):
-                                    return False
-                        except Exception:
-                            # Fall back silently if SpaCy fails.
-                            pass
-
-                    return True
-
-                origin = slots.get("origin")
-                if origin and _slot_is_valid_place_phrase(origin):
-                    entities["origin"] = origin
-                    # If Places grounding resolved a canonical name, expose it too
-                    if slots.get("origin_grounded"):
-                        entities["origin_grounded"] = slots["origin_grounded"]
-
-                destination = slots.get("destination")
-                if destination and _slot_is_valid_place_phrase(destination):
-                    entities["destination"] = destination
-                    if slots.get("destination_grounded"):
-                        entities["destination_grounded"] = slots["destination_grounded"]
-
-        except Exception as exc:
-            print(f"[NER] Journey slot extraction error: {exc}")
-
-        # ---- Phase 3: Domain-specific regex ----
+        # ---- Phase 2: Domain-specific regex ----
         domain_entities = self._extract_domain_entities(text, text_lower)
         # Domain entities take precedence for domain-specific fields
         for key, value in domain_entities.items():
@@ -278,7 +127,7 @@ class NERProcessor:
             ):
                 entities[key] = value
 
-        # ---- Phase 3: Reconcile SpaCy + regex locations ----
+        # ---- Reconcile SpaCy + regex locations ----
         self._reconcile_locations(entities, text_lower)
 
         return entities
@@ -379,11 +228,9 @@ class NERProcessor:
             entities["road"] = road_match.group(1).strip()
 
         # ---- Origin and destination ----
-        # Handled by the JourneySlotExtractor (Phase 2) which uses
-        # preposition-context extraction.  The old regex here was too
-        # aggressive (e.g. "want to plan" → origin="want", dest="plan")
-        # so it has been removed to avoid overwriting correct Phase-2
-        # results with garbage.
+        # Journey origin/destination extraction is now handled exclusively
+        # by the LLM-based extractor (llm_entity_extractor.py).
+        # No rule-based extraction is performed here.
 
         # ---- Time expressions ----
         time_patterns = [

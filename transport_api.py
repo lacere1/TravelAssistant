@@ -1625,7 +1625,14 @@ class TransportDataFetcher:
         return None
     
     def get_transit_route(self, origin: str, destination: str) -> Optional[Dict[str, Any]]:
-        """Get public transport route between origin and destination"""
+        """
+        Get public transport route between origin and destination.
+
+        Returns:
+            dict with journey data, or
+            dict with 'disambiguation_needed' key if TfL needs disambiguation, or
+            None if no data available.
+        """
         if self.has_tfl:
             try:
                 journey = self._fetch_tfl_journey(origin, destination)
@@ -1633,7 +1640,7 @@ class TransportDataFetcher:
                     return journey
             except Exception as e:
                 print(f"Error fetching transit route: {e}")
-        
+
         # No API data available - return None instead of mock data
         return None
     
@@ -1954,28 +1961,49 @@ class TransportDataFetcher:
             response.raise_for_status()
             data = response.json()
             
-            # Handle disambiguation - API may return multiple options for start/end points
-            # Check if we need to disambiguate (fromJourney and toJourney contain multiple options)
+            # Handle disambiguation - API may return multiple options for start/end points.
+            # Instead of silently picking the first option (which loses user intent),
+            # return disambiguation info so the caller can present options to the user.
             if 'fromLocationDisambiguation' in data or 'toLocationDisambiguation' in data:
-                # If disambiguation needed, use first option or return disambiguation info
-                if 'fromLocationDisambiguation' in data:
-                    disambiguation_options = data['fromLocationDisambiguation'].get('disambiguationOptions', [])
-                    if disambiguation_options:
-                        # Use first option's identifier
-                        origin_encoded = quote(disambiguation_options[0].get('parameterValue', origin), safe='')
-                        url = f"{self.tfl_base_url}/Journey/JourneyResults/{origin_encoded}/to/{destination_encoded}"
-                        response = requests.get(url, params=params, timeout=10)
-                        response.raise_for_status()
-                        data = response.json()
-                
+                from_disamb = data.get('fromLocationDisambiguation', {})
+                to_disamb = data.get('toLocationDisambiguation', {})
+                from_options = from_disamb.get('disambiguationOptions', [])
+                to_options = to_disamb.get('disambiguationOptions', [])
+
+                # Only auto-pick if there's exactly one option (no real ambiguity)
+                if len(from_options) == 1:
+                    origin_encoded = quote(from_options[0].get('parameterValue', origin), safe='')
+                    url = f"{self.tfl_base_url}/Journey/JourneyResults/{origin_encoded}/to/{destination_encoded}"
+                    response = requests.get(url, params=params, timeout=10)
+                    response.raise_for_status()
+                    data = response.json()
+                elif len(from_options) > 1:
+                    # Return disambiguation needed — don't silently pick
+                    print(f"[TransportAPI] Journey origin '{origin}' needs disambiguation ({len(from_options)} options)")
+                    return {
+                        'disambiguation_needed': True,
+                        'direction': 'from',
+                        'query': origin,
+                        'options': from_options,
+                    }
+
                 if 'toLocationDisambiguation' in data:
-                    disambiguation_options = data['toLocationDisambiguation'].get('disambiguationOptions', [])
-                    if disambiguation_options:
-                        destination_encoded = quote(disambiguation_options[0].get('parameterValue', destination), safe='')
+                    to_disamb = data.get('toLocationDisambiguation', {})
+                    to_options = to_disamb.get('disambiguationOptions', [])
+                    if len(to_options) == 1:
+                        destination_encoded = quote(to_options[0].get('parameterValue', destination), safe='')
                         url = f"{self.tfl_base_url}/Journey/JourneyResults/{origin_encoded}/to/{destination_encoded}"
                         response = requests.get(url, params=params, timeout=10)
                         response.raise_for_status()
                         data = response.json()
+                    elif len(to_options) > 1:
+                        print(f"[TransportAPI] Journey destination '{destination}' needs disambiguation ({len(to_options)} options)")
+                        return {
+                            'disambiguation_needed': True,
+                            'direction': 'to',
+                            'query': destination,
+                            'options': to_options,
+                        }
             
             if 'journeys' in data and len(data['journeys']) > 0:
                 journey = data['journeys'][0]
@@ -2071,5 +2099,507 @@ class TransportDataFetcher:
         except Exception as e:
             print(f"Error fetching Google directions: {e}")
             return None
-    
-    
+
+    # ------------------------------------------------------------------
+    # Towards-location resolution
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _target_tokens(target_location: str) -> List[str]:
+        """
+        Tokenise a target location string into significant lowercase words,
+        dropping common noise words so "towards Kingsbury Road" → ["kingsbury"].
+        """
+        _NOISE = {
+            "stop", "station", "road", "street", "lane", "avenue", "way",
+            "hill", "park", "green", "town", "centre", "center", "gate",
+            "bridge", "square", "the", "a", "an", "at", "in", "on", "to",
+            "from", "near", "towards", "for", "of", "bus", "route",
+        }
+        words = re.findall(r"[a-zA-Z0-9]+", target_location.lower())
+        return [w for w in words if len(w) >= 3 and w not in _NOISE]
+
+    @staticmethod
+    def _text_contains_target(text: str, target_tokens: List[str]) -> bool:
+        """Return True if *all* target tokens appear in text (case-insensitive)."""
+        if not target_tokens or not text:
+            return False
+        text_lower = text.lower()
+        return all(tok in text_lower for tok in target_tokens)
+
+    def _check_route_sequence(
+        self,
+        stop_id: str,
+        line_id: str,
+        target_tokens: List[str],
+    ) -> bool:
+        """
+        Fetch the outbound *and* inbound stop sequences for `line_id` and
+        return True if `target_tokens` appear in a stop that comes *after*
+        `stop_id` on any branch in either direction.
+
+        Uses /Line/{lineId}/Route/Sequence/{direction}.
+        """
+        for direction in ("outbound", "inbound"):
+            url = f"{self.tfl_base_url}/Line/{line_id}/Route/Sequence/{direction}"
+            try:
+                resp = requests.get(url, params=self._tfl_params(), timeout=8)
+                if resp.status_code != 200:
+                    continue
+                data = resp.json()
+            except Exception as exc:
+                print(f"[towards] route sequence fetch failed ({line_id}/{direction}): {exc}")
+                continue
+
+            # Each sequence may have multiple branches (stopPointSequences)
+            for branch in data.get("stopPointSequences", []):
+                stops = branch.get("stopPoint", [])
+                # Find the index of our stop in this branch
+                stop_index = None
+                for i, sp in enumerate(stops):
+                    if sp.get("id") == stop_id or sp.get("stationId") == stop_id:
+                        stop_index = i
+                        break
+                if stop_index is None:
+                    # Also try matching on topMostParentId (for grouped stops)
+                    for i, sp in enumerate(stops):
+                        if sp.get("topMostParentId") == stop_id:
+                            stop_index = i
+                            break
+                if stop_index is None:
+                    continue
+
+                # Check all stops that come AFTER this stop on this branch
+                for sp in stops[stop_index + 1:]:
+                    name = sp.get("name", "")
+                    if self._text_contains_target(name, target_tokens):
+                        return True
+
+        return False
+
+    def get_stop_travel_bearing(self, stop_id: str) -> Optional[float]:
+        """
+        Return the compass bearing (0-360, 0 = N) that buses depart from
+        *stop_id* by inspecting the route sequence of the first bus line
+        that serves the stop.
+
+        Strategy (2 API calls total):
+        1. GET /StopPoint/{stop_id} → extract the first bus line ID
+        2. GET /Line/{lineId}/Route/Sequence/outbound (or inbound)
+           → find stop_id in the sequence, get the *next* stop's lat/lon
+           → compute bearing from stop_id to next stop
+
+        Returns None if we can't determine the bearing.
+        """
+        import math
+
+        if not self.has_tfl or not stop_id:
+            return None
+
+        # Step 1: get line IDs that serve this stop
+        line_ids: List[str] = []
+        stop_lat: Optional[float] = None
+        stop_lon: Optional[float] = None
+        try:
+            info_url = f"{self.tfl_base_url}/StopPoint/{stop_id}"
+            resp = requests.get(info_url, params=self._tfl_params(), timeout=8)
+            if resp.status_code == 200:
+                info = resp.json()
+                stop_lat = info.get("lat")
+                stop_lon = info.get("lon")
+                for line in info.get("lines", []):
+                    lid = line.get("id", "")
+                    if lid:
+                        line_ids.append(lid)
+        except Exception as exc:
+            print(f"[travel-bearing] stop info failed ({stop_id}): {exc}")
+            return None
+
+        if not line_ids:
+            return None
+
+        # Step 2: fetch route sequence and find the next stop
+        for line_id in line_ids[:3]:  # try up to 3 lines
+            for direction in ("outbound", "inbound"):
+                try:
+                    url = f"{self.tfl_base_url}/Line/{line_id}/Route/Sequence/{direction}"
+                    resp = requests.get(url, params=self._tfl_params(), timeout=8)
+                    if resp.status_code != 200:
+                        continue
+                    data = resp.json()
+                except Exception:
+                    continue
+
+                for branch in data.get("stopPointSequences", []):
+                    stops = branch.get("stopPoint", [])
+                    # Find our stop
+                    stop_index = None
+                    for i, sp in enumerate(stops):
+                        if (sp.get("id") == stop_id
+                                or sp.get("stationId") == stop_id
+                                or sp.get("topMostParentId") == stop_id):
+                            stop_index = i
+                            break
+                    if stop_index is None:
+                        continue
+
+                    # Get the next stop (skip if we're the last stop)
+                    if stop_index + 1 >= len(stops):
+                        continue
+                    next_sp = stops[stop_index + 1]
+                    next_lat = next_sp.get("lat")
+                    next_lon = next_sp.get("lon")
+                    if next_lat is None or next_lon is None:
+                        continue
+
+                    # Use our stop's coords from the sequence if available,
+                    # otherwise fall back to the coords from step 1
+                    cur_lat = stops[stop_index].get("lat") or stop_lat
+                    cur_lon = stops[stop_index].get("lon") or stop_lon
+                    if cur_lat is None or cur_lon is None:
+                        continue
+
+                    # Compute bearing
+                    lat1 = math.radians(float(cur_lat))
+                    lat2 = math.radians(float(next_lat))
+                    d_lon = math.radians(float(next_lon) - float(cur_lon))
+                    x = math.sin(d_lon) * math.cos(lat2)
+                    y = (math.cos(lat1) * math.sin(lat2)
+                         - math.sin(lat1) * math.cos(lat2) * math.cos(d_lon))
+                    bearing = (math.degrees(math.atan2(x, y)) + 360) % 360
+
+                    print(
+                        f"[travel-bearing] {stop_id} on line {line_id}/{direction}: "
+                        f"bearing={bearing:.0f}° (next stop: {next_sp.get('name', '?')})"
+                    )
+                    return bearing
+
+        return None
+
+    def get_stops_towards_location(
+        self,
+        stop_ids: List[str],
+        target_location: str,
+        use_route_sequence_fallback: bool = True,
+    ) -> Dict[str, Dict]:
+        """
+        For each candidate bus stop ID determine whether buses at that stop
+        travel towards `target_location`.
+
+        Two-tier strategy
+        -----------------
+        Tier 1 – live arrivals  (fast, ~1 API call per stop)
+            Fetch /StopPoint/{id}/Arrivals.  Each prediction carries a
+            ``towards`` headsign and a ``destinationName``.  If all target
+            tokens appear in either field the stop is a match.
+
+        Tier 2 – route sequence  (thorough, used when arrivals are absent)
+            Fetch /Line/{lineId}/Route/Sequence/{direction} for each bus line
+            that serves the stop.  Walk the ordered stop list; if a stop
+            *downstream* from the candidate contains the target the line (and
+            therefore this stop in this direction) goes towards the target.
+
+        Parameters
+        ----------
+        stop_ids : list of TfL StopPoint IDs to test (leaf or group IDs).
+        target_location : free-text location the user wants to go towards
+                          (e.g. "Kingsbury", "Burnt Oak", "Wembley").
+        use_route_sequence_fallback : set False to skip Tier 2 (saves API
+                          calls when speed matters more than completeness).
+
+        Returns
+        -------
+        Dict keyed by stop_id::
+
+            {
+              "490004733BE": {
+                  "matches":        True,
+                  "method":         "arrivals",      # or "route_sequence"
+                  "matching_lines": [
+                      {"line": "83", "towards": "Stanmore", "destination": "Stanmore"}
+                  ],
+              },
+              "490004733BL": {
+                  "matches":        False,
+                  "method":         "arrivals",
+                  "matching_lines": [],
+              },
+            }
+        """
+        if not self.has_tfl or not stop_ids or not target_location:
+            return {}
+
+        target_tokens = self._target_tokens(target_location)
+        if not target_tokens:
+            print(f"[towards] no significant tokens in target '{target_location}'")
+            return {}
+
+        print(f"[towards] resolving towards='{target_location}' tokens={target_tokens} "
+              f"for {len(stop_ids)} stop(s)")
+
+        results: Dict[str, Dict] = {}
+
+        for stop_id in stop_ids:
+            result: Dict = {
+                "matches": False,
+                "method": None,
+                "matching_lines": [],
+            }
+
+            # ---- Tier 1: live arrivals ----------------------------------------
+            leaf_ids = self._expand_to_leaf_bus_stops(stop_id)
+            all_arrivals: List[Dict] = []
+            for leaf_id in leaf_ids:
+                try:
+                    arr_url = f"{self.tfl_base_url}/StopPoint/{leaf_id}/Arrivals"
+                    resp = requests.get(arr_url, params=self._tfl_params(), timeout=8)
+                    if resp.status_code == 200:
+                        all_arrivals.extend(resp.json() or [])
+                except Exception as exc:
+                    print(f"[towards] arrivals fetch failed ({leaf_id}): {exc}")
+
+            # Filter to bus/coach only
+            bus_arrivals = [
+                a for a in all_arrivals
+                if a.get("modeName", "").lower() in ("bus", "coach")
+            ]
+
+            if bus_arrivals:
+                result["method"] = "arrivals"
+                seen_lines: set = set()
+                for arr in bus_arrivals:
+                    towards_text = arr.get("towards", "") or ""
+                    dest_text = arr.get("destinationName", "") or ""
+                    line_name = arr.get("lineName", arr.get("lineId", "?"))
+                    if self._text_contains_target(towards_text, target_tokens) or \
+                       self._text_contains_target(dest_text, target_tokens):
+                        key = (line_name, towards_text, dest_text)
+                        if key not in seen_lines:
+                            seen_lines.add(key)
+                            result["matching_lines"].append({
+                                "line":        line_name,
+                                "towards":     towards_text,
+                                "destination": dest_text,
+                            })
+                result["matches"] = len(result["matching_lines"]) > 0
+
+            # ---- Tier 2: route sequence (when no arrivals or no match yet) ------
+            if not result["matches"] and use_route_sequence_fallback:
+                # Collect the line IDs that serve this stop from stop detail
+                line_ids: List[str] = []
+                try:
+                    info_url = f"{self.tfl_base_url}/StopPoint/{stop_id}"
+                    info_resp = requests.get(info_url, params=self._tfl_params(), timeout=8)
+                    if info_resp.status_code == 200:
+                        stop_info = info_resp.json()
+                        for line in stop_info.get("lines", []):
+                            lid = line.get("id", "")
+                            if lid and lid not in line_ids:
+                                line_ids.append(lid)
+                except Exception as exc:
+                    print(f"[towards] stop info fetch failed ({stop_id}): {exc}")
+
+                if not line_ids and bus_arrivals:
+                    # Fall back to line IDs seen in arrivals
+                    line_ids = list({
+                        a.get("lineId", "") for a in bus_arrivals
+                        if a.get("lineId")
+                    })
+
+                if line_ids:
+                    result["method"] = result["method"] or "route_sequence"
+                    for line_id in line_ids:
+                        if self._check_route_sequence(stop_id, line_id, target_tokens):
+                            result["matches"] = True
+                            result["method"] = "route_sequence"
+                            result["matching_lines"].append({
+                                "line":        line_id,
+                                "towards":     target_location,
+                                "destination": target_location,
+                                "via_sequence": True,
+                            })
+                            # One confirming line is enough — keep checking for
+                            # completeness but don't duplicate the same line.
+
+            results[stop_id] = result
+            print(f"[towards] stop={stop_id} matches={result['matches']} "
+                  f"method={result['method']} lines={[m['line'] for m in result['matching_lines']]}")
+
+        return results
+
+    # ------------------------------------------------------------------ #
+    #  Train / Tube  "towards" resolution                                  #
+    # ------------------------------------------------------------------ #
+
+    _TRAIN_MODES: frozenset = frozenset({
+        "tube", "train", "dlr", "overground", "tram",
+        "national-rail", "elizabeth-line",
+    })
+
+    def get_train_stops_towards_location(
+        self,
+        stop_ids: List[str],
+        target_location: str,
+        use_route_sequence_fallback: bool = True,
+    ) -> Dict[str, Dict]:
+        """
+        For each candidate train/tube station ID determine whether trains
+        at that station travel towards `target_location`.
+
+        Mirrors ``get_stops_towards_location`` but operates on train/tube
+        arrivals rather than bus arrivals.
+
+        Two-tier strategy
+        -----------------
+        Tier 1 – live arrivals  (fast)
+            Fetch /StopPoint/{id}/Arrivals.  Each prediction carries a
+            ``destinationName``.  If all target tokens appear in that field
+            the station is a match.
+
+        Tier 2 – route sequence  (thorough, quiet-hours fallback)
+            Fetch /Line/{lineId}/Route/Sequence/{direction} for each line
+            that serves the station.  Walk the ordered stop list; if a stop
+            *downstream* from the candidate contains the target tokens the
+            line goes towards the target.
+
+        Parameters
+        ----------
+        stop_ids : list of TfL StopPoint IDs to test (tube/train station IDs
+                   such as ``940GZZLUEUS`` or hub IDs such as ``HUBEUS``).
+        target_location : free-text destination the user wants to travel
+                          towards (e.g. "Watford", "Brighton", "Stratford").
+        use_route_sequence_fallback : set False to skip Tier 2.
+
+        Returns
+        -------
+        Dict keyed by stop_id, same schema as ``get_stops_towards_location``::
+
+            {
+              "940GZZLUKSX": {
+                  "matches":        True,
+                  "method":         "arrivals",
+                  "matching_lines": [
+                      {"line": "northern", "towards": "", "destination": "Morden"}
+                  ],
+              },
+            }
+        """
+        if not self.has_tfl or not stop_ids or not target_location:
+            return {}
+
+        target_tokens = self._target_tokens(target_location)
+        if not target_tokens:
+            print(f"[towards-train] no significant tokens in target '{target_location}'")
+            return {}
+
+        print(
+            f"[towards-train] resolving towards='{target_location}' "
+            f"tokens={target_tokens} for {len(stop_ids)} station(s)"
+        )
+
+        results: Dict[str, Dict] = {}
+
+        for stop_id in stop_ids:
+            result: Dict = {
+                "matches": False,
+                "method": None,
+                "matching_lines": [],
+            }
+
+            # ---- Tier 1: live arrivals ----------------------------------------
+            # For hub IDs (HUBXXX), expand to train-mode child stop points first.
+            arrival_ids: List[str] = [stop_id]
+            if stop_id.upper().startswith("HUB"):
+                try:
+                    info_url = f"{self.tfl_base_url}/StopPoint/{stop_id}"
+                    resp = requests.get(info_url, params=self._tfl_params(), timeout=5)
+                    if resp.status_code == 200:
+                        info = resp.json()
+                        train_children = [
+                            c.get("id")
+                            for c in (info.get("children") or [])
+                            if c.get("id") and any(
+                                m in (c.get("modes") or [])
+                                for m in self._TRAIN_MODES
+                            )
+                        ]
+                        if train_children:
+                            arrival_ids = train_children
+                except Exception as exc:
+                    print(f"[towards-train] hub expansion failed ({stop_id}): {exc}")
+
+            all_arrivals: List[Dict] = []
+            for aid in arrival_ids:
+                try:
+                    arr_url = f"{self.tfl_base_url}/StopPoint/{aid}/Arrivals"
+                    resp = requests.get(arr_url, params=self._tfl_params(), timeout=8)
+                    if resp.status_code == 200:
+                        all_arrivals.extend(resp.json() or [])
+                except Exception as exc:
+                    print(f"[towards-train] arrivals fetch failed ({aid}): {exc}")
+
+            # Keep only train/tube arrivals
+            train_arrivals = [
+                a for a in all_arrivals
+                if a.get("modeName", "").lower() in self._TRAIN_MODES
+            ]
+
+            if train_arrivals:
+                result["method"] = "arrivals"
+                seen_lines: set = set()
+                for arr in train_arrivals:
+                    dest_text = arr.get("destinationName", "") or ""
+                    line_name = arr.get("lineName", arr.get("lineId", "?"))
+                    if self._text_contains_target(dest_text, target_tokens):
+                        key = (line_name, dest_text)
+                        if key not in seen_lines:
+                            seen_lines.add(key)
+                            result["matching_lines"].append({
+                                "line":        line_name,
+                                "towards":     dest_text,
+                                "destination": dest_text,
+                            })
+                result["matches"] = len(result["matching_lines"]) > 0
+
+            # ---- Tier 2: route sequence (when arrivals absent or no match) ----
+            if not result["matches"] and use_route_sequence_fallback:
+                line_ids: List[str] = []
+                try:
+                    info_url = f"{self.tfl_base_url}/StopPoint/{stop_id}"
+                    info_resp = requests.get(info_url, params=self._tfl_params(), timeout=8)
+                    if info_resp.status_code == 200:
+                        stop_info = info_resp.json()
+                        for line in stop_info.get("lines", []):
+                            lid = line.get("id", "")
+                            if lid and lid not in line_ids:
+                                line_ids.append(lid)
+                except Exception as exc:
+                    print(f"[towards-train] stop info fetch failed ({stop_id}): {exc}")
+
+                # Fall back to line IDs seen in arrivals if stop-info failed
+                if not line_ids and train_arrivals:
+                    line_ids = list({
+                        a.get("lineId", "") for a in train_arrivals if a.get("lineId")
+                    })
+
+                if line_ids:
+                    result["method"] = result["method"] or "route_sequence"
+                    for line_id in line_ids:
+                        if self._check_route_sequence(stop_id, line_id, target_tokens):
+                            result["matches"] = True
+                            result["method"] = "route_sequence"
+                            result["matching_lines"].append({
+                                "line":        line_id,
+                                "towards":     target_location,
+                                "destination": target_location,
+                                "via_sequence": True,
+                            })
+
+            results[stop_id] = result
+            print(
+                f"[towards-train] stop={stop_id} matches={result['matches']} "
+                f"method={result['method']} "
+                f"lines={[m['line'] for m in result['matching_lines']]}"
+            )
+
+        return results

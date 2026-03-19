@@ -7,6 +7,16 @@ Updated to use FSM-based DialogStateTracker for per-user state management.
 from nlp_processor import NLPProcessor
 from transport_api import TransportDataFetcher
 from dialog_state import DialogStateTracker, DialogState, DisambiguationContext, UserState
+from disambiguation_engine import (
+    DisambiguationEngine,
+    DisambiguationCandidate,
+    SpatialAnchor,
+    UserContext,
+    candidates_from_tfl_matches,
+    anchor_from_places,
+    get_disambiguation_engine,
+)
+from places_grounder import get_grounder
 import json
 import re
 from difflib import SequenceMatcher
@@ -143,6 +153,8 @@ class TrafficChatbot:
             if intent == 'cancel':
                 mode_text = 'train' if disamb.get('timetable_mode') == 'train' else 'bus'
                 self.conversation_state['timetable_disambiguation'] = None
+                # FSM transition: cancel disambiguation, return to idle
+                self.state_tracker.finish_processing(user_key or "_anon")
                 response_message = {
                     'primary': "No problem.",
                     'details': None,
@@ -161,6 +173,8 @@ class TrafficChatbot:
                 # User chose an option; either fetch timetable by stop (bus/train station) or filter by direction (train platform/direction)
                 is_train_direction = disamb.get('train_direction_disambiguation') is True
                 self.conversation_state['timetable_disambiguation'] = None
+                # FSM transition: resolve disambiguation
+                self.state_tracker.resolve_disambiguation(user_key or "_anon", selected.get('id', ''))
                 timetable_mode = disamb.get('timetable_mode', 'bus')
                 if is_train_direction:
                     # Filter existing timetable data by chosen direction; no re-fetch
@@ -337,9 +351,14 @@ class TrafficChatbot:
                 continue
             if towards in text:
                 return opt
-            # One significant word from towards (e.g. "willesden" from "Willesden Bus Garage")
+            # Match significant words from towards, but require the word to be
+            # distinctive (≥5 chars) AND not be a common location/query word.
+            # This prevents "bank" matching as a towards direction when the user
+            # is asking about "Bank station".
+            _towards_ignore = {'stop', 'station', 'road', 'street', 'lane', 'avenue',
+                               'park', 'hill', 'green', 'town', 'centre', 'gate', 'bridge'}
             for word in towards.split():
-                if len(word) >= 4 and word in text:  # avoid "to", "the"
+                if len(word) >= 5 and word not in _towards_ignore and re.search(r'\b' + re.escape(word) + r'\b', text_norm):
                     return opt
 
         # 2b) Match by train direction (northbound, southbound, eastbound, westbound, clockwise, anticlockwise)
@@ -364,6 +383,9 @@ class TrafficChatbot:
                 return opt
 
         # 3) Match by option number anywhere: "1", "first", "one", "option 1", "number 2", "2nd" (word-boundary)
+        # Guard: skip numeric matching if the message contains time patterns (e.g. "3pm", "5:30")
+        # to prevent "bus times at 3pm" from selecting option 3.
+        _has_time_pattern = bool(re.search(r'\d+\s*(am|pm|:\d{2})', text, re.IGNORECASE))
         number_phrases = [
             (1, r'\b(1|one|first|1st)\b'),
             (2, r'\b(2|two|second|2nd)\b'),
@@ -376,9 +398,10 @@ class TrafficChatbot:
             (9, r'\b(9|nine|ninth|9th)\b'),
             (10, r'\b(10|ten|tenth|10th)\b'),
         ]
-        for idx, pattern in number_phrases:
-            if idx <= len(options) and re.search(pattern, text_norm):
-                return options[idx - 1]
+        if not _has_time_pattern:
+            for idx, pattern in number_phrases:
+                if idx <= len(options) and re.search(pattern, text_norm):
+                    return options[idx - 1]
         if re.search(r'\boption\s*1\b', text_norm) and len(options) >= 1:
             return options[0]
         if re.search(r'\boption\s*2\b', text_norm) and len(options) >= 2:
@@ -387,10 +410,11 @@ class TrafficChatbot:
             return options[0]
         if re.search(r'\bnumber\s*2\b', text_norm) and len(options) >= 2:
             return options[1]
-        # Standalone digit 1-10
-        for idx in range(1, min(11, len(options) + 1)):
-            if re.search(r'\b' + str(idx) + r'\b', text_norm):
-                return options[idx - 1]
+        # Standalone digit 1-10 (skip if message contains time patterns)
+        if not _has_time_pattern:
+            for idx in range(1, min(11, len(options) + 1)):
+                if re.search(r'\b' + str(idx) + r'\b', text_norm):
+                    return options[idx - 1]
 
         # 4) Match by station/stop name (for train disambiguation; bus may also match)
         for opt in options:
@@ -486,6 +510,273 @@ class TrafficChatbot:
             return (first, -count)
 
         return sorted(options, key=sort_key)
+
+    def _build_timetable_spatial_anchor(
+        self, query: str, entities: Dict[str, Any]
+    ) -> Optional[SpatialAnchor]:
+        """
+        Build a SpatialAnchor for timetable disambiguation from LLM-extracted entities.
+
+        Only builds an anchor when the user has explicitly provided geographic context
+        via the near_area entity (e.g. "bus times at Lavender Avenue in Kingsbury").
+
+        near_area and towards are intentionally kept separate (for bus AND train):
+          - near_area  = where the stop IS (area/neighbourhood context for disambiguation)
+          - towards    = where the bus is GOING (direction/destination, used for label
+                         matching in _resolve_disambiguation_reply, not for geo-filtering)
+
+        Grounding the query itself as a fallback is deliberately excluded: when there
+        is no near_area the query is the ambiguous thing being resolved, so pinning it
+        to one Google Places result would silently bias disambiguation against stops in
+        other parts of London that share the same street name.
+        """
+        grounder = get_grounder()
+        if not grounder.available:
+            return None
+
+        # Only anchor on near_area — an explicit area context provided by the user
+        near_area = entities.get('near_area')
+        if near_area:
+            places_result = grounder.ground(near_area)
+            anchor = anchor_from_places(places_result, source="near_area")
+            if anchor:
+                print(f"[Chatbot] Spatial anchor from near_area='{near_area}': ({anchor.lat}, {anchor.lng})")
+                return anchor
+
+        # No near_area → no anchor; let the scoring stage rank without geo-filtering
+        return None
+
+    # ------------------------------------------------------------------
+    #  Coordinate-based platform direction resolution
+    # ------------------------------------------------------------------
+
+    # Compass angles for each TfL direction label
+    _DIRECTION_ANGLES: Dict[str, float] = {
+        "Northbound": 0.0,
+        "Eastbound": 90.0,
+        "Southbound": 180.0,
+        "Westbound": 270.0,
+    }
+
+    def _direction_from_towards_coordinates(
+        self,
+        towards_target: str,
+        timetable_data: Dict[str, Any],
+        meaningful_directions: list,
+    ) -> Optional[str]:
+        """
+        Geocode *towards_target* and pick the closest available platform
+        direction based on compass bearing from the current station.
+
+        This is the fallback used when no train at the station has the
+        target in its destination name (e.g. user says "towards Euston" at
+        Wembley Park, but no Metropolitan/Jubilee train lists Euston as a
+        destination — Euston is ESE so we pick the closest available
+        direction: Southbound).
+        """
+        import math
+
+        grounder = get_grounder()
+        if not grounder or not grounder.available:
+            return None
+
+        station_lat = timetable_data.get('stop_lat')
+        station_lon = timetable_data.get('stop_lon')
+        if station_lat is None or station_lon is None:
+            return None
+
+        places_result = grounder.ground(towards_target)
+        if not places_result:
+            return None
+        target_lat = places_result.get('lat')
+        target_lon = places_result.get('lng')
+        if target_lat is None or target_lon is None:
+            return None
+
+        # Compute bearing from station to target
+        lat1 = math.radians(float(station_lat))
+        lat2 = math.radians(float(target_lat))
+        d_lon = math.radians(float(target_lon) - float(station_lon))
+        x = math.sin(d_lon) * math.cos(lat2)
+        y = (math.cos(lat1) * math.sin(lat2)
+             - math.sin(lat1) * math.cos(lat2) * math.cos(d_lon))
+        bearing = (math.degrees(math.atan2(x, y)) + 360) % 360
+
+        print(
+            f"[Chatbot] towards coord fallback: '{towards_target}' bearing={bearing:.0f}° "
+            f"from station ({station_lat}, {station_lon})"
+        )
+
+        # Find the closest available cardinal direction.
+        # Clockwise/Anticlockwise (Circle line) can't be mapped from
+        # compass bearing, so skip those.
+        best_direction = None
+        best_delta = 999.0
+        for direction in meaningful_directions:
+            angle = self._DIRECTION_ANGLES.get(direction)
+            if angle is None:
+                continue  # skip Clockwise/Anticlockwise
+            # Angular distance (0-180)
+            delta = abs(bearing - angle)
+            if delta > 180:
+                delta = 360 - delta
+            if delta < best_delta:
+                best_delta = delta
+                best_direction = direction
+
+        if best_direction and best_delta <= 135:
+            # 135° threshold: pick the closest direction as long as the
+            # target isn't almost perpendicular to every available axis.
+            print(
+                f"[Chatbot] → auto-selected direction '{best_direction}' "
+                f"(coordinate fallback, delta={best_delta:.0f}°)"
+            )
+            return best_direction
+
+        return None
+
+    def _bus_stop_towards_by_bearing(
+        self,
+        towards_target: str,
+        candidates,
+    ):
+        """
+        Determine which candidate bus stop has buses travelling towards
+        *towards_target* by comparing each stop's travel bearing (from
+        the route sequence) against the bearing to the geocoded target.
+
+        Efficient: only needs ONE stop's travel bearing (2 API calls:
+        stop-info + route-sequence).  Since paired bus stops face opposite
+        directions, once we know one stop's bearing we know both.
+
+        Returns the winning DisambiguationCandidate, or None on failure.
+        """
+        import math
+
+        grounder = get_grounder()
+        if not grounder or not grounder.available:
+            return None
+
+        places_result = grounder.ground(towards_target)
+        if not places_result:
+            return None
+        target_lat = places_result.get('lat')
+        target_lon = places_result.get('lng')
+        if target_lat is None or target_lon is None:
+            return None
+
+        # Only consider candidates that have coordinates
+        with_coords = [
+            c for c in candidates
+            if c.lat is not None and c.lon is not None
+        ]
+        if len(with_coords) < 2:
+            return None
+
+        # Get travel bearing for the FIRST candidate only (efficient).
+        # Once we know which way stop A's buses go, we know both directions.
+        first = with_coords[0]
+        travel_bearing = self.transport_api.get_stop_travel_bearing(first.id)
+        if travel_bearing is None:
+            # Try the second candidate as fallback
+            first = with_coords[1]
+            travel_bearing = self.transport_api.get_stop_travel_bearing(first.id)
+            if travel_bearing is None:
+                return None
+
+        # Identify the "other" stop (typically the opposite side of the road)
+        other = next((c for c in with_coords if c.id != first.id), None)
+        if other is None:
+            return None
+
+        # Helper to compute bearing and great-circle distance from a stop to target
+        def _bearing_and_distance(stop_lat, stop_lon):
+            lat1 = math.radians(float(stop_lat))
+            lon1 = math.radians(float(stop_lon))
+            lat2 = math.radians(float(target_lat))
+            lon2 = math.radians(float(target_lon))
+
+            d_lon = lon2 - lon1
+            x = math.sin(d_lon) * math.cos(lat2)
+            y = (math.cos(lat1) * math.sin(lat2)
+                 - math.sin(lat1) * math.cos(lat2) * math.cos(d_lon))
+            bearing = (math.degrees(math.atan2(x, y)) + 360) % 360
+
+            # Haversine distance (Earth radius in km, relative comparison only)
+            d_lat = lat2 - lat1
+            a = (math.sin(d_lat / 2) ** 2
+                 + math.cos(lat1) * math.cos(lat2) * math.sin(d_lon / 2) ** 2)
+            c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+            distance_km = 6371.0 * c
+            return bearing, distance_km
+
+        # Bearing and distance from each candidate to the target
+        first_bearing, first_dist = _bearing_and_distance(first.lat, first.lon)
+        other_bearing, other_dist = _bearing_and_distance(other.lat, other.lon)
+
+        # Angular difference between travel direction and target direction
+        def _angular_delta(travel, target):
+            d = abs(travel - target)
+            return 360 - d if d > 180 else d
+
+        delta_first = _angular_delta(travel_bearing, first_bearing)
+        # Buses at the opposite stop travel ~180° from the first stop
+        opposite_travel_bearing = (travel_bearing + 180) % 360
+        delta_other = _angular_delta(opposite_travel_bearing, other_bearing)
+
+        print(
+            "[Chatbot] bus bearing+distance fallback: "
+            f"first='{first.name}' ({first.id}) travel={travel_bearing:.0f}° "
+            f"target_bearing={first_bearing:.0f}° delta={delta_first:.0f}° "
+            f"dist={first_dist:.2f}km; "
+            f"other='{other.name}' ({other.id}) travel_opposite={opposite_travel_bearing:.0f}° "
+            f"target_bearing={other_bearing:.0f}° delta={delta_other:.0f}° "
+            f"dist={other_dist:.2f}km"
+        )
+
+        # Prefer candidates whose travel direction roughly aligns with the target.
+        aligned_candidates = []
+        if delta_first <= 90:
+            aligned_candidates.append(("first", first, first_dist, delta_first))
+        if delta_other <= 90:
+            aligned_candidates.append(("other", other, other_dist, delta_other))
+
+        chosen = None
+        if aligned_candidates:
+            # Among aligned candidates, pick the closest to the target.
+            chosen_label, chosen, _, _ = min(
+                aligned_candidates,
+                key=lambda item: item[2],  # distance
+            )
+            print(
+                f"[Chatbot] → selected '{chosen.name}' ({chosen.id}) "
+                f"(aligned by bearing, closest by distance)"
+            )
+            return chosen
+
+        # If neither stop aligns well by bearing, fall back purely to closest distance.
+        if first_dist <= other_dist:
+            chosen = first
+        else:
+            chosen = other
+
+        print(
+            f"[Chatbot] → selected '{chosen.name}' ({chosen.id}) "
+            f"(no good bearing match; closest by distance)"
+        )
+        return chosen
+
+    def _build_user_context(self, user_key: Optional[str]) -> Optional[UserContext]:
+        """Build a UserContext from stored per-user preferences."""
+        if not user_key:
+            return None
+        prefs = self._user_preferences.get(user_key)
+        if not prefs:
+            return None
+        return UserContext(
+            last_chosen_stop_id=prefs.get('last_chosen_stop_id'),
+            frequent_stops=prefs.get('frequent_stops', {}),
+        )
 
     def _update_user_preference(
         self, user_key: Optional[str], stop_id: str, stop_name: str
@@ -833,19 +1124,160 @@ class TrafficChatbot:
                 count = timetable_data.get('count', len(stations))
                 mode = timetable_data.get('mode', '')
                 disambiguation_options = timetable_data.get('disambiguation_options') or []
-                
-                # Bus or train disambiguation: store state and handle replies
+
+                # ---- Unified Disambiguation Engine ----
                 if disambiguation_options:
-                    ordered_options = (
-                        self._reorder_options_by_preference(disambiguation_options, user_key)
-                        if mode == 'bus'
-                        else disambiguation_options
+                    # Convert to DisambiguationCandidate objects
+                    candidates = candidates_from_tfl_matches(disambiguation_options)
+
+                    # ---- Towards-location resolution (bus + train) ----
+                    # If the user said "towards X", check which candidate stops/stations
+                    # actually have vehicles travelling towards X via live arrivals /
+                    # route sequence.  This runs before the geo/score engine so it can
+                    # hard-filter or auto-resolve without needing a spatial anchor.
+                    towards = entities.get('towards') if mode in ('bus', 'train') else None
+                    if towards:
+                        stop_ids = [c.id for c in candidates if c.id]
+                        if mode == 'bus':
+                            towards_results = self.transport_api.get_stops_towards_location(
+                                stop_ids, towards
+                            )
+                        else:
+                            towards_results = self.transport_api.get_train_stops_towards_location(
+                                stop_ids, towards
+                            )
+                        matching_ids = {
+                            sid for sid, r in towards_results.items() if r.get('matches')
+                        }
+                        print(f"[Chatbot] towards='{towards}' (mode={mode}) matched stop IDs: {matching_ids}")
+
+                        if len(matching_ids) == 1:
+                            # Exactly one stop goes towards the target — auto-resolve now,
+                            # no need to run the disambiguation engine at all.
+                            chosen_id = next(iter(matching_ids))
+                            chosen_candidate = next(
+                                (c for c in candidates if c.id == chosen_id), None
+                            )
+                            if chosen_candidate:
+                                self._update_user_preference(
+                                    user_key, chosen_candidate.id, chosen_candidate.name
+                                )
+                                print(
+                                    f"[Chatbot] towards-resolved '{query}' → "
+                                    f"'{chosen_candidate.name}' (towards='{towards}')"
+                                )
+                                timetable_data = self.transport_api.get_tfl_timetable_by_stop_id(
+                                    chosen_candidate.id,
+                                    mode_filter=timetable_mode,
+                                    stop_name=chosen_candidate.name,
+                                )
+                                if (
+                                    timetable_data
+                                    and isinstance(timetable_data, dict)
+                                    and 'error' not in timetable_data
+                                ):
+                                    response_message = self._format_timetable_response(
+                                        timetable_data, timetable_mode
+                                    )
+                                    response_message['timetable_data'] = timetable_data
+                                    return response_message
+                                # API fetch failed — fall through to present options
+
+                        elif len(matching_ids) > 1:
+                            # Multiple stops match — keep only those, let the engine rank them
+                            candidates = [c for c in candidates if c.id in matching_ids]
+
+                        # len == 0: no match from arrivals/route-sequence
+                        # (quiet hours or target isn't a direct destination).
+                        # Bearing fallback: get the travel direction of a
+                        # candidate from the route sequence, geocode the
+                        # towards target, and pick the stop whose buses
+                        # travel in the direction of the target.
+                        if len(matching_ids) == 0 and len(candidates) >= 2:
+                            closest = self._bus_stop_towards_by_bearing(
+                                towards, candidates
+                            )
+                            if closest:
+                                self._update_user_preference(
+                                    user_key, closest.id, closest.name
+                                )
+                                print(
+                                    f"[Chatbot] towards coord fallback (bus): "
+                                    f"'{towards}' → '{closest.name}' ({closest.id})"
+                                )
+                                timetable_data = self.transport_api.get_tfl_timetable_by_stop_id(
+                                    closest.id,
+                                    mode_filter=timetable_mode,
+                                    stop_name=closest.name,
+                                )
+                                if (
+                                    timetable_data
+                                    and isinstance(timetable_data, dict)
+                                    and 'error' not in timetable_data
+                                ):
+                                    response_message = self._format_timetable_response(
+                                        timetable_data, timetable_mode
+                                    )
+                                    response_message['timetable_data'] = timetable_data
+                                    return response_message
+
+                    # Build spatial anchor from near_area entity
+                    anchor = self._build_timetable_spatial_anchor(query, entities)
+
+                    # Build user context for preference boosting
+                    user_ctx = self._build_user_context(user_key)
+
+                    # Run the disambiguation engine
+                    engine = get_disambiguation_engine()
+                    result = engine.disambiguate(
+                        query=query,
+                        candidates=candidates,
+                        anchor=anchor,
+                        user_context=user_ctx,
+                        mode=mode or "bus",
                     )
+
+                    if result.resolved and result.chosen:
+                        # Auto-resolved: fetch timetable for the chosen stop directly
+                        chosen = result.chosen
+                        self._update_user_preference(user_key, chosen.id, chosen.name)
+                        print(f"[Chatbot] Auto-resolved '{query}' → '{chosen.name}' (score={result.top_score:.3f})")
+                        timetable_data = self.transport_api.get_tfl_timetable_by_stop_id(
+                            chosen.id, mode_filter=timetable_mode, stop_name=chosen.name
+                        )
+                        if timetable_data and isinstance(timetable_data, dict) and 'error' not in timetable_data:
+                            response_message = self._format_timetable_response(timetable_data, timetable_mode)
+                            response_message['timetable_data'] = timetable_data
+                            return response_message
+                        # If fetch failed, fall through to present options
+
+                    if result.action == "ask_rephrase":
+                        mode_text = 'train stations' if mode == 'train' else 'bus stops' if mode == 'bus' else 'stops'
+                        return {
+                            'primary': f"I couldn't confidently match '{query}' to a specific {mode_text.rstrip('s')}.",
+                            'details': "Could you be more specific?",
+                            'alternatives': [],
+                            'next_steps': f"Try including a direction, area, or route number (e.g., '{query} towards Wembley' or '{query} in Kingsbury')."
+                        }
+
+                    # present_options: store ranked candidates for user to choose from
+                    ranked_options = [c.to_dict() for c in result.candidates]
+                    # Also apply legacy preference reordering for bus stops
+                    if mode == 'bus':
+                        ranked_options = self._reorder_options_by_preference(ranked_options, user_key)
+
                     self.conversation_state['timetable_disambiguation'] = {
-                        'options': ordered_options,
+                        'options': ranked_options,
                         'query': query,
                         'timetable_mode': timetable_mode or mode
                     }
+                    # FSM transition: enter disambiguation state
+                    self.state_tracker.start_disambiguation(
+                        user_key or "_anon",
+                        options=ranked_options,
+                        query=query,
+                        mode=timetable_mode or mode,
+                    )
                     prompt = self._build_disambiguation_prompt(self.conversation_state['timetable_disambiguation'])
                     return {
                         'primary': prompt['primary'],
@@ -853,7 +1285,7 @@ class TrafficChatbot:
                         'alternatives': [],
                         'next_steps': prompt.get('next_steps')
                     }
-                
+
                 # No disambiguation_options (legacy/fallback): just list options
                 if stations:
                     station_list = '\n'.join([f"  • {station}" for station in stations[:10]])
@@ -988,6 +1420,40 @@ class TrafficChatbot:
                             if direction == 'Anticlockwise' and (re.search(r'\banticlockwise\b', text) or re.search(r'\bcounter[\s-]?clockwise\b', text)):
                                 chosen_direction = direction
                                 break
+                    # 3) Match by 'towards' entity (or 'destination' when Haiku puts
+                    #    "timetable for X to Y" destination in that field).
+                    #    3a) Check destination names for target tokens.
+                    #    3b) Fallback: geocode the towards target and pick the
+                    #        compass direction (N/S/E/W) from station to target.
+                    if not chosen_direction:
+                        towards_target = (
+                            entities.get('towards')
+                            or entities.get('destination')
+                        )
+                        if towards_target:
+                            # 3a) Destination-name matching
+                            target_tokens = self.transport_api._target_tokens(towards_target)
+                            if target_tokens:
+                                for direction in meaningful_directions:
+                                    direction_trains = train_arrivals_by_direction.get(direction, [])
+                                    for train in direction_trains:
+                                        dest = train.get('destination', '') or ''
+                                        if self.transport_api._text_contains_target(dest, target_tokens):
+                                            chosen_direction = direction
+                                            print(
+                                                f"[Chatbot] towards/dest '{towards_target}' "
+                                                f"→ auto-selected direction '{direction}' (name match)"
+                                            )
+                                            break
+                                    if chosen_direction:
+                                        break
+
+                            # 3b) Coordinate-based fallback: geocode towards target,
+                            #     compute bearing from station, map to direction.
+                            if not chosen_direction:
+                                chosen_direction = self._direction_from_towards_coordinates(
+                                    towards_target, timetable_data, meaningful_directions
+                                )
                 if chosen_direction:
                     # Query already specified direction/platform – filter and show immediately (no disambiguation)
                     filtered_trains = [t for t in train_arrivals if (t.get('direction') or '') == chosen_direction]
@@ -1030,6 +1496,13 @@ class TrafficChatbot:
                         'train_direction_disambiguation': True,
                         'timetable_data': timetable_data,
                     }
+                    # FSM transition: enter disambiguation state
+                    self.state_tracker.start_disambiguation(
+                        user_key or "_anon",
+                        options=train_direction_options,
+                        query=stop_name,
+                        mode='train',
+                    )
                     prompt = self._build_disambiguation_prompt(self.conversation_state['timetable_disambiguation'])
                     return {
                         'primary': prompt['primary'],

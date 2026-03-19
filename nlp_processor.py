@@ -20,6 +20,9 @@ from typing import Dict, List, Any, Set, Optional, Tuple
 # New components
 from intent_classifier import IntentClassifier
 from ner_processor import NERProcessor
+from llm_entity_extractor import get_llm_extractor
+from journey_slot_extractor import get_extractor as get_journey_slot_extractor
+from tfl_stop_datasets import TRAIN_LINES, load_bus_routes, load_bus_stops, load_train_stations
 
 try:
     # Optional NLTK + WordNet support for synonym expansion
@@ -43,8 +46,20 @@ class NLPProcessor:
         # Replaces the slow zero-shot classification pipeline
         self._intent_classifier = IntentClassifier()
 
-        # ---- New: Hybrid SpaCy + regex NER ----
-        self._ner = NERProcessor()
+        # ---- Backup: Hybrid SpaCy + regex NER ----
+        # Create only if/when LLM entity extraction is unavailable.
+        self._ner_fallback: Optional[NERProcessor] = None
+
+        # ---- Backup: Rule-based journey slot extraction ----
+        # Used when the LLM entity extractor is unavailable OR fails at runtime.
+        self._journey_slot_extractor = get_journey_slot_extractor()
+
+        # ---- New: LLM-based entity extraction (Anthropic Claude) ----
+        self._llm_extractor = get_llm_extractor()
+        if self._llm_extractor.available:
+            print("[NLP] LLM entity extractor enabled (Anthropic Claude)")
+        else:
+            print("[NLP] LLM entity extractor unavailable – falling back to SpaCy + regex NER")
 
         # Legacy: keep the old zero-shot classifier as an optional deep fallback
         # (only loaded if the new classifier fails to initialize)
@@ -83,13 +98,13 @@ class NLPProcessor:
 
         print("NLP models loaded successfully")
 
-        # Pre-load stop name datasets for CSV-backed intent refinement
-        # (These are also loaded inside NERProcessor, but we keep them here
-        #  for backward compatibility with extract_train_disruption_line etc.)
-        self._bus_stops: List[str] = self._ner.bus_stops
-        self._train_stations: List[str] = self._ner.train_stations
-        self._train_lines: List[str] = self._ner.train_lines
-        self._bus_routes: Set[str] = self._ner.bus_routes
+        # Pre-load stop name datasets for CSV-backed intent refinement.
+        # This is intentionally not tied to NERProcessor so that NER is a
+        # true fallback component.
+        self._bus_stops: List[str] = load_bus_stops()
+        self._train_stations: List[str] = load_train_stations()
+        self._train_lines: List[str] = list(TRAIN_LINES)
+        self._bus_routes: Set[str] = load_bus_routes()
         self._stops_loaded: bool = True
     
     def _expand_with_synonyms(self, tokens: List[str]) -> Set[str]:
@@ -154,17 +169,54 @@ class NLPProcessor:
 
         # ---- Intent classification (new: fine-tuned classifier) ----
         intent, confidence = self._classify_intent(text)
-        print(f"[NLP] Final intent: {intent}, confidence: {confidence:.3f}")
+        print(f"[NLP] Classifier intent: {intent}, confidence: {confidence:.3f}")
 
-        # ---- Entity extraction (new: hybrid SpaCy + regex NER) ----
-        entities = self._ner.extract_entities(original_text)
-        # Also run legacy regex extraction and merge (for any patterns not yet in NER)
-        legacy_entities = self._extract_entities(text)
-        for key, value in legacy_entities.items():
-            if key not in entities:
-                entities[key] = value
-        print(f"[NLP] Extracted entities: {entities}")
+        # ---- Entity extraction ----
+        # Primary: LLM-based extraction (Anthropic Claude)
+        # Backup: JourneySlotExtractor + hybrid SpaCy+regex NER (runtime-fallback)
+        entities: Dict[str, Any] = {}
+        llm_ok = False
+        if self._llm_extractor.available:
+            try:
+                llm_entities = self._llm_extractor.extract_entities(original_text)
+                if isinstance(llm_entities, dict) and llm_entities:
+                    print(f"[NLP] LLM extracted entities: {llm_entities}")
+                    entities = self._normalize_llm_entities(llm_entities)
+                    llm_ok = True
+                else:
+                    print("[NLP][LLM] Returned no entities → falling back to JourneySlotExtractor + NERProcessor.")
+            except Exception as e:
+                # Runtime failure (timeout/network/API/etc.) → fall back gracefully.
+                print(f"[NLP][LLM] FAILED ({type(e).__name__}: {e}) → falling back to JourneySlotExtractor + NERProcessor.")
 
+        if not llm_ok:
+            # Journey slots first (origin/destination + optional Places grounding)
+            try:
+                journey_slots = self._journey_slot_extractor.extract_journey_slots(original_text)
+                if journey_slots:
+                    entities.update(journey_slots)
+                    print(f"[NLP] JourneySlotExtractor entities: {journey_slots}")
+            except Exception as e:
+                print(f"[NLP][Fallback] JourneySlotExtractor failed ({type(e).__name__}: {e})")
+
+            # General/domain entities via SpaCy + regex
+            if self._ner_fallback is None:
+                self._ner_fallback = NERProcessor()
+            try:
+                ner_entities = self._ner_fallback.extract_entities(original_text)
+                if ner_entities:
+                    # Don't overwrite journey slots already extracted above
+                    for k, v in ner_entities.items():
+                        if k not in entities:
+                            entities[k] = v
+            except Exception as e:
+                print(f"[NLP][Fallback] NERProcessor failed ({type(e).__name__}: {e})")
+
+            # Also run legacy regex extraction and merge (for non-journey patterns)
+            legacy_entities = self._extract_entities(text)
+            for key, value in legacy_entities.items():
+                if key not in entities:
+                    entities[key] = value
         # ---- CSV-backed refinement (preserved from original) ----
         intent, entities, confidence = self._refine_with_stop_datasets(
             original_text, intent, entities, confidence
@@ -174,9 +226,32 @@ class NLPProcessor:
         # Origin/destination can be noisy for non-journey queries. To keep them
         # from polluting other intents, only expose them when we're in an
         # explicit journey_planning flow.
+        #
+        # HOWEVER: if the LLM extracted origin or destination, trust it and
+        # override the intent to journey_planning. The LLM is specifically
+        # designed for journey entity extraction and is more reliable than
+        # the sentence-transformer intent classifier for this purpose.
         if intent != "journey_planning":
-            for k in ("origin", "destination", "origin_grounded", "destination_grounded"):
-                entities.pop(k, None)
+            # Never let journey slots force us into journey planning for these intents.
+            # For timetable/disruption queries we prefer keeping the current intent,
+            # and we also strip journey slots to avoid polluting downstream handlers.
+            protected_intents = {"ask_timetable", "ask_transit_disruption"}
+
+            llm_has_journey_slots = entities.get("origin") or entities.get("destination")
+            if llm_has_journey_slots and intent not in protected_intents:
+                print(f"[NLP] LLM found journey slots but intent was '{intent}' — overriding to 'journey_planning'")
+                intent = "journey_planning"
+            else:
+                # For timetable queries, "destination" often means "towards"
+                # (e.g. "train timetable for Wembley Park to Euston" →
+                # destination="Euston" should become towards="Euston").
+                # Preserve it before stripping journey slots.
+                if intent == "ask_timetable" and entities.get("destination") and not entities.get("towards"):
+                    entities["towards"] = entities["destination"]
+                    print(f"[NLP] Promoted destination='{entities['destination']}' → towards for timetable query")
+                for k in ("origin", "destination", "origin_grounded", "destination_grounded"):
+                    entities.pop(k, None)
+        print(f"[NLP] Final intent: {intent}, entities: {entities}")
         # Final safety: if, after all filters, an origin/destination still starts
         # with a verb/pronoun due to some unexpected path, drop it here as well.
         for slot_key in ("origin", "destination"):
@@ -205,6 +280,81 @@ class NLPProcessor:
             'confidence': confidence
         }
     
+    def _normalize_llm_entities(self, llm_entities: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Normalize LLM-extracted entities to match the key names expected
+        by the rest of the pipeline (journey planner, chatbot, frontend).
+
+        The LLM uses richer, more descriptive keys; this maps them to the
+        existing entity schema while preserving the extra LLM-specific fields
+        prefixed with 'llm_' for the frontend info panel.
+        """
+        entities: Dict[str, Any] = {}
+
+        # Direct pass-through keys (same name in both schemas)
+        # Note: "towards" here is the timetable-specific entity (bus travel direction),
+        # distinct from journey planner origin/destination.  It must not overwrite
+        # journey-planner slots and is only meaningful when intent == 'ask_timetable'.
+        for key in ("origin", "destination", "location", "date", "time",
+                     "bus_route", "near_area", "towards"):
+            if key in llm_entities:
+                entities[key] = llm_entities[key]
+
+        # ── TfL Journey API parameters (new) ──
+
+        # via — intermediate waypoint for the journey
+        if "via" in llm_entities:
+            entities["via"] = llm_entities["via"]
+
+        # mode — comma-separated TfL transport modes (e.g. "tube,walking")
+        if "mode" in llm_entities:
+            entities["mode"] = llm_entities["mode"]
+
+        # time_preference → maps to TfL "timeIs" parameter
+        # LLM outputs "departing"/"arriving" → TfL expects "Departing"/"Arriving"
+        if "time_preference" in llm_entities:
+            tp = llm_entities["time_preference"].lower()
+            entities["time_preference"] = tp
+            # Also store the TfL-formatted version
+            entities["timeIs"] = "Arriving" if tp == "arriving" else "Departing"
+
+        # journey_preference → maps to TfL "journeyPreference" parameter
+        # Values: "leastinterchange", "leasttime", "leastwalking"
+        if "journey_preference" in llm_entities:
+            entities["journey_preference"] = llm_entities["journey_preference"]
+
+        # tube_line → line (and also route for compatibility)
+        if "tube_line" in llm_entities:
+            entities["line"] = llm_entities["tube_line"]
+            entities["route"] = llm_entities["tube_line"]
+
+        # Legacy travel_mode for timetable routing (bus/train detection)
+        if "mode" in llm_entities:
+            mode_str = llm_entities["mode"].lower()
+            if "public-bus" in mode_str and "tube" not in mode_str and "train" not in mode_str:
+                entities["timetable_mode"] = "bus"
+                entities["travel_mode"] = "transit"
+            elif ("tube" in mode_str or "train" in mode_str) and "public-bus" not in mode_str:
+                entities["timetable_mode"] = "train"
+                entities["travel_mode"] = "transit"
+            elif "walking" == mode_str:
+                entities["travel_mode"] = "walk"
+            elif "cycle" == mode_str:
+                entities["travel_mode"] = "bike"
+            else:
+                entities["travel_mode"] = "transit"
+
+        # accessibility needs
+        if "accessibility" in llm_entities:
+            entities["accessibility"] = llm_entities["accessibility"]
+
+        # ── LLM-enriched context fields (prefixed for the info panel) ──
+        for key in ("urgency", "mood", "utterance_type"):
+            if key in llm_entities:
+                entities[f"llm_{key}"] = llm_entities[key]
+
+        return entities
+
     def _classify_intent(self, text: str) -> tuple:
         """
         Classify user intent using a 3-tier strategy:
@@ -524,10 +674,9 @@ class NLPProcessor:
                 entities['time'] = match.group(0)
                 break
         
-        # Origin and destination are handled by NERProcessor's journey slot extractor
-        # (rule-based grammar patterns in journey_slot_extractor.py).
-        # The old regex here produced garbage like origin='get me' for "get me to neasden"
-        # and has been removed to avoid polluting the NER results.
+        # Origin and destination extraction is handled exclusively by the
+        # LLM-based extractor (llm_entity_extractor.py). No rule-based
+        # journey slot extraction is performed here.
 
         # Extract travel mode
         if re.search(r'\b(drive|driving|car)\b', text_lower):
@@ -620,16 +769,15 @@ class NLPProcessor:
     
     def _load_stop_datasets(self) -> None:
         """
-        Legacy method — stop data is now loaded by NERProcessor.
+        Legacy method — stop data is loaded by `tfl_stop_datasets.py`.
         This stub ensures backward compatibility if called externally.
         """
         if self._stops_loaded:
             return
-        # Delegate to the NER processor's already-loaded data
-        self._bus_stops = self._ner.bus_stops
-        self._train_stations = self._ner.train_stations
-        self._train_lines = self._ner.train_lines
-        self._bus_routes = self._ner.bus_routes
+        self._bus_stops = load_bus_stops()
+        self._train_stations = load_train_stations()
+        self._train_lines = list(TRAIN_LINES)
+        self._bus_routes = load_bus_routes()
         self._stops_loaded = True
     
     # Keywords that indicate a status/disruption query (train or bus)

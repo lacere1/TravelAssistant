@@ -176,20 +176,31 @@ def _journey_planner_entities(state: dict) -> dict:
     if not state:
         return entities
     if state.get("fromQuery"):
-        entities["from"] = state["fromQuery"]
+        entities["origin"] = state["fromQuery"]
     if state.get("toQuery"):
-        entities["to"] = state["toQuery"]
+        entities["destination"] = state["toQuery"]
     when = state.get("when")
     if when and isinstance(when, dict):
         dt = when.get("datetime")
         if hasattr(dt, "strftime"):
-            entities["when"] = dt.strftime("%Y-%m-%d %H:%M")
+            entities["time"] = dt.strftime("%H:%M")
+            entities["date"] = dt.strftime("%Y-%m-%d")
         elif dt is not None:
-            entities["when"] = str(dt)
+            entities["time"] = str(dt)
+        time_is = when.get("timeIs")
+        if time_is:
+            entities["time_preference"] = time_is.lower()
     if state.get("fromLocationId"):
         entities["from_id"] = state["fromLocationId"]
     if state.get("toLocationId"):
         entities["to_id"] = state["toLocationId"]
+    # Include LLM-extracted TfL API parameters
+    if state.get("_nlp_via"):
+        entities["via"] = state["_nlp_via"]
+    if state.get("_nlp_mode"):
+        entities["mode"] = state["_nlp_mode"]
+    if state.get("_nlp_journey_preference"):
+        entities["journey_preference"] = state["_nlp_journey_preference"]
     return entities
 
 
@@ -285,6 +296,7 @@ def chat():
         nlp_result = None
         nlp_origin = None
         nlp_destination = None
+        nlp_entities = {}
         try:
             nlp_result = traffic_chatbot.nlp.process(user_message)
             nlp_entities = nlp_result.get("entities", {}) if isinstance(nlp_result, dict) else {}
@@ -334,7 +346,20 @@ def chat():
         # 2) If we're in the middle of journey planning (e.g. asked "Where from?", waiting for "3", or for "neasden station"), use the journey planner.
         jp_state = journey_chatbot.state.get("global") or {}
         if jp_state.get("journey_planning_active") or jp_state.get("fromOptions") or jp_state.get("toOptions"):
-            jp_response = journey_chatbot.handle_message(user_message, now=now, username=username)
+            jp_response = journey_chatbot.handle_message(
+                user_message,
+                now=now,
+                username=username,
+                nlp_origin=nlp_origin,
+                nlp_destination=nlp_destination,
+                nlp_entities=nlp_entities,
+            )
+            # Keep the info panel consistent with the NLP output by merging
+            # journey-planner state entities with LLM context fields.
+            jp_entities = _journey_planner_entities(jp_response.get("state", {}))
+            for k, v in nlp_entities.items():
+                if k.startswith("llm_") or k in ("route_preference", "accessibility", "time_preference", "origin", "destination", "via", "mode", "journey_preference", "date", "time"):
+                    jp_entities[k] = v
             return jsonify({
                 "response": jp_response.get("reply", ""),
                 "journeys": jp_response.get("journeys", []),
@@ -343,7 +368,7 @@ def chat():
                 "journey_disambiguation": jp_response.get("place_disambiguation"),
                 "state": jp_response.get("state", {}),
                 "intent": "journey_planner",
-                "entities": _journey_planner_entities(jp_response.get("state", {})),
+                "entities": jp_entities,
                 "confidence": 0.95,
             })
 
@@ -371,7 +396,14 @@ def chat():
                 username=username,
                 nlp_origin=nlp_origin,
                 nlp_destination=nlp_destination,
+                nlp_entities=nlp_entities,
             )
+            # Merge journey planner state entities with LLM-extracted entities
+            jp_entities = _journey_planner_entities(jp_response.get("state", {}))
+            # Include LLM context fields (urgency, mood, utterance_type, preferences)
+            for k, v in nlp_entities.items():
+                if k.startswith("llm_") or k in ("route_preference", "accessibility", "time_preference"):
+                    jp_entities[k] = v
             return jsonify({
                 "response": jp_response.get("reply", ""),
                 "journeys": jp_response.get("journeys", []),
@@ -380,7 +412,7 @@ def chat():
                 "journey_disambiguation": jp_response.get("place_disambiguation"),
                 "state": jp_response.get("state", {}),
                 "intent": "journey_planner",
-                "entities": _journey_planner_entities(jp_response.get("state", {})),
+                "entities": jp_entities,
                 "confidence": 0.95,
             })
 
@@ -392,10 +424,16 @@ def chat():
             user_message, user_key=_current_user_key(), username=username
         )
 
+        # Merge LLM context fields into the traffic response entities
+        traffic_entities = traffic_response.get('entities', {})
+        for k, v in nlp_entities.items():
+            if k.startswith("llm_") or k in ("route_preference", "accessibility", "time_preference"):
+                traffic_entities[k] = v
+
         return jsonify({
             'response': traffic_response['message'],
             'intent': traffic_response.get('intent', 'unknown'),
-            'entities': traffic_response.get('entities', {}),
+            'entities': traffic_entities,
             'confidence': traffic_response.get('confidence', 0.0),
             'journeys': [],
             'disambiguation': False,

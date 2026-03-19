@@ -10,13 +10,12 @@ sentence-transformers==2.2.2
 torch==2.1.1
 huggingface-hub==0.10.1
 
-# ---- NER: SpaCy for general entity recognition ----
+# ---- LLM entity extraction (Anthropic Claude) ----
+anthropic>=0.39.0
+
+# ---- NER: SpaCy for general entity recognition (fallback) ----
 spacy==3.7.2
 # Download the model after install: python -m spacy download en_core_web_sm
-
-# ---- Date/time parsing (Microsoft Recognizers-Text) ----
-recognizers-text-suite
-emoji==1.7.0  # recognizers-text depends on UNICODE_EMOJI, removed in emoji 2.x
 
 # ---- Legacy: Hugging Face transformers (optional fallback only) ----
 # Uncomment if you want the old zero-shot classifier as a deep fallback:

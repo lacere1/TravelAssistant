@@ -17,52 +17,30 @@ import re
 import copy
 import requests
 
-try:
-    # Microsoft Recognizers-Text for robust date/time parsing
-    from recognizers_text import Culture  # type: ignore[import]
-    from recognizers_date_time import DateTimeRecognizer  # type: ignore[import]
+from disambiguation_engine import (
+    DisambiguationEngine,
+    DisambiguationCandidate,
+    SpatialAnchor,
+    UserContext,
+    candidates_from_journey_options,
+    anchor_from_places,
+    get_disambiguation_engine,
+)
+from places_grounder import get_grounder
 
-    _MS_RECOGNIZERS_AVAILABLE = True
-except Exception as e:
-    # Log the real import error so it's visible in the console.
-    print(f"[journey_planner] Recognizers-Text import failed: {e}")
-    _MS_RECOGNIZERS_AVAILABLE = False
-    Culture = None  # type: ignore[assignment]
-    DateTimeRecognizer = None  # type: ignore[assignment]
+# Microsoft Recognizers-Text has been removed — date/time extraction from
+# natural language is now handled by the LLM entity extractor.  The
+# lightweight pattern-based parser below is kept as a fallback for
+# structured date/time strings (e.g. "tomorrow 9am", "arrive by 6pm").
 
 
-# ---- Lightweight + Microsoft Recognizers datetime NLP -----------------------
+# ---- Lightweight datetime parser --------------------------------------------
 
 
 @dataclass
 class ParsedWhen:
     date: datetime
     timeIs: str  # "Departing" or "Arriving"
-
-
-_datetime_model = None
-
-
-def _get_datetime_model():
-    """
-    Lazily initialize and cache the Microsoft Recognizers-Text datetime model.
-    Falls back gracefully if the package is missing or fails to load.
-    """
-    global _datetime_model
-    if not _MS_RECOGNIZERS_AVAILABLE:
-        # Debug: recognizers-text not installed or failed import
-        print("[journey_planner] Microsoft Recognizers-Text not available; using legacy datetime parser.")
-        return None
-    if _datetime_model is not None:
-        return _datetime_model
-    try:
-        recognizer = DateTimeRecognizer(Culture.English)
-        _datetime_model = recognizer.get_datetime_model()
-        print("[journey_planner] Microsoft Recognizers-Text datetime model initialised successfully.")
-    except Exception as e:
-        print(f"[journey_planner] Failed to initialise Recognizers-Text datetime model: {e}")
-        _datetime_model = None
-    return _datetime_model
 
 
 def parse_datetime_text(text: str, now: datetime) -> Optional[dict]:
@@ -72,10 +50,6 @@ def parse_datetime_text(text: str, now: datetime) -> Optional[dict]:
       - 'tomorrow 9am'
       - 'today 18:30'
       - 'arrive by 6pm'
-      - 'next Monday at 7:30'
-
-    Uses Microsoft Recognizers-Text when available for rich parsing,
-    and falls back to the original lightweight pattern-based logic.
 
     Returns:
       {
@@ -94,59 +68,7 @@ def parse_datetime_text(text: str, now: datetime) -> Optional[dict]:
     if t == "now":
         return {"datetime": now, "timeIs": "Departing"}
 
-    # Try Microsoft Recognizers-Text first
-    model = _get_datetime_model()
-    if model is not None:
-        try:
-            results = model.parse(raw)
-            if results:
-                # Prefer datetime / time results
-                best = None
-                for r in results:
-                    ttype = (r.type_name or "").lower()
-                    if "datetime" in ttype or "time" in ttype or "date" in ttype:
-                        best = r
-                        break
-                if best is None:
-                    best = results[0]
-
-                res = best.resolution or {}
-                values = res.get("values") or []
-                if values:
-                    v = values[0]
-                    # v may contain 'value' (datetime or date) and 'time' / 'start' etc.
-                    dt_str = v.get("value") or v.get("start") or v.get("time")
-                    if dt_str:
-                        dt: Optional[datetime] = None
-                        try:
-                            # recognizers-text uses ISO-like formats; fromisoformat handles most of them
-                            dt = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
-                        except Exception:
-                            # If only a time is present (no date), combine with today
-                            m = re.match(r"^(\d{1,2}):(\d{2})(?::\d{2})?$", dt_str)
-                            if m:
-                                hour = int(m.group(1))
-                                minute = int(m.group(2))
-                                dt = datetime(
-                                    year=now.year,
-                                    month=now.month,
-                                    day=now.day,
-                                    hour=hour,
-                                    minute=minute,
-                                )
-                        if dt is not None:
-                            # Decide whether this is a departure or arrival time
-                            time_is = "Departing"
-                            # If the original text clearly says "arrive by", treat it as arrival
-                            if "arrive by" in t or "arriving by" in t:
-                                time_is = "Arriving"
-                            print(f"[journey_planner] Parsed datetime with Recognizers-Text: {dt.isoformat()} ({time_is}) from {raw!r}")
-                            return {"datetime": dt, "timeIs": time_is}
-        except Exception as e:
-            # Fall through to the legacy parser
-            print(f"[journey_planner] Recognizers-Text parsing error, falling back to legacy parser: {e}")
-
-    # Legacy lightweight parser (original behaviour) as fallback
+    # Lightweight pattern-based parser
     time_is = "Departing"
     if t.startswith("arrive by"):
         time_is = "Arriving"
@@ -332,6 +254,177 @@ class TflJourneyClient:
         # Last TfL URL used for a request (for debugging/inspection).
         self.last_url: str | None = None
 
+    # ---- Helpers --------------------------------------------------------
+
+    # Mapping from commonly used / LLM-output mode names to the actual
+    # identifiers accepted by the TfL Journey Planner API.
+    # Source: https://api.tfl.gov.uk/Journey/Meta/Modes
+    _MODE_ALIASES: Dict[str, str] = {
+        # Correct API identifiers (pass through)
+        "bus": "bus",
+        "tube": "tube",
+        "overground": "overground",
+        "dlr": "dlr",
+        "tram": "tram",
+        "coach": "coach",
+        "walking": "walking",
+        "cycle": "cycle",
+        "national-rail": "national-rail",
+        "elizabeth-line": "elizabeth-line",
+        "cable-car": "cable-car",
+        "river-bus": "river-bus",
+        "cycle-hire": "cycle-hire",
+        "interchange-keep-sitting": "interchange-keep-sitting",
+        "interchange-secure": "interchange-secure",
+        # Common aliases from old documentation / LLM output
+        "public-bus": "bus",
+        "train": "national-rail",
+        "rail": "national-rail",
+        "cablecar": "cable-car",
+        "cable car": "cable-car",
+        "river": "river-bus",
+        "riverbus": "river-bus",
+        "river bus": "river-bus",
+        "elizabeth": "elizabeth-line",
+        "crossrail": "elizabeth-line",
+        "walk": "walking",
+        "bike": "cycle",
+        "bicycle": "cycle",
+    }
+
+    @staticmethod
+    def _build_extra_params(
+        via: str | None = None,
+        mode: str | None = None,
+        journey_preference: str | None = None,
+    ) -> Dict[str, str]:
+        """
+        Build the optional TfL query parameters from LLM-extracted entities,
+        normalising casing and format to match what the TfL API expects.
+
+        TfL Journey API parameter reference:
+          via              – free-text, postcode, Naptan StopPoint ID, ICS StopId,
+                             or WGS84 "lat,long"
+          mode             – comma-separated list from Journey/Meta/Modes:
+                             bus, tube, national-rail, overground, dlr,
+                             elizabeth-line, tram, cable-car, river-bus,
+                             coach, walking, cycle, cycle-hire
+          journeyPreference – LeastInterchange | LeastTime | LeastWalking
+          timeIs           – Departing | Arriving  (handled separately via `when`)
+        """
+        extra: Dict[str, str] = {}
+
+        if via:
+            extra["via"] = via.strip()
+
+        if mode:
+            # Normalise each mode token through the alias map, dropping unknowns
+            raw_modes = [m.strip().lower() for m in mode.split(",") if m.strip()]
+            mapped = []
+            for m in raw_modes:
+                canonical = TflJourneyClient._MODE_ALIASES.get(m)
+                if canonical:
+                    if canonical not in mapped:
+                        mapped.append(canonical)
+                else:
+                    print(f"[TfL] WARNING: unknown mode '{m}' — dropping from request")
+            if mapped:
+                extra["mode"] = ",".join(mapped)
+                print(f"[TfL] Normalised modes: {raw_modes} → {mapped}")
+
+        if journey_preference:
+            # TfL expects PascalCase: LeastInterchange, LeastTime, LeastWalking
+            _JP_MAP = {
+                "leastinterchange": "LeastInterchange",
+                "leasttime": "LeastTime",
+                "leastwalking": "LeastWalking",
+            }
+            jp_lower = journey_preference.strip().lower()
+            extra["journeyPreference"] = _JP_MAP.get(jp_lower, journey_preference)
+
+        if extra:
+            print(f"[TfL] Extra API params: {extra}")
+        return extra
+
+    @staticmethod
+    def _extract_via_disambiguation(data: Dict[str, Any]) -> str | None:
+        """
+        If the TfL response contains a viaLocationDisambiguation with options,
+        return the parameterValue of the first (best) match so we can retry
+        with a resolved via ID instead of free text.
+        """
+        via_disamb = data.get("viaLocationDisambiguation") or {}
+        if via_disamb.get("matchStatus") not in ("list", "identified"):
+            return None
+        options = via_disamb.get("disambiguationOptions") or []
+        if not options:
+            return None
+        first = options[0]
+        param_val = first.get("parameterValue", "")
+        place_name = (first.get("place") or {}).get("commonName", "")
+        if param_val:
+            print(f"[TfL] Via disambiguation: auto-resolving to '{place_name}' (id={param_val})")
+            return param_val
+        return None
+
+    def _try_journey_request(
+        self,
+        url: str,
+        params: Dict[str, str],
+        label: str = "",
+    ) -> List[Dict[str, Any]]:
+        """
+        Make a single journey API request, handling:
+          - Normal 200 responses with journeys
+          - 300 via-disambiguation responses (auto-resolves and retries once)
+          - Errors / empty results (returns [])
+        """
+        try:
+            resp = self.session.get(url, params=params, timeout=8)
+            print(f"[TfL] {label} status: {resp.status_code}")
+
+            # On 4xx/5xx, raise immediately so the caller can try a fallback
+            if resp.status_code >= 400:
+                resp.raise_for_status()
+
+            data = resp.json()
+
+            # Check for from/to disambiguation (log only, don't auto-resolve)
+            for side in ("from", "to"):
+                disamb = data.get(f"{side}LocationDisambiguation") or {}
+                if disamb.get("matchStatus") == "list":
+                    print(f"[TfL] {label}: '{side}' needs disambiguation")
+
+            journeys = data.get("journeys") or []
+            print(f"[TfL] {label}: {len(journeys)} journeys returned")
+
+            if journeys:
+                return _journeys_to_summaries(journeys)
+
+            # No journeys — check if via needs disambiguation and retry once
+            if "via" in params:
+                resolved_via = self._extract_via_disambiguation(data)
+                if resolved_via:
+                    retry_params = dict(params)
+                    retry_params["via"] = resolved_via
+                    print(f"[TfL] {label}: retrying with resolved via={resolved_via}")
+                    try:
+                        resp2 = self.session.get(url, params=retry_params, timeout=8)
+                        print(f"[TfL] {label} via-retry status: {resp2.status_code}")
+                        if resp2.status_code < 400:
+                            data2 = resp2.json()
+                            journeys2 = data2.get("journeys") or []
+                            print(f"[TfL] {label} via-retry: {len(journeys2)} journeys")
+                            if journeys2:
+                                return _journeys_to_summaries(journeys2)
+                    except Exception as exc2:
+                        print(f"[TfL] {label} via-retry failed: {exc2}")
+
+            return []
+        except Exception as exc:
+            print(f"[TfL] {label} failed: {exc}")
+            return []
+
     # ---- Public methods -------------------------------------------------
 
     def disambiguate_location(self, query: str) -> List[Dict[str, Any]]:
@@ -423,10 +516,26 @@ class TflJourneyClient:
 
         return results
 
-    def get_journeys(self, from_id: str, to_id: str, when: Dict[str, Any]) -> List[Dict[str, Any]]:
+    def get_journeys(
+        self,
+        from_id: str,
+        to_id: str,
+        when: Dict[str, Any],
+        via: str | None = None,
+        mode: str | None = None,
+        journey_preference: str | None = None,
+    ) -> List[Dict[str, Any]]:
         """
         Fetches journeys between two resolved place IDs around a given datetime.
-        TfL format: date=YYYYMMDD, time=HHmm (no separators), timeIs=Departing|Arriving.
+
+        Parameters
+        ----------
+        from_id             : Resolved TfL place ID / coordinate / postcode for origin.
+        to_id               : Resolved TfL place ID / coordinate / postcode for destination.
+        when                : Dict with "datetime" (datetime obj) and "timeIs" ("Departing"|"Arriving").
+        via                 : Optional intermediate waypoint (free-text, postcode, Naptan ID, or "lat,lon").
+        mode                : Optional comma-separated TfL transport modes (TfL identifiers).
+        journey_preference  : Optional journey optimisation: "leastinterchange"|"leasttime"|"leastwalking".
         """
         dt: datetime = when["datetime"]
         time_is: str = when["timeIs"]  # "Departing" or "Arriving"
@@ -434,61 +543,49 @@ class TflJourneyClient:
         url = f"{TFL_BASE_URL}/journey/journeyresults/{from_id}/to/{to_id}"
         self.last_url = url
 
-        # Primary call: TfL format – date=YYYYMMDD, time=HHmm (no separators), timeIs=Departing|Arriving.
+        extra_params = self._build_extra_params(via, mode, journey_preference)
+
+        # Primary call: TfL format – date=YYYYMMDD, time=HHmm, timeIs=Departing|Arriving.
         params = self._auth_params()
-        params.update(
-            {
-                "date": dt.strftime("%Y%m%d"),
-                "time": dt.strftime("%H%M"),
-                "timeIs": time_is,
-            }
-        )
-        try:
-            resp = self.session.get(url, params=params, timeout=8)
-            resp.raise_for_status()
-            data = resp.json()
-            journeys = data.get("journeys") or []
-            if journeys:
-                return _journeys_to_summaries(journeys)
-        except Exception:
-            pass
+        params.update({"date": dt.strftime("%Y%m%d"), "time": dt.strftime("%H%M"), "timeIs": time_is})
+        params.update(extra_params)
+        print(f"[TfL] get_journeys URL: {url}")
 
-        # Fallback: try date/time again with hyphen/colon in case of strict parsing elsewhere.
-        try:
-            params_alt = self._auth_params()
-            params_alt.update(
-                {
-                    "date": dt.strftime("%Y-%m-%d"),
-                    "time": dt.strftime("%H:%M"),
-                    "timeIs": time_is,
-                }
-            )
-            resp2 = self.session.get(url, params=params_alt, timeout=8)
-            resp2.raise_for_status()
-            data2 = resp2.json()
-            journeys2 = data2.get("journeys") or []
-            if journeys2:
-                return _journeys_to_summaries(journeys2)
-        except Exception:
-            pass
+        result = self._try_journey_request(url, params, label="get_journeys")
+        if result:
+            return result
 
-        # Fallback: if still no journeys, try without date/time so TfL can suggest alternatives.
-        try:
-            params_fallback = self._auth_params()
-            resp2 = self.session.get(url, params=params_fallback, timeout=8)
-            resp2.raise_for_status()
-            data2 = resp2.json()
-            journeys2 = data2.get("journeys") or []
-            return _journeys_to_summaries(journeys2)
-        except Exception:
-            return []
+        # Fallback: date/time with hyphen/colon.
+        params_alt = self._auth_params()
+        params_alt.update({"date": dt.strftime("%Y-%m-%d"), "time": dt.strftime("%H:%M"), "timeIs": time_is})
+        params_alt.update(extra_params)
+        result2 = self._try_journey_request(url, params_alt, label="get_journeys-fb1")
+        if result2:
+            return result2
+
+        # Fallback: without date/time.
+        params_fb = self._auth_params()
+        params_fb.update(extra_params)
+        return self._try_journey_request(url, params_fb, label="get_journeys-fb2")
 
     def get_journeys_by_queries(
-        self, from_query: str, to_query: str, when: Dict[str, Any]
+        self,
+        from_query: str,
+        to_query: str,
+        when: Dict[str, Any],
+        via: str | None = None,
+        mode: str | None = None,
+        journey_preference: str | None = None,
     ) -> List[Dict[str, Any]]:
         """
         Tries the journey API with from/to as place names (e.g. "Royal Borough of Kingston upon Thames").
         If TfL returns itineraries directly, returns them; otherwise returns [] so the caller can disambiguate.
+
+        Parameters
+        ----------
+        via                 : Optional intermediate waypoint (free-text, postcode, Naptan ID, or "lat,lon").
+        mode                : Optional comma-separated TfL transport modes.
+        journey_preference  : Optional journey optimisation: "leastinterchange"|"leasttime"|"leastwalking".
         """
         if not from_query.strip() or not to_query.strip():
             return []
@@ -497,54 +594,30 @@ class TflJourneyClient:
         url = f"{TFL_BASE_URL}/journey/journeyresults/{requests.utils.quote(from_query.strip())}/to/{requests.utils.quote(to_query.strip())}"
         self.last_url = url
 
+        extra_params = self._build_extra_params(via, mode, journey_preference)
+        print(f"[TfL] get_journeys_by_queries URL: {url}")
+
         # Primary call: TfL format – date=YYYYMMDD, time=HHmm, timeIs=Departing|Arriving.
         params = self._auth_params()
-        params.update(
-            {
-                "date": dt.strftime("%Y%m%d"),
-                "time": dt.strftime("%H%M"),
-                "timeIs": time_is,
-            }
-        )
-        try:
-            resp = self.session.get(url, params=params, timeout=8)
-            resp.raise_for_status()
-            data = resp.json()
-            journeys = data.get("journeys") or []
-            if journeys:
-                return _journeys_to_summaries(journeys)
-        except Exception:
-            pass
+        params.update({"date": dt.strftime("%Y%m%d"), "time": dt.strftime("%H%M"), "timeIs": time_is})
+        params.update(extra_params)
+
+        result = self._try_journey_request(url, params, label="by_queries")
+        if result:
+            return result
 
         # Fallback: date/time with hyphen and colon.
-        try:
-            params_alt = self._auth_params()
-            params_alt.update(
-                {
-                    "date": dt.strftime("%Y-%m-%d"),
-                    "time": dt.strftime("%H:%M"),
-                    "timeIs": time_is,
-                }
-            )
-            resp2 = self.session.get(url, params=params_alt, timeout=8)
-            resp2.raise_for_status()
-            data2 = resp2.json()
-            journeys2 = data2.get("journeys") or []
-            if journeys2:
-                return _journeys_to_summaries(journeys2)
-        except Exception:
-            pass
+        params_alt = self._auth_params()
+        params_alt.update({"date": dt.strftime("%Y-%m-%d"), "time": dt.strftime("%H:%M"), "timeIs": time_is})
+        params_alt.update(extra_params)
+        result2 = self._try_journey_request(url, params_alt, label="by_queries-fb1")
+        if result2:
+            return result2
 
-        # Fallback without date/time – let TfL pick nearby services.
-        try:
-            params_fallback = self._auth_params()
-            resp3 = self.session.get(url, params=params_fallback, timeout=8)
-            resp3.raise_for_status()
-            data3 = resp3.json()
-            journeys3 = data3.get("journeys") or []
-            return _journeys_to_summaries(journeys3)
-        except Exception:
-            return []
+        # Fallback without date/time.
+        params_fb = self._auth_params()
+        params_fb.update(extra_params)
+        return self._try_journey_request(url, params_fb, label="by_queries-fb2")
 
     # ---- Internal helpers -----------------------------------------------
 
@@ -810,6 +883,7 @@ class JourneyChatbot:
         username: str | None = None,
         nlp_origin: str | None = None,
         nlp_destination: str | None = None,
+        nlp_entities: Dict[str, Any] | None = None,
     ) -> Dict[str, Any]:
         """
         Core entry point called from Flask.
@@ -822,6 +896,8 @@ class JourneyChatbot:
         nlp_origin      : Origin extracted by the NLP pipeline (used as
                           fallback when text-based extraction finds nothing).
         nlp_destination : Destination extracted by the NLP pipeline.
+        nlp_entities    : Full entity dict from the NLP/LLM pipeline,
+                          containing via, mode, timeIs, journey_preference, etc.
 
         Returns a JSON structure the frontend can render:
         {
@@ -831,6 +907,14 @@ class JourneyChatbot:
         }
         """
         user_state = self.state["global"]
+
+        # Store LLM-extracted journey parameters in user_state so they
+        # propagate through to the TfL API call in _continue_planning.
+        if nlp_entities:
+            for key in ("via", "mode", "journey_preference", "timeIs", "near_area", "towards"):
+                if key in nlp_entities and nlp_entities[key]:
+                    user_state[f"_nlp_{key}"] = nlp_entities[key]
+                    print(f"[JourneyChatbot] Stored _nlp_{key}={nlp_entities[key]!r}")
 
         # 0) If we previously asked the user to "rephrase or give a nearby
         # station or area" and stored which side ('from' or 'to') failed, then
@@ -851,24 +935,32 @@ class JourneyChatbot:
             # Continue planning immediately with the updated query.
             return self._continue_planning(text, user_state, now, username=username)
 
-        # 1) Text-based extraction: "from X to Y" / "to Y from X" patterns.
-        self._apply_full_plan_if_present(text, user_state, now=now)
-        if "fromQuery" not in user_state or "toQuery" not in user_state:
-            self._maybe_extract_initial_intent(text, user_state)
-
-        # 2) NLP fallback: use the NER-extracted slots for any slot still missing.
-        #    This makes use of the SpaCy journey slot extractor that runs in
-        #    ner_processor.py before the message reaches the journey planner.
+        # 1) LLM-extracted slots are the sole source for journey origin/destination.
+        #    Rule-based regex extraction (_apply_full_plan_if_present,
+        #    _maybe_extract_initial_intent) has been removed.
         if nlp_origin and "fromQuery" not in user_state:
             user_state["fromQuery"] = nlp_origin
-            print(f"[JourneyChatbot] fromQuery from NLP: {nlp_origin!r}")
+            print(f"[JourneyChatbot] fromQuery from LLM: {nlp_origin!r}")
         if nlp_destination and "toQuery" not in user_state:
             user_state["toQuery"] = nlp_destination
-            print(f"[JourneyChatbot] toQuery from NLP: {nlp_destination!r}")
+            print(f"[JourneyChatbot] toQuery from LLM: {nlp_destination!r}")
 
-        # 3) If user said just "plan a journey" (or similar) without from/to,
+        # Also extract date/time from LLM entities if available and no when set yet
+        if nlp_entities and "when" not in user_state:
+            llm_time = nlp_entities.get("time")
+            llm_date = nlp_entities.get("date")
+            if llm_time or llm_date:
+                # Try to parse date/time from LLM output; fall back to "now" on failure
+                when = _parse_journey_datetime(text, now=now) or _parse_on_date_time(text)
+                if when:
+                    user_state["when"] = when
+                    # Apply LLM timeIs if present
+                    if nlp_entities.get("timeIs"):
+                        user_state["when"]["timeIs"] = nlp_entities["timeIs"]
+
+        # 2) If user said just "plan a journey" (or similar) without from/to,
         #    start fresh so we ask "Where from?" instead of reusing old state.
-        #    BUT if this very message already gave us a from/to (e.g.
+        #    BUT if this very message already gave us a from/to via LLM (e.g.
         #    "plan a journey from Neasden"), keep that slot and do NOT reset.
         if self._is_new_plan_without_locations(text) and "fromQuery" not in user_state and "toQuery" not in user_state:
             for key in (
@@ -939,6 +1031,9 @@ class JourneyChatbot:
                 from_id=from_id,
                 to_id=to_id,
                 when=user_state["when"],
+                via=user_state.get("_nlp_via"),
+                mode=user_state.get("_nlp_mode"),
+                journey_preference=user_state.get("_nlp_journey_preference"),
             )
 
             if not journeys:
@@ -981,9 +1076,36 @@ class JourneyChatbot:
         # /chat router keeps sending follow-up messages here until we either
         # reset the state or finish successfully.
         user_state["journey_planning_active"] = True
+
+        # Extract LLM-derived TfL API parameters from user_state
+        _via = user_state.get("_nlp_via")
+        _mode = user_state.get("_nlp_mode")
+        _journey_pref = user_state.get("_nlp_journey_preference")
+
         def _journey_reply(with_name: bool = False) -> str:
-            base = "Here are your journey options."
-            return base + (f", {username}." if username and with_name else ".")
+            base = "Here are your journey options"
+            if with_name and username:
+                base += f", {username}"
+            # Mention active preferences so the user knows what was applied
+            notes = []
+            if _mode:
+                notes.append(f"mode: {_mode}")
+            if _via:
+                notes.append(f"via {_via}")
+            if _journey_pref:
+                _JP_LABELS = {
+                    "leastinterchange": "fewest changes",
+                    "leasttime": "fastest",
+                    "leastwalking": "least walking",
+                }
+                notes.append(_JP_LABELS.get(_journey_pref.lower(), _journey_pref))
+            if notes:
+                base += f" ({', '.join(notes)})"
+            return base + "."
+
+        # Override timeIs from LLM if available (e.g. user said "arrive by 6pm")
+        if "_nlp_timeIs" in user_state and "when" in user_state:
+            user_state["when"]["timeIs"] = user_state["_nlp_timeIs"]
 
         # 1) If we have from, to and when, try the journey API with place names first.
         if "fromQuery" in user_state and "toQuery" in user_state and "when" in user_state:
@@ -991,6 +1113,9 @@ class JourneyChatbot:
                 from_query=user_state["fromQuery"],
                 to_query=user_state["toQuery"],
                 when=user_state["when"],
+                via=_via,
+                mode=_mode,
+                journey_preference=_journey_pref,
             )
             if journeys:
                 reply = _journey_reply(True)
@@ -1026,6 +1151,9 @@ class JourneyChatbot:
             from_id=user_state["fromLocationId"],
             to_id=user_state["toLocationId"],
             when=user_state["when"],
+            via=_via,
+            mode=_mode,
+            journey_preference=_journey_pref,
         )
 
         if not journeys:
@@ -1047,100 +1175,10 @@ class JourneyChatbot:
 
     # ---- Internal helpers -----------------------------------------------
 
-    def _apply_full_plan_if_present(self, text: str, user_state: Dict[str, Any], now: datetime) -> None:
-        """
-        If the message contains both origin and destination, extract them and
-        set fromQuery / toQuery.  Handles both word orders:
-          - "from X to Y"   (standard)
-          - "to Y from X"   (reversed, e.g. "take me to Oxford Circus from Neasden")
-
-        Uses original casing for place names passed to the TfL API.
-        Strips trailing date/time phrases from each location span.
-        """
-        t = text.strip()
-
-        from_part: Optional[str] = None
-        to_part: Optional[str] = None
-
-        # ---- Try "from X to Y" (standard order) ----
-        m = re.search(
-            r'\bfrom\s+(.+?)\s+to\s+(.+?)(?:\s+(?:at|on)\b.*)?$',
-            t, re.IGNORECASE,
-        )
-        if m:
-            from_part = _strip_datetime_suffix(m.group(1).strip())
-            to_part   = _strip_datetime_suffix(m.group(2).strip())
-
-        # ---- Try "to Y from X" (reversed order) ----
-        # Greedy .* at the front makes the engine find the LAST "to" before "from".
-        if not from_part or not to_part:
-            m = re.search(
-                r'.*\bto\s+(.+?)\s+from\s+(.+?)(?:\s+(?:at|on)\b.*)?$',
-                t, re.IGNORECASE,
-            )
-            if m:
-                # Example of this pattern we DO want:
-                #   "get me to Oxford Circus from Neasden"
-                # Example we do NOT want:
-                #   "I want to plan a journey from Harlesden"
-                candidate_to   = _strip_datetime_suffix(m.group(1).strip())
-                candidate_from = _strip_datetime_suffix(m.group(2).strip())
-
-                def _looks_like_non_place_control_phrase(s: str) -> bool:
-                    """Heuristic: phrases like 'plan a journey', 'get me', 'need to' should not be treated as destinations."""
-                    if not s:
-                        return True
-                    # Strip leading quotes / brackets so examples like
-                    # `"plan a journey from Harlesden"` don't slip through.
-                    s_lower = s.lower().lstrip(" '\"“”‘’(")
-                    leading_verbs = (
-                        "plan",
-                        "planning",
-                        "get",
-                        "getting",
-                        "need",
-                        "needing",
-                        "want",
-                        "wanting",
-                        "go",
-                        "going",
-                        "leave",
-                        "leaving",
-                        "start",
-                        "starting",
-                        "travel",
-                        "travelling",
-                        "traveling",
-                    )
-                    if any(s_lower.startswith(v + " ") for v in leading_verbs):
-                        return True
-                    # Phrases that clearly describe actions, not places
-                    if "journey" in s_lower or "trip" in s_lower or "route" in s_lower:
-                        return True
-                    return False
-
-                # Only accept the reversed pattern if the "to" side looks like a
-                # genuine place name rather than a control phrase.
-                if not _looks_like_non_place_control_phrase(candidate_to):
-                    to_part   = candidate_to
-                    from_part = candidate_from
-
-        if not from_part or not to_part:
-            return
-
-        user_state["fromQuery"] = from_part
-        user_state["toQuery"]   = to_part
-
-        for key in (
-            "fromLocationId", "toLocationId",
-            "fromOptions",    "toOptions",
-            "fromQuestion",   "toQuestion",
-            "askedWhen",      "when",
-        ):
-            user_state.pop(key, None)
-
-        when = _parse_journey_datetime(text, now=now) or _parse_on_date_time(text)
-        user_state["when"] = when or {"datetime": now, "timeIs": "Departing"}
+    # _apply_full_plan_if_present() has been removed.
+    # Journey origin/destination extraction is now handled exclusively by the
+    # LLM-based extractor (llm_entity_extractor.py). The LLM-extracted slots
+    # (nlp_origin, nlp_destination) are passed directly to handle_message().
 
     def _is_new_plan_without_locations(self, text: str) -> bool:
         """
@@ -1155,64 +1193,10 @@ class JourneyChatbot:
         has_from_to = " from " in t and " to " in t
         return bool(has_plan and not has_from_to)
 
-    def _maybe_extract_initial_intent(self, text: str, user_state: Dict[str, Any]):
-        """
-        Partial-slot extraction: sets whichever of fromQuery / toQuery is still
-        missing after _apply_full_plan_if_present ran.
-
-        Handles:
-          - "from X" only  → sets fromQuery
-          - "to X" only    → sets toQuery (greedily finds the LAST "to")
-        Uses original casing; strips trailing date/time noise.
-        """
-        t = text.strip()
-
-        def _starts_with_verb_or_pronoun(phrase: str) -> bool:
-            """
-            Heuristic: if a candidate place phrase starts with a verb or pronoun
-            (e.g. 'plan a journey', 'i want', 'we need'), we do NOT treat it as
-            a from/to location.
-            """
-            if not phrase:
-                return False
-            first = phrase.strip().split()[0].lower().strip(" '\"“”‘’(),.")
-            bad_starts = {
-                # Pronouns / determiners
-                "i", "i'm", "im", "me", "you", "we", "they", "he", "she", "it",
-                "my", "your", "our", "their", "his", "her", "its",
-                "this", "that", "these", "those",
-                # Common journey verbs
-                "go", "going", "get", "getting", "take", "taking",
-                "plan", "planning", "travel", "travelling", "traveling",
-                "leave", "leaving", "depart", "departing",
-                "start", "starting", "head", "heading", "navigate",
-                "navigating", "walk", "walking", "drive", "driving",
-                "catch", "catching", "need", "needing", "want", "wanting",
-                "know", "see", "make", "do", "be", "have",
-            }
-            return first in bad_starts
-
-        if "fromQuery" not in user_state:
-            # "from X" – stop before "to", "at", "on"
-            m = re.search(
-                r'\bfrom\s+(.+?)(?:\s+(?:to|at|on)\b.*)?$',
-                t, re.IGNORECASE,
-            )
-            if m:
-                part = _strip_datetime_suffix(m.group(1).strip())
-                if part and not _starts_with_verb_or_pronoun(part):
-                    user_state.setdefault("fromQuery", part)
-
-        if "toQuery" not in user_state:
-            # Greedy .* finds the LAST "to" (avoids "I want TO travel TO X" picking "travel")
-            m = re.search(
-                r'.*\bto\s+(.+?)(?:\s+(?:from|at|on)\b.*)?$',
-                t, re.IGNORECASE,
-            )
-            if m:
-                part = _strip_datetime_suffix(m.group(1).strip())
-                if part and not _starts_with_verb_or_pronoun(part):
-                    user_state.setdefault("toQuery", part)
+    # _maybe_extract_initial_intent() has been removed.
+    # Partial-slot extraction (origin-only or destination-only) is now handled
+    # by the LLM extractor. The LLM extracts whichever slots are present in the
+    # user’s message and they are passed via nlp_origin / nlp_destination.
 
     def _handle_location_disambiguation(
         self,
@@ -1227,6 +1211,9 @@ class JourneyChatbot:
         key_prefix is 'from' or 'to'. When a location is resolved (single option or user pick),
         continues the flow in the same request so we can resolve the other location and
         return journey options without requiring another user message.
+
+        Uses the unified DisambiguationEngine for geospatial + semantic + fuzzy scoring
+        to rank candidates and decide whether to auto-resolve or present options.
         """
         query_key = f"{key_prefix}Query"
         chosen_id_key = f"{key_prefix}LocationId"
@@ -1243,10 +1230,9 @@ class JourneyChatbot:
                 "state": user_state,
             }
 
-        # 1) If we don't have the raw text query yet: either ask for it, or use this message as the answer (e.g. user replied "neasden station").
+        # 1) If we don't have the raw text query yet: either ask for it, or use this message as the answer.
         if query_key not in user_state:
-            user_state["journey_planning_active"] = True  # so next message is routed to journey planner
-            # Don't use the same message for "to" that we already used for "from" (we may be in same request after _continue_after_resolve).
+            user_state["journey_planning_active"] = True
             other_query_key = "toQuery" if key_prefix == "from" else "fromQuery"
             if key_prefix == "to" and user_state.get(other_query_key) == (text or "").strip():
                 return {
@@ -1254,33 +1240,44 @@ class JourneyChatbot:
                     "journeys": [],
                     "state": user_state,
                 }
-            # Don't treat a disambiguation-style reply (e.g. "5") as a place name for "to" when we're continuing after resolving "from".
             if key_prefix == "to" and (text or "").strip().isdigit():
                 return {
                     "reply": "Where are you travelling to?",
                     "journeys": [],
                     "state": user_state,
                 }
-            # If the other slot is already set (meaning this message already gave us one
-            # location via slot extraction), don't treat the full message as a place name
-            # for this slot — the extractor already had a chance and found nothing.
-            # Ask the user explicitly instead (e.g. "get me to Neasden" → ask "Where from?").
-            # BUT: if we already asked (awaiting_key flag), the user's message IS the answer.
             awaiting_key = f"awaiting_{key_prefix}Query"
             if user_state.get(other_query_key) and not user_state.get(awaiting_key):
                 direction = "from" if key_prefix == "from" else "to"
-                user_state[awaiting_key] = True  # mark that we've asked, next reply is the answer
+                user_state[awaiting_key] = True
                 return {
                     "reply": f"Where are you travelling {direction}?",
                     "journeys": [],
                     "state": user_state,
                 }
-            # Clear the awaiting flag — we've received the answer.
             user_state.pop(awaiting_key, None)
-            # If the user sent a place name in reply to our question, use it and continue.
-            if (text or "").strip() and not self._is_new_plan_without_locations(text):
-                user_state[query_key] = text.strip()
-                # Fall through to step 3 to get options / disambiguate for this query.
+            cleaned = (text or "").strip()
+            if cleaned and not self._is_new_plan_without_locations(cleaned):
+                t = cleaned.lower()
+                looks_like_full_request = (
+                    (" go to " in t)
+                    or (" get to " in t)
+                    or (" take me to " in t)
+                    or (" directions to " in t)
+                    or (" navigate to " in t)
+                    or (" from " in t and " to " in t)
+                    or (" want to travel " in t)
+                    or (" need to travel " in t)
+                )
+                if looks_like_full_request:
+                    direction = "from" if key_prefix == "from" else "to"
+                    user_state[awaiting_key] = True
+                    return {
+                        "reply": f"Where are you travelling {direction}? (Just the place name, e.g. 'Neasden Station')",
+                        "journeys": [],
+                        "state": user_state,
+                    }
+                user_state[query_key] = cleaned
             else:
                 return {
                     "reply": f"Where are you travelling { 'from' if key_prefix == 'from' else 'to' }?",
@@ -1293,7 +1290,7 @@ class JourneyChatbot:
             options = user_state[pending_options_key]
             choice = text.strip().lower()
 
-            # Match by number (e.g. "1", "2") like bus stop disambiguation.
+            # Match by number (e.g. "1", "2")
             if choice.isdigit():
                 idx = int(choice)
                 if 1 <= idx <= len(options):
@@ -1323,8 +1320,6 @@ class JourneyChatbot:
                     "state": user_state,
                 }
 
-            # no match, fall back to asking again with options
-
         # 3) Get place options: Google Places API if key set, else TfL disambiguation.
         query = user_state[query_key]
         if self.google_places_api_key:
@@ -1333,9 +1328,6 @@ class JourneyChatbot:
             options = self.tfl_client.disambiguate_location(query)
 
         if not options:
-            # Remember which side ('from' or 'to') we need a rephrased location for,
-            # so the next short reply (e.g. "neasden") can be treated as a new
-            # location value for that side.
             user_state["journey_planning_active"] = True
             user_state["pending_location_rephrase_for"] = key_prefix
             reply = (
@@ -1350,14 +1342,52 @@ class JourneyChatbot:
                 "state": user_state,
             }
 
-        if len(options) == 1:
-            user_state[chosen_id_key] = options[0]["id"]
+        # ---- Unified Disambiguation Engine ----
+        # Convert options to DisambiguationCandidate objects
+        candidates = candidates_from_journey_options(options)
+
+        # Build a spatial anchor from LLM-extracted near_area or the query itself
+        anchor = self._build_spatial_anchor(query, user_state)
+
+        # Run the disambiguation engine
+        engine = get_disambiguation_engine()
+        result = engine.disambiguate(
+            query=query,
+            candidates=candidates,
+            anchor=anchor,
+            mode="journey",
+        )
+
+        if result.resolved and result.chosen:
+            # Auto-resolved: use the chosen candidate directly
+            user_state[chosen_id_key] = result.chosen.id
+            print(f"[JourneyChatbot] Auto-resolved '{query}' → '{result.chosen.name}' (score={result.top_score:.3f})")
             return _continue_after_resolve()
 
-        # Multiple options: ask disambiguation (same style as bus stop disambiguation).
-        user_state[pending_options_key] = options
+        if result.action == "ask_rephrase":
+            user_state["journey_planning_active"] = True
+            user_state["pending_location_rephrase_for"] = key_prefix
+            reply = (
+                f"I couldn't confidently match '{query}' to a specific location. "
+                "Could you rephrase or give a nearby station or area?"
+            )
+            return {
+                "reply": reply,
+                "journeys": [],
+                "state": user_state,
+            }
+
+        # present_options: show ranked candidates to user
+        # Convert ranked candidates back to option dicts for state storage
+        ranked_options = [c.to_dict() for c in result.candidates]
+        user_state[pending_options_key] = ranked_options
         direction = "from" if key_prefix == "from" else "to"
-        lines = [f"  {i}. {o['name']}" + (f" ({o['qualifier']})" if o.get("qualifier") else "") for i, o in enumerate(options, 1)]
+        lines = []
+        for i, c in enumerate(result.candidates, 1):
+            label = c.label or c.name
+            qualifier = f" ({c.qualifier})" if c.qualifier else ""
+            distance_info = f" [{c.distance_km:.1f}km away]" if c.distance_km is not None else ""
+            lines.append(f"  {i}. {label}{qualifier}{distance_info}")
         question = (
             f"Which place did you mean for '{query}' ({direction})?\n"
             + "\n".join(lines)
@@ -1365,8 +1395,8 @@ class JourneyChatbot:
         )
         user_state[pending_question_key] = question
 
-        # Build place_disambiguation for frontend map: options with lat, lon, label, name (id is often "lat,lng" from Google Places).
-        place_disambiguation = _build_place_disambiguation_for_map(options, query, direction)
+        # Build place_disambiguation for frontend map
+        place_disambiguation = _build_place_disambiguation_for_map(ranked_options, query, direction)
 
         reply = question
         if self.tfl_client.last_url:
@@ -1378,6 +1408,46 @@ class JourneyChatbot:
             "disambiguation": True,
             "place_disambiguation": place_disambiguation,
         }
+
+    def _build_spatial_anchor(
+        self, query: str, user_state: Dict[str, Any]
+    ) -> Optional[SpatialAnchor]:
+        """
+        Build a SpatialAnchor for disambiguation from available context.
+
+        Priority:
+          1. LLM-extracted 'near_area' entity → ground via Places API
+          2. LLM-extracted 'towards' context  → ground via Places API
+          3. The query itself                  → ground via Places API (weaker anchor)
+        """
+        grounder = get_grounder()
+        if not grounder.available:
+            return None
+
+        # Check for near_area from LLM entities stored in user_state
+        near_area = user_state.get("_nlp_near_area")
+        if near_area:
+            places_result = grounder.ground(near_area)
+            anchor = anchor_from_places(places_result, source="near_area")
+            if anchor:
+                print(f"[JourneyChatbot] Spatial anchor from near_area='{near_area}': ({anchor.lat}, {anchor.lng})")
+                return anchor
+
+        # Check for towards context
+        towards = user_state.get("_nlp_towards")
+        if towards:
+            places_result = grounder.ground(towards)
+            anchor = anchor_from_places(places_result, source="towards")
+            if anchor:
+                print(f"[JourneyChatbot] Spatial anchor from towards='{towards}': ({anchor.lat}, {anchor.lng})")
+                return anchor
+
+        # Fall back to grounding the query itself (weaker — the query IS the ambiguous thing)
+        places_result = grounder.ground(query)
+        anchor = anchor_from_places(places_result, source="places_query")
+        if anchor:
+            print(f"[JourneyChatbot] Spatial anchor from query='{query}': ({anchor.lat}, {anchor.lng})")
+        return anchor
 
     def _handle_datetime(
         self, text: str, user_state: Dict[str, Any], now: datetime
@@ -1427,6 +1497,12 @@ class JourneyChatbot:
             "journey_planning_active",
             "awaiting_fromQuery",
             "awaiting_toQuery",
+            # LLM-extracted TfL API parameters
+            "_nlp_via",
+            "_nlp_mode",
+            "_nlp_journey_preference",
+            "_nlp_timeIs",
+            "pending_location_rephrase_for",
         ):
             user_state.pop(key, None)
 
