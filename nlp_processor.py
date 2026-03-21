@@ -217,9 +217,15 @@ class NLPProcessor:
             for key, value in legacy_entities.items():
                 if key not in entities:
                     entities[key] = value
-        # ---- CSV-backed refinement (preserved from original) ----
+        # ---- Timetable mode hint from raw text (bus vs train) ----
+        # Honour explicit "bus"/"train"/"tube" wording from the user, even when
+        # the LLM suggests a different mode based on stop metadata.
+        if intent == "ask_timetable":
+            self._apply_timetable_mode_hint(text, entities)
+
+        # ---- CSV-backed refinement (backup only when LLM failed) ----
         intent, entities, confidence = self._refine_with_stop_datasets(
-            original_text, intent, entities, confidence
+            original_text, intent, entities, confidence, llm_ok
         )
 
         # ---- Scope journey slots to journey-planning intent ----
@@ -249,9 +255,38 @@ class NLPProcessor:
                 if intent == "ask_timetable" and entities.get("destination") and not entities.get("towards"):
                     entities["towards"] = entities["destination"]
                     print(f"[NLP] Promoted destination='{entities['destination']}' → towards for timetable query")
-                for k in ("origin", "destination", "origin_grounded", "destination_grounded"):
+                for k in (
+                    "origin",
+                    "destination",
+                    "origin_grounded",
+                    "destination_grounded",
+                ):
                     entities.pop(k, None)
         print(f"[NLP] Final intent: {intent}, entities: {entities}")
+        # LLM sometimes puts the whole sentence in one slot; the first-word filter
+        # below misses phrases starting with "from …" or "a journey …".
+        o_raw = (entities.get("origin") or "").strip()
+        d_raw = (entities.get("destination") or "").strip()
+
+        def _compound_journey_phrase(s: str) -> bool:
+            if not s:
+                return False
+            sl = s.lower()
+            if "plan" in sl and "journey" in sl:
+                return True
+            return " from " in f" {s} " and " to " in sl
+
+        if _compound_journey_phrase(o_raw) or _compound_journey_phrase(d_raw):
+            try:
+                recovered = self._journey_slot_extractor.extract_journey_slots(original_text)
+                if recovered.get("origin"):
+                    entities["origin"] = recovered["origin"]
+                if recovered.get("destination"):
+                    entities["destination"] = recovered["destination"]
+                print(f"[NLP] Recovered journey slots from compound phrase: {recovered}")
+            except Exception as exc:
+                print(f"[NLP] Compound phrase recovery failed: {exc}")
+
         # Final safety: if, after all filters, an origin/destination still starts
         # with a verb/pronoun due to some unexpected path, drop it here as well.
         for slot_key in ("origin", "destination"):
@@ -265,11 +300,13 @@ class NLPProcessor:
                 "this", "that", "these", "those",
                 "go", "going", "get", "getting", "take", "taking",
                 "plan", "planning", "travel", "travelling", "traveling",
+                "journey", "journeys",
                 "leave", "leaving", "depart", "departing",
                 "start", "starting", "head", "heading", "navigate",
                 "navigating", "walk", "walking", "drive", "driving",
                 "catch", "catching", "need", "needing", "want", "wanting",
                 "know", "see", "make", "do", "be", "have",
+                "from",  # "from X to Y" accidentally stored only in origin
             }
             if first_word in bad_starts:
                 entities.pop(slot_key, None)
@@ -279,6 +316,31 @@ class NLPProcessor:
             'entities': entities,
             'confidence': confidence
         }
+
+    def _apply_timetable_mode_hint(self, text: str, entities: Dict[str, Any]) -> None:
+        """
+        Enforce the user's explicit wording for timetable mode:
+          - If they say 'bus' (and not train/tube), force bus.
+          - If they say 'train'/'tube' (and not bus), force train.
+          - If they mention both, use 'both'.
+
+        This runs even when LLM entities are present so that a clear user
+        preference like "bus times for Rayners Lane" is not overridden by
+        station metadata that also serves trains.
+        """
+        t = (text or "").lower()
+
+        has_bus = "bus" in t or "coach" in t
+        has_train_like = any(
+            kw in t for kw in ("train", "tube", "overground", "dlr", "rail", "underground")
+        )
+
+        if has_bus and has_train_like:
+            entities["timetable_mode"] = "both"
+        elif has_bus and not has_train_like:
+            entities["timetable_mode"] = "bus"
+        elif has_train_like and not has_bus:
+            entities["timetable_mode"] = "train"
     
     def _normalize_llm_entities(self, llm_entities: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -296,7 +358,8 @@ class NLPProcessor:
         # distinct from journey planner origin/destination.  It must not overwrite
         # journey-planner slots and is only meaningful when intent == 'ask_timetable'.
         for key in ("origin", "destination", "location", "date", "time",
-                     "bus_route", "near_area", "towards"):
+                     "bus_route", "near_area", "towards",
+                     "origin_near_area", "destination_near_area"):
             if key in llm_entities:
                 entities[key] = llm_entities[key]
 
@@ -956,15 +1019,26 @@ class NLPProcessor:
         intent: str,
         entities: Dict[str, Any],
         confidence: float,
+        llm_used: bool,
     ):
         """
-        Use CSV stop names as an additional NER + slot-filling and intent hint layer.
+        Use CSV stop names as a backup NER + slot-filling and intent hint layer.
         
-        - Detect if the user text closely matches a known bus or train stop.
-        - Infer whether this is a bus or train timetable query.
-        - Cooperate with existing rule-based / transformer intent detection and
-          with the downstream disambiguation engine in the TFL API.
+        When the LLM entity extractor has already produced entities (llm_used=True),
+        this method leaves them untouched and returns immediately so that LLM output
+        is the single source of truth for bus/train times.
+        
+        When llm_used is False (LLM unavailable or failed), this acts as a
+        heuristic backup:
+          - Detect if the user text closely matches a known bus or train stop.
+          - Infer whether this is a bus or train timetable query.
+          - Cooperate with existing rule-based / transformer intent detection and
+            with the downstream disambiguation engine in the TFL API.
         """
+        # If LLM entities were successfully extracted, do not apply CSV refinement;
+        # LLM should be primary for bus/train timetable extraction.
+        if llm_used:
+            return intent, entities, confidence
         text_lower = original_text.lower()
 
         # Only run this refinement when the user is clearly talking about

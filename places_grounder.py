@@ -1,20 +1,14 @@
 """
 Places Grounder – resolves raw location strings to structured place data
-via the Google Places API (Text Search).
-
-Setup
------
-Set the environment variable ``GOOGLE_PLACES_API_KEY`` to your key.
-If the key is absent the grounder silently disables itself and extraction
-continues with the raw text (the TfL API can usually resolve it anyway).
+via OpenStreetMap Nominatim search.
 
 Returned structure
 ------------------
 Each successful grounding returns a dict:
     {
         "name":              "Wembley Central",
-        "formatted_address": "Wembley Central, Wembley HA9 7AD, UK",
-        "place_id":          "ChIJ...",
+        "formatted_address": "Wembley Central, Wembley HA9 7AD, United Kingdom",
+        "place_id":          "nominatim:123456",
         "lat":               51.5528,
         "lng":               -0.2966,
     }
@@ -27,37 +21,39 @@ additional API calls.
 
 from __future__ import annotations
 
-import os
 import time
 from typing import Dict, Optional
 
 # ---------------------------------------------------------------------------
-# London centre coordinates – used to bias Place Search results
+# London bounds – used to restrict search results
 # ---------------------------------------------------------------------------
-_LONDON_LAT = 51.5074
-_LONDON_LNG = -0.1278
-_SEARCH_RADIUS_M = 30_000   # 30 km – covers Greater London
+_LONDON_BOUNDS = {
+    "left": -0.489,   # west lon
+    "right": 0.236,   # east lon
+    "top": 51.686,    # north lat
+    "bottom": 51.28,  # south lat
+}
 
-# How long to wait (seconds) between API requests to stay under rate limits
-_REQUEST_DELAY = 0.05
+# Nominatim usage policy is strict; keep to ~1 request per second.
+_REQUEST_DELAY = 1.05
 
 
 class PlacesGrounder:
     """
-    Wraps the Google Places Text Search API with in-process caching.
+    Wraps OpenStreetMap Nominatim search with in-process caching.
 
     Attributes:
-        available: True only when a valid API key is configured.
+        available: True when dependency requirements are met.
     """
 
     def __init__(self, api_key: Optional[str] = None):
-        self._api_key = api_key or os.environ.get("GOOGLE_PLACES_API_KEY") or ""
+        # Keep signature for backward compatibility (api_key is unused now).
         self._cache: Dict[str, Optional[Dict]] = {}
         self._last_request_ts: float = 0.0
 
     @property
     def available(self) -> bool:
-        return bool(self._api_key)
+        return True
 
     def ground(self, query: str) -> Optional[Dict]:
         """
@@ -93,7 +89,7 @@ class PlacesGrounder:
     # ------------------------------------------------------------------
 
     def _call_api(self, query: str) -> Optional[Dict]:
-        """Make one Text Search request and return the top result."""
+        """Make one Nominatim request and return the top result."""
         try:
             import requests
         except ImportError:
@@ -108,39 +104,77 @@ class PlacesGrounder:
         # Append "London" to bias results toward the city
         search_query = f"{query.strip()} London"
 
-        url = "https://maps.googleapis.com/maps/api/place/textsearch/json"
+        url = "https://nominatim.openstreetmap.org/search"
         params = {
-            "query":    search_query,
-            "location": f"{_LONDON_LAT},{_LONDON_LNG}",
-            "radius":   str(_SEARCH_RADIUS_M),
-            "key":      self._api_key,
+            "q": search_query,
+            "format": "jsonv2",
+            "limit": 1,
+            "addressdetails": 1,
+            "countrycodes": "gb",
+            "viewbox": (
+                f"{_LONDON_BOUNDS['left']},{_LONDON_BOUNDS['top']},"
+                f"{_LONDON_BOUNDS['right']},{_LONDON_BOUNDS['bottom']}"
+            ),
+            "bounded": 1,
+        }
+        headers = {
+            "User-Agent": "TravelAssistant/1.0 (local app)",
+            "Accept-Language": "en-GB,en",
         }
 
         try:
-            resp = requests.get(url, params=params, timeout=5)
+            resp = requests.get(url, params=params, headers=headers, timeout=6)
+            resp.raise_for_status()
             self._last_request_ts = time.time()
             data = resp.json()
         except Exception as exc:
             print(f"[PlacesGrounder] API request failed: {exc}")
             return None
 
-        if data.get("status") not in ("OK", "ZERO_RESULTS"):
-            print(f"[PlacesGrounder] API status: {data.get('status')} – {data.get('error_message', '')}")
+        if not isinstance(data, list) or not data:
             return None
 
-        results = data.get("results", [])
-        if not results:
-            return None
+        top = data[0]
+        lat_raw = top.get("lat")
+        lon_raw = top.get("lon")
+        try:
+            lat = float(lat_raw) if lat_raw is not None else None
+            lng = float(lon_raw) if lon_raw is not None else None
+        except (TypeError, ValueError):
+            lat, lng = None, None
 
-        top = results[0]
-        location = top.get("geometry", {}).get("location", {})
+        # Extract structured address fields from Nominatim addressdetails.
+        # These are far more precise than just lat/lng for disambiguation:
+        #   suburb       → neighbourhood name  (e.g. "Sudbury", "Kingsbury")
+        #   city_district → borough name        (e.g. "London Borough of Brent")
+        #   postcode     → full postcode        (e.g. "HA0 2LL")
+        addr = top.get("address") or {}
+        raw_postcode = addr.get("postcode", "")
+        # Postcode prefix = everything before the space: "HA0 2LL" → "HA0"
+        postcode_prefix = raw_postcode.split()[0].upper() if raw_postcode else ""
+
+        # Borough: try city_district first, then look for "London Borough of X"
+        # or "Royal Borough of X" pattern in the display_name as a fallback.
+        borough = addr.get("city_district", "")
+        if not borough:
+            import re as _re
+            m = _re.search(
+                r'((?:London|Royal) Borough of [A-Za-z &]+)',
+                top.get("display_name", ""),
+            )
+            if m:
+                borough = m.group(1).strip().rstrip(",")
 
         return {
-            "name":              top.get("name", query),
-            "formatted_address": top.get("formatted_address", ""),
-            "place_id":          top.get("place_id", ""),
-            "lat":               location.get("lat"),
-            "lng":               location.get("lng"),
+            "name": top.get("display_name", query).split(",")[0].strip(),
+            "formatted_address": top.get("display_name", ""),
+            "place_id": f"nominatim:{top.get('place_id', '')}",
+            "lat": lat,
+            "lng": lng,
+            # Structured address fields — used for hard-boundary candidate matching
+            "suburb":           addr.get("suburb", ""),
+            "borough":          borough,
+            "postcode_prefix":  postcode_prefix,
         }
 
 

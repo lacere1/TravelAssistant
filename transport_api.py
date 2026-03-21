@@ -1386,12 +1386,14 @@ class TransportDataFetcher:
         'liberty': 'liberty',
         'dlr': 'dlr',
         'docklands light railway': 'dlr',
+        'elizabeth': 'elizabeth',
+        'elizabeth line': 'elizabeth',
     }
 
     def get_transit_disruption(self, line: str) -> Optional[Dict[str, Any]]:
         """
-        Get transit disruption for a train line (Underground, Overground, DLR).
-        Uses Line/Mode/tube,dlr,overground/Status; returns status or error dict.
+        Get transit disruption for a train line (Underground, Overground, DLR, Elizabeth line).
+        Uses GET /Line/{line_id}/Status so Elizabeth (mode elizabeth) is included alongside tube/DLR/Overground.
         Returns: dict with status/description, or dict with 'error': 'line_not_found'|'api_error'.
         """
         if not self.has_tfl:
@@ -1413,7 +1415,7 @@ class TransportDataFetcher:
         if not line_id:
             return {'error': 'line_not_found', 'line': line}
         try:
-            url = f"{self.tfl_base_url}/Line/Mode/tube,dlr,overground/Status"
+            url = f"{self.tfl_base_url}/Line/{line_id}/Status"
             params = {**self._tfl_params(), 'detail': True}
             response = requests.get(url, params=params, timeout=10)
             response.raise_for_status()

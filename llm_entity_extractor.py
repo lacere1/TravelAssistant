@@ -39,8 +39,10 @@ Do NOT guess or hallucinate values that aren't present.
 ### Entity schema
 
 **Core journey slots**
-- "origin"            : string – where the user is travelling FROM (place name, postcode, or coordinates)
-- "destination"       : string – where the user is travelling TO (place name, postcode, or coordinates)
+- "origin"            : string – where the user is travelling FROM (place name ONLY — strip any "near X" or "(near X)" context and put it in "origin_near_area" instead)
+- "destination"       : string – where the user is travelling TO (place name ONLY — strip any "near X" or "(near X)" context and put it in "destination_near_area" instead)
+- "origin_near_area"  : string – area/neighbourhood context for the ORIGIN location. Extract from proximity phrases attached to the origin: "near X", "(near X)", "in X", "by X", "around X". For example: "from Harrow Road near Sudbury" → origin="Harrow Road", origin_near_area="Sudbury". "from Lavender Avenue (near Kingsbury)" → origin="Lavender Avenue", origin_near_area="Kingsbury". Only extract if the user explicitly provides area context for the origin.
+- "destination_near_area" : string – area/neighbourhood context for the DESTINATION location. Same rules as origin_near_area but for the destination. For example: "to Lavender Avenue near Wembley" → destination="Lavender Avenue", destination_near_area="Wembley". "to Harrow Road (near Paddington)" → destination="Harrow Road", destination_near_area="Paddington".
 - "via"               : string – an intermediate waypoint the user wants to travel THROUGH (e.g. "via King's Cross", "through Baker Street"). Can be a place name, UK postcode, or coordinates.
 - "date"              : string – travel date in natural language (e.g. "tomorrow", "next Monday", "25th March")
 - "time"              : string – travel time in natural language (e.g. "9am", "around 3pm", "morning")
@@ -68,7 +70,12 @@ Do NOT guess or hallucinate values that aren't present.
 ### Rules
 1. Return ONLY valid JSON – no markdown, no explanation, no wrapping.
 2. Omit keys that have no evidence in the user's text.
-3. For "origin", "destination", and "via", extract the place name exactly as the user typed it.
+3. For "origin" and "destination", extract ONLY the core place name — strip any "near X", "(near X)", "in X", "by X", "around X" context and put the area in "origin_near_area" / "destination_near_area" respectively. For "via", extract the place name exactly as the user typed it.
+   Examples:
+   - "plan a journey from Harrow Road (near sudbury) to lavender avenue (near wembley)" → origin="Harrow Road", origin_near_area="sudbury", destination="lavender avenue", destination_near_area="wembley"
+   - "from Oxford Street near Marble Arch to Brixton Road near Oval" → origin="Oxford Street", origin_near_area="Marble Arch", destination="Brixton Road", destination_near_area="Oval"
+   - "from Wembley to Paddington" → origin="Wembley", destination="Paddington" (no near_area fields)
+   - "from Lavender Avenue in Kingsbury to Harrow Road by Paddington" → origin="Lavender Avenue", origin_near_area="Kingsbury", destination="Harrow Road", destination_near_area="Paddington"
 4. If the user mentions a specific bus route number, put it in "bus_route" NOT "origin"/"destination".
 5. If the user mentions a tube/train line name, put it in "tube_line".
 6. "location" is for single-location queries like "bus times at Oxford Circus" – not for journey endpoints.
@@ -133,7 +140,7 @@ class LLMEntityExtractor:
 
     def __init__(
         self,
-        model: str = "claude-haiku-4-5-20251001",
+        model: str = "claude-sonnet-4-6",
         max_tokens: int = 512,
         temperature: float = 0.0,
         cache_ttl: int = 300,       # seconds

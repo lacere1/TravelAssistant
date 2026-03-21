@@ -283,6 +283,8 @@ class JourneySlots:
     """Structured result of slot extraction."""
     origin: Optional[str] = None          # raw extracted text (user's casing)
     destination: Optional[str] = None
+    origin_near_area: Optional[str] = None     # "near X" context for origin
+    destination_near_area: Optional[str] = None  # "near X" context for destination
     origin_grounded: Optional[Dict] = None    # from Places API (if available)
     destination_grounded: Optional[Dict] = None
     rule_matched: str = ""                 # label of the rule that fired (debug)
@@ -294,11 +296,83 @@ class JourneySlots:
             out["origin"] = self.origin
         if self.destination:
             out["destination"] = self.destination
+        if self.origin_near_area:
+            out["origin_near_area"] = self.origin_near_area
+        if self.destination_near_area:
+            out["destination_near_area"] = self.destination_near_area
         if self.origin_grounded:
             out["origin_grounded"] = self.origin_grounded
         if self.destination_grounded:
             out["destination_grounded"] = self.destination_grounded
         return out
+
+
+# ---------------------------------------------------------------------------
+# Near-area context extraction
+# ---------------------------------------------------------------------------
+
+# Matches "(near X)", "(in X)", "(by X)", "(around X)" — parenthesised form
+_NEAR_AREA_PAREN_RE = re.compile(
+    r'\s*\(\s*(?:near|in|by|around|close\s+to)\s+(.+?)\s*\)',
+    re.IGNORECASE,
+)
+
+# Matches "near X", "in X", "by X", "around X" — non-parenthesised, at end
+_NEAR_AREA_SUFFIX_RE = re.compile(
+    r'\s+(?:near|by|around|close\s+to)\s+(.+?)$',
+    re.IGNORECASE,
+)
+
+# "in X" suffix — more cautious: only match if what follows looks like
+# an area name (capitalised word or 2+ words), to avoid stripping "in" from
+# place names like "Stratford International"
+_NEAR_AREA_IN_SUFFIX_RE = re.compile(
+    r'\s+in\s+([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)*)$',
+)
+
+
+def _extract_near_area(location: str) -> Tuple[str, Optional[str]]:
+    """
+    Strip "near X" / "(near X)" / "in X" / "(in X)" context from a location string.
+
+    Returns (cleaned_location, near_area_or_None).
+
+    Examples:
+        "Harrow Road (near Sudbury)"    → ("Harrow Road", "Sudbury")
+        "Lavender Avenue near Wembley"  → ("Lavender Avenue", "Wembley")
+        "Harrow Road in Paddington"     → ("Harrow Road", "Paddington")
+        "Oxford Circus"                 → ("Oxford Circus", None)
+        "Harrow Road (near sudbury town)" → ("Harrow Road", "sudbury town")
+    """
+    if not location:
+        return (location, None)
+
+    # 1. Try parenthesised form first — highest confidence
+    m = _NEAR_AREA_PAREN_RE.search(location)
+    if m:
+        area = m.group(1).strip()
+        cleaned = location[:m.start()] + location[m.end():]
+        cleaned = cleaned.strip()
+        if cleaned and area:
+            return (cleaned, area)
+
+    # 2. Try non-parenthesised suffix: "near/by/around X"
+    m = _NEAR_AREA_SUFFIX_RE.search(location)
+    if m:
+        area = m.group(1).strip()
+        cleaned = location[:m.start()].strip()
+        if cleaned and area:
+            return (cleaned, area)
+
+    # 3. Try "in X" suffix (more cautious)
+    m = _NEAR_AREA_IN_SUFFIX_RE.search(location)
+    if m:
+        area = m.group(1).strip()
+        cleaned = location[:m.start()].strip()
+        if cleaned and area:
+            return (cleaned, area)
+
+    return (location, None)
 
 
 # ---------------------------------------------------------------------------
@@ -406,27 +480,84 @@ class JourneySlotExtractor:
         Returns:
             A :class:`JourneySlots` instance.  Fields are None when not found.
         """
-        text_lower = text.lower()
         result = JourneySlots()
+
+        # Pre-pass: strip ALL parenthesised near-area clauses from the text
+        # BEFORE applying grammar rules so that "(close to X)" or "(near X)"
+        # don't interfere with "from … to …" splitting.  We track each
+        # extracted area with its *character position* in the original text
+        # so we can later assign it to the correct slot.
+        pre_areas: List[Tuple[int, str]] = []     # (char_pos, area_text)
+        text_stripped = text
+
+        def _collect_paren(m: re.Match) -> str:
+            pre_areas.append((m.start(), m.group(1).strip()))
+            return ""                    # remove from text
+
+        text_stripped = _NEAR_AREA_PAREN_RE.sub(_collect_paren, text_stripped)
+        text_stripped = re.sub(r'\s{2,}', ' ', text_stripped).strip()
+
+        text_lower = text_stripped.lower()
 
         # Try two-slot rules first, then single-slot rules
         two_slot = [r for r in _RULES if r.origin_group and r.dest_group]
         one_slot = [r for r in _RULES if not (r.origin_group and r.dest_group)]
 
         for rule in two_slot + one_slot:
-            slots = self._apply_rule(rule, text, text_lower)
+            slots = self._apply_rule(rule, text_stripped, text_lower)
             if slots is None:
                 continue
 
             origin, dest = slots
 
             if origin and not result.origin:
-                result.origin = origin
+                # Extract any remaining suffix-form "near X" context from origin
+                origin_clean, origin_area = _extract_near_area(origin)
+                result.origin = origin_clean
+                if origin_area:
+                    result.origin_near_area = origin_area
             if dest and not result.destination:
-                result.destination = dest
+                # Extract any remaining suffix-form "near X" context from dest
+                dest_clean, dest_area = _extract_near_area(dest)
+                result.destination = dest_clean
+                if dest_area:
+                    result.destination_near_area = dest_area
             if result.origin or result.destination:
                 result.rule_matched = rule.label
                 break  # stop on first rule that produces anything
+
+        # Assign pre-extracted parenthesised areas to origin/dest slots.
+        # Each area is matched to the slot whose text appeared just before it
+        # in the original input (by character position).
+        if pre_areas:
+            text_lower_orig = text.lower()
+            origin_pos = text_lower_orig.find(result.origin.lower()) if result.origin else -1
+            dest_pos = text_lower_orig.find(result.destination.lower()) if result.destination else -1
+
+            for area_pos, area_text in pre_areas:
+                # Determine which slot this area belongs to by proximity:
+                # it belongs to the slot whose text ends just before it.
+                origin_end = (origin_pos + len(result.origin)) if result.origin and origin_pos >= 0 else -999
+                dest_end = (dest_pos + len(result.destination)) if result.destination and dest_pos >= 0 else -999
+
+                # The area follows whichever slot ended most recently before it
+                assign_to_origin = (
+                    origin_end <= area_pos
+                    and (dest_end > area_pos or origin_end > dest_end)
+                )
+                assign_to_dest = (
+                    dest_end <= area_pos
+                    and (origin_end > area_pos or dest_end > origin_end)
+                )
+
+                if assign_to_origin and result.origin and not result.origin_near_area:
+                    result.origin_near_area = area_text
+                elif assign_to_dest and result.destination and not result.destination_near_area:
+                    result.destination_near_area = area_text
+                elif result.origin and not result.origin_near_area:
+                    result.origin_near_area = area_text
+                elif result.destination and not result.destination_near_area:
+                    result.destination_near_area = area_text
 
         # Optional Places API grounding
         if ground and (result.origin or result.destination):
@@ -440,7 +571,8 @@ class JourneySlotExtractor:
         if result.origin or result.destination:
             print(
                 f"[JourneySlotExtractor] Rule='{result.rule_matched}' "
-                f"origin={result.origin!r} dest={result.destination!r}"
+                f"origin={result.origin!r} (near={result.origin_near_area!r}) "
+                f"dest={result.destination!r} (near={result.destination_near_area!r})"
             )
 
         return result
@@ -467,3 +599,4 @@ def get_extractor() -> JourneySlotExtractor:
     if _singleton is None:
         _singleton = JourneySlotExtractor()
     return _singleton
+

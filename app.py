@@ -26,6 +26,41 @@ traffic_chatbot = TrafficChatbot()
 journey_chatbot = JourneyChatbot()
 tfl_journey_client = TflJourneyClient()
 
+# Flask session backup for when the journey planner asked "rephrase this location"
+# after OSM returned no results. In-memory global state can be lost on restart;
+# session keeps the user in the journey flow until they answer or start a new chat.
+JP_REPHRASE_SESSION_KEY = "jp_rephrase_pending"
+
+
+def _restore_journey_rephrase_from_session() -> None:
+    mem = journey_chatbot.state.setdefault("global", {})
+    backup = session.get(JP_REPHRASE_SESSION_KEY)
+    if not isinstance(backup, dict):
+        return
+    if mem.get("pending_location_rephrase_for") in ("from", "to"):
+        return
+    side = backup.get("pending_location_rephrase_for")
+    if side not in ("from", "to"):
+        return
+    mem["pending_location_rephrase_for"] = side
+    mem["journey_planning_active"] = True
+    for k in ("fromQuery", "toQuery", "fromLocationId", "toLocationId"):
+        if k in backup:
+            mem[k] = backup[k]
+
+
+def _sync_journey_rephrase_session(jp_state: dict) -> None:
+    if jp_state.get("pending_location_rephrase_for") in ("from", "to"):
+        session[JP_REPHRASE_SESSION_KEY] = {
+            "pending_location_rephrase_for": jp_state["pending_location_rephrase_for"],
+            "fromQuery": jp_state.get("fromQuery"),
+            "toQuery": jp_state.get("toQuery"),
+            "fromLocationId": jp_state.get("fromLocationId"),
+            "toLocationId": jp_state.get("toLocationId"),
+        }
+    elif JP_REPHRASE_SESSION_KEY in session:
+        session.pop(JP_REPHRASE_SESSION_KEY, None)
+
 
 @app.route('/')
 def index():
@@ -166,6 +201,7 @@ def new_chat():
 
     # Reset journey planner's internal state.
     journey_chatbot.reset()
+    session.pop(JP_REPHRASE_SESSION_KEY, None)
 
     return jsonify({'ok': True})
 
@@ -202,6 +238,28 @@ def _journey_planner_entities(state: dict) -> dict:
     if state.get("_nlp_journey_preference"):
         entities["journey_preference"] = state["_nlp_journey_preference"]
     return entities
+
+
+def _build_journey_jsonify(jp_response: dict, entities: dict, confidence: float = 0.95) -> dict:
+    """Build the standard JSON response for journey planner replies."""
+    resp = {
+        "response": jp_response.get("reply", ""),
+        "journeys": jp_response.get("journeys", []),
+        "tfl_journey_url": jp_response.get("tfl_journey_url"),
+        "disambiguation": jp_response.get("disambiguation", False),
+        "journey_disambiguation": jp_response.get("place_disambiguation"),
+        "confirm_pins": jp_response.get("confirm_pins"),
+        "state": jp_response.get("state", {}),
+        "intent": "journey_planner",
+        "entities": entities,
+        "confidence": confidence,
+    }
+    # Send updated journey history back so frontend can persist to localStorage
+    jp_state = jp_response.get("state", {})
+    if jp_state.get("_updated_journey_history"):
+        resp["updated_journey_history"] = jp_state.get("_user_journey_history", {})
+    _sync_journey_rephrase_session(jp_state)
+    return resp
 
 
 def _looks_like_journey_message(text: str) -> bool:
@@ -279,6 +337,28 @@ def chat():
         date_str = (data.get('date') or '').strip() or None
         time_str = (data.get('time') or '').strip() or None
 
+        # Browser geolocation and user history (sent from frontend)
+        user_lat = data.get('userLat')
+        user_lon = data.get('userLon')
+        user_journey_history = data.get('journeyHistory')  # localStorage dict
+
+        # Pin-confirmation submission: user dragged/accepted the origin+destination pins.
+        # Update stored location IDs with the (possibly adjusted) coordinates and mark
+        # pins as confirmed so the next pass through _continue_planning skips the map step.
+        confirm_pins = data.get('confirmPins')  # {from: {lat,lon}, to: {lat,lon}}
+        if confirm_pins and isinstance(confirm_pins, dict):
+            jp_state_pre = journey_chatbot.state.setdefault("global", {})
+            cf = confirm_pins.get('from') or {}
+            ct = confirm_pins.get('to') or {}
+            try:
+                if cf.get('lat') is not None and cf.get('lon') is not None:
+                    jp_state_pre['fromLocationId'] = f"{float(cf['lat'])},{float(cf['lon'])}"
+                if ct.get('lat') is not None and ct.get('lon') is not None:
+                    jp_state_pre['toLocationId'] = f"{float(ct['lat'])},{float(ct['lon'])}"
+            except (TypeError, ValueError):
+                pass
+            jp_state_pre['_pins_confirmed'] = True
+
         # Apply user-defined shortcuts before routing the message.
         user_key = _current_user_key()
         user_message = _apply_shortcuts_to_text(user_key, user_message_raw)
@@ -288,6 +368,22 @@ def chat():
         now = datetime.utcnow()
 
         username = session.get('username')
+
+        # If we asked the user to rephrase a location, restore that flow from
+        # session when in-memory state was lost (e.g. server reload).
+        _restore_journey_rephrase_from_session()
+
+        # Inject geolocation and history into journey planner state so
+        # the disambiguation engine can use them for scoring.
+        jp_state = journey_chatbot.state.setdefault("global", {})
+        if user_lat is not None and user_lon is not None:
+            try:
+                jp_state["_user_lat"] = float(user_lat)
+                jp_state["_user_lon"] = float(user_lon)
+            except (TypeError, ValueError):
+                pass
+        if user_journey_history and isinstance(user_journey_history, dict):
+            jp_state["_user_journey_history"] = user_journey_history
 
         # Run the NLP pipeline once per request so we can:
         # - detect journey origin/destination slots even when the text does not
@@ -327,6 +423,7 @@ def chat():
                 entities["from_id"] = from_id
             if to_id:
                 entities["to_id"] = to_id
+            _sync_journey_rephrase_session(jp_response.get("state", {}))
             return jsonify({
                 # Main text used by existing frontend
                 "response": jp_response.get("reply", ""),
@@ -345,7 +442,13 @@ def chat():
 
         # 2) If we're in the middle of journey planning (e.g. asked "Where from?", waiting for "3", or for "neasden station"), use the journey planner.
         jp_state = journey_chatbot.state.get("global") or {}
-        if jp_state.get("journey_planning_active") or jp_state.get("fromOptions") or jp_state.get("toOptions"):
+        if (
+            jp_state.get("journey_planning_active")
+            or jp_state.get("fromOptions")
+            or jp_state.get("toOptions")
+            or jp_state.get("pending_location_rephrase_for") in ("from", "to")
+            or jp_state.get("_pins_confirmed")  # pin confirmation just submitted
+        ):
             jp_response = journey_chatbot.handle_message(
                 user_message,
                 now=now,
@@ -360,17 +463,7 @@ def chat():
             for k, v in nlp_entities.items():
                 if k.startswith("llm_") or k in ("route_preference", "accessibility", "time_preference", "origin", "destination", "via", "mode", "journey_preference", "date", "time"):
                     jp_entities[k] = v
-            return jsonify({
-                "response": jp_response.get("reply", ""),
-                "journeys": jp_response.get("journeys", []),
-                "tfl_journey_url": jp_response.get("tfl_journey_url"),
-                "disambiguation": jp_response.get("disambiguation", False),
-                "journey_disambiguation": jp_response.get("place_disambiguation"),
-                "state": jp_response.get("state", {}),
-                "intent": "journey_planner",
-                "entities": jp_entities,
-                "confidence": 0.95,
-            })
+            return jsonify(_build_journey_jsonify(jp_response, jp_entities))
 
         # 3) If the free-text clearly looks like a journey query OR the NLP
         #    extractor found a journey origin/destination (even if only one of
@@ -404,24 +497,18 @@ def chat():
             for k, v in nlp_entities.items():
                 if k.startswith("llm_") or k in ("route_preference", "accessibility", "time_preference"):
                     jp_entities[k] = v
-            return jsonify({
-                "response": jp_response.get("reply", ""),
-                "journeys": jp_response.get("journeys", []),
-                "tfl_journey_url": jp_response.get("tfl_journey_url"),
-                "disambiguation": jp_response.get("disambiguation", False),
-                "journey_disambiguation": jp_response.get("place_disambiguation"),
-                "state": jp_response.get("state", {}),
-                "intent": "journey_planner",
-                "entities": jp_entities,
-                "confidence": 0.95,
-            })
+            return jsonify(_build_journey_jsonify(jp_response, jp_entities))
 
         # 4) Fallback: use the existing traffic chatbot for everything else.
         if not user_message:
             return jsonify({'error': 'No message provided'}), 400
 
         traffic_response = traffic_chatbot.process_message(
-            user_message, user_key=_current_user_key(), username=username
+            user_message,
+            user_key=_current_user_key(),
+            username=username,
+            user_lat=user_lat,
+            user_lon=user_lon,
         )
 
         # Merge LLM context fields into the traffic response entities

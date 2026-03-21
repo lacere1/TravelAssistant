@@ -10,7 +10,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Dict, Any, List, Optional
+from difflib import SequenceMatcher
+from typing import Dict, Any, List, Optional, Tuple
 
 import os
 import re
@@ -18,15 +19,18 @@ import copy
 import requests
 
 from disambiguation_engine import (
-    DisambiguationEngine,
     DisambiguationCandidate,
+    DisambiguationEngine,
     SpatialAnchor,
-    UserContext,
+    JourneyDisambiguationContext,
+    JourneyUserHistory,
+    NearAreaStructured,
     candidates_from_journey_options,
-    anchor_from_places,
-    get_disambiguation_engine,
+    journey_disambiguate,
+    haversine_km,
 )
 from places_grounder import get_grounder
+from journey_slot_extractor import get_extractor as get_journey_slot_extractor, _extract_near_area
 
 # Microsoft Recognizers-Text has been removed — date/time extraction from
 # natural language is now handled by the LLM entity extractor.  The
@@ -122,11 +126,11 @@ def parse_datetime_text(text: str, now: datetime) -> Optional[dict]:
 
 
 TFL_BASE_URL = "https://api.tfl.gov.uk"
-GOOGLE_PLACES_SEARCH_URL = "https://places.googleapis.com/v1/places:searchText"
+OSM_NOMINATIM_SEARCH_URL = "https://nominatim.openstreetmap.org/search"
 
 
 def _parse_lat_lon_from_id(place_id: str) -> tuple[float | None, float | None]:
-    """If place_id is 'lat,lng' (e.g. from Google Places), return (lat, lon); else (None, None)."""
+    """If place_id is 'lat,lng', return (lat, lon); else (None, None)."""
     if not place_id or "," not in place_id:
         return None, None
     parts = place_id.split(",", 1)
@@ -164,67 +168,355 @@ def _build_place_disambiguation_for_map(
     }
 
 
-# Greater London bounds (SW and NE corners) – same as frontend autocomplete.
-# Restricts Places API results to London only.
-LONDON_BOUNDS_SW = {"latitude": 51.28, "longitude": -0.489}
-LONDON_BOUNDS_NE = {"latitude": 51.686, "longitude": 0.236}
+# Greater London bounds for Nominatim's viewbox:
+# left, top, right, bottom = west_lon, north_lat, east_lon, south_lat.
+LONDON_VIEWBOX = {
+    "left": -0.489,
+    "top": 51.686,
+    "right": 0.236,
+    "bottom": 51.28,
+}
+
+_PLACE_TYPE_LABELS: Dict[str, str] = {
+    "bus_station": "Bus Station",
+    "train_station": "Train Station",
+    "subway_station": "Underground Station",
+    "light_rail_station": "DLR Station",
+}
+
+def _stop_type_tag(place_types: List[str]) -> str:
+    """Return a short human-readable tag like 'Bus Stop' from place types."""
+    for pt in place_types:
+        if pt in _PLACE_TYPE_LABELS:
+            return _PLACE_TYPE_LABELS[pt]
+    if "bus_stop" in place_types:
+        return "Bus Stop"
+    return ""
 
 
-def _google_places_search(query: str, api_key: str, max_results: int = 5) -> List[Dict[str, Any]]:
+def _osm_place_search(query: str, max_results: int = 5, near_area: str | None = None) -> List[Dict[str, Any]]:
     """
-    Call Google Places API (new) searchText to find places matching the query.
-    Restricted to Greater London via locationRestriction. Returns options in the same
-    shape as TfL disambiguation: { "id": "lat,lng", "name", "qualifier", "shortLabel" }.
+    Call OpenStreetMap Nominatim search to find places matching the query.
+    Restricted to Greater London via viewbox + bounded search. Returns options
+    in the same shape as TfL disambiguation:
+    { "id": "lat,lng", "name", "qualifier", "shortLabel", "place_types" }.
     TfL journey API accepts "lat,lng" as from_id/to_id.
+
+    near_area: optional area/neighbourhood hint (e.g. "Sudbury") appended to
+    the query so OSM returns geographically biased candidates from the start.
     """
-    if not query or not api_key:
+    if not query:
         return []
+    # Build enriched query: "Harrow Road, Sudbury, London" rather than just "Harrow Road, London"
+    parts = [query]
+    if near_area:
+        parts.append(near_area)
+    if "london" not in query.lower() and (not near_area or "london" not in near_area.lower()):
+        parts.append("London")
+    search_query = ", ".join(parts)
+    params = {
+        "q": search_query,
+        "format": "jsonv2",
+        "addressdetails": 1,
+        "countrycodes": "gb",
+        "limit": max_results,
+        "viewbox": (
+            f"{LONDON_VIEWBOX['left']},{LONDON_VIEWBOX['top']},"
+            f"{LONDON_VIEWBOX['right']},{LONDON_VIEWBOX['bottom']}"
+        ),
+        "bounded": 1,
+    }
     headers = {
-        "Content-Type": "application/json",
-        "X-Goog-Api-Key": api_key,
-        "X-Goog-FieldMask": "places.displayName,places.formattedAddress,places.location",
+        "User-Agent": "TravelAssistant/1.0 (local app)",
+        "Accept-Language": "en-GB,en",
     }
-    body = {
-        "textQuery": query,
-        "locationRestriction": {
-            "rectangle": {
-                "low": LONDON_BOUNDS_SW,
-                "high": LONDON_BOUNDS_NE,
-            }
-        },
-    }
+    print(f"[OSM] GET {OSM_NOMINATIM_SEARCH_URL}")
+    print(f"[OSM] Params: {params}")
     try:
-        resp = requests.post(
-            GOOGLE_PLACES_SEARCH_URL,
-            json=body,
-            headers=headers,
-            timeout=5,
-        )
+        resp = requests.get(OSM_NOMINATIM_SEARCH_URL, params=params, headers=headers, timeout=6)
+        print(f"[OSM] Status: {resp.status_code}")
         resp.raise_for_status()
         data = resp.json()
-    except Exception:
+    except Exception as e:
+        print(f"[OSM] FAILED: {e}")
         return []
-    places = data.get("places") or []
+    places = data if isinstance(data, list) else []
+    print(f"[OSM] Returned {len(places)} places:")
+    for idx, p in enumerate(places):
+        name = (p.get("display_name") or "?").split(",")[0].strip()
+        addr = p.get("display_name") or ""
+        lat = p.get("lat", "?")
+        lon = p.get("lon", "?")
+        p_class = p.get("class", "")
+        p_type = p.get("type", "")
+        print(f"[OSM]   {idx+1}. {name} | {addr} | ({lat}, {lon}) | class={p_class} type={p_type}")
     results: List[Dict[str, Any]] = []
-    for p in places[:max_results]:
-        loc = p.get("location") or {}
-        lat = loc.get("latitude")
-        lon = loc.get("longitude")
-        if lat is None or lon is None:
+    for p in places:
+        lat_raw = p.get("lat")
+        lon_raw = p.get("lon")
+        try:
+            lat = float(lat_raw)
+            lon = float(lon_raw)
+        except (TypeError, ValueError):
             continue
         place_id = f"{lat},{lon}"
-        display = p.get("displayName") or {}
-        name = display.get("text", query) if isinstance(display, dict) else str(display)
-        addr = p.get("formattedAddress") or ""
+        display_name = p.get("display_name") or query
+        name = display_name.split(",")[0].strip() or query
+        p_class = (p.get("class") or "").strip()
+        p_type = (p.get("type") or "").strip()
+        types = [v for v in (p_class, p_type) if v]
+        addr = display_name
         results.append(
             {
                 "id": place_id,
                 "name": name,
                 "qualifier": addr,
                 "shortLabel": name,
+                "place_types": types,
             }
         )
     return results
+
+
+# London centre — bias for Google Places Text Search
+_GOOGLE_PLACES_LOCATION_BIAS = "51.5074,-0.1278"
+_GOOGLE_PLACES_RADIUS_M = 45000
+
+# Merge OSM + Google hits that are the same road/place under different postcodes
+_COALESCE_MAX_DISTANCE_KM = 0.75
+_COALESCE_NAME_RATIO = 0.90
+# How many ranked candidates to show when asking for journey origin/destination
+_JOURNEY_DISAMBIG_UI_MAX = 5
+# Minimum query↔name similarity (SequenceMatcher ratio) to list a candidate
+_JOURNEY_NAME_MATCH_MIN_DISPLAY = 0.35
+
+
+def _journey_name_match_passes(c: DisambiguationCandidate) -> bool:
+    """True if candidate should be shown (or auto-selected) on name similarity alone."""
+    ns = getattr(c, "name_similarity", None)
+    if ns is None:
+        return True
+    try:
+        return float(ns) >= _JOURNEY_NAME_MATCH_MIN_DISPLAY
+    except (TypeError, ValueError):
+        return True
+
+
+def _option_lat_lng(o: Dict[str, Any]) -> Tuple[Optional[float], Optional[float]]:
+    """Read coordinates from explicit fields or from a 'lat,lng' id."""
+    lat = o.get("lat")
+    lng = o.get("lng")
+    if lng is None:
+        lng = o.get("lon")
+    if lat is not None and lng is not None:
+        try:
+            return float(lat), float(lng)
+        except (TypeError, ValueError):
+            pass
+    oid = str(o.get("id") or "")
+    if "," in oid:
+        parts = oid.split(",", 1)
+        try:
+            return float(parts[0].strip()), float(parts[1].strip())
+        except (TypeError, ValueError):
+            pass
+    return None, None
+
+
+def _dedupe_exact_coord_options(options: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Drop duplicate results that share the same id (e.g. same lat,lng from two APIs)."""
+    seen: set = set()
+    out: List[Dict[str, Any]] = []
+    for o in options:
+        lid = str(o.get("id") or "").strip()
+        if not lid:
+            continue
+        if lid in seen:
+            continue
+        seen.add(lid)
+        out.append(o)
+    return out
+
+
+def _pick_representative_index(
+    members: List[int],
+    options: List[Dict[str, Any]],
+    norms: List[str],
+    q_norm: str,
+) -> int:
+    """Prefer higher query–name similarity, then Google over OSM when tied."""
+    best_idx = members[0]
+    best_key: Optional[Tuple[float, int]] = None
+    for idx in members:
+        sim = SequenceMatcher(None, q_norm, norms[idx]).ratio()
+        src_boost = 1 if options[idx].get("_source") == "google" else 0
+        key = (sim, src_boost)
+        if best_key is None or key > best_key:
+            best_key = key
+            best_idx = idx
+    return best_idx
+
+
+def _coalesce_near_duplicate_options(
+    options: List[Dict[str, Any]],
+    query: str,
+) -> List[Dict[str, Any]]:
+    """
+    Group results that refer to the same feature: very similar normalised names
+    and within _COALESCE_MAX_DISTANCE_KM. Keeps one representative per cluster.
+    """
+    if len(options) <= 1:
+        out = []
+        q_norm = DisambiguationEngine._normalize_place_name(query)
+        for o in options:
+            oc = dict(o)
+            n = DisambiguationEngine._normalize_place_name(oc.get("name") or "")
+            oc["name_similarity"] = round(SequenceMatcher(None, q_norm, n).ratio(), 4)
+            oc.pop("_source", None)
+            out.append(oc)
+        return out
+
+    n = len(options)
+    parent = list(range(n))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(i: int, j: int) -> None:
+        ri, rj = find(i), find(j)
+        if ri != rj:
+            parent[rj] = ri
+
+    coords = [_option_lat_lng(o) for o in options]
+    norms = [DisambiguationEngine._normalize_place_name(o.get("name") or "") for o in options]
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            if coords[i][0] is None or coords[j][0] is None:
+                continue
+            if SequenceMatcher(None, norms[i], norms[j]).ratio() < _COALESCE_NAME_RATIO:
+                continue
+            d = haversine_km(coords[i][0], coords[i][1], coords[j][0], coords[j][1])
+            if d <= _COALESCE_MAX_DISTANCE_KM:
+                union(i, j)
+
+    clusters: Dict[int, List[int]] = {}
+    for i in range(n):
+        r = find(i)
+        clusters.setdefault(r, []).append(i)
+
+    q_norm = DisambiguationEngine._normalize_place_name(query)
+    merged: List[Dict[str, Any]] = []
+    for members in clusters.values():
+        best_idx = _pick_representative_index(members, options, norms, q_norm)
+        rep = dict(options[best_idx])
+        rep["name_similarity"] = round(
+            SequenceMatcher(None, q_norm, norms[best_idx]).ratio(),
+            4,
+        )
+        if len(members) > 1:
+            print(
+                f"[JourneyMerge] Coalesced {len(members)} options → "
+                f"'{rep.get('name')}' @ {rep.get('id')}"
+            )
+        rep.pop("_source", None)
+        merged.append(rep)
+
+    merged.sort(key=lambda x: x.get("name_similarity") or 0.0, reverse=True)
+    return merged
+
+
+def _google_places_text_search(query: str, max_results: int = 20, near_area: str | None = None) -> List[Dict[str, Any]]:
+    """
+    Google Places Text Search (legacy) — returns options in the same shape as OSM search.
+    TfL journey API accepts "lat,lng" as from_id/to_id.
+
+    near_area: optional area hint appended to the query for geographic bias.
+    """
+    if not query:
+        return []
+    api_key = os.getenv("GOOGLE_PLACES_API_KEY", "").strip()
+    if not api_key:
+        return []
+    parts = [query]
+    if near_area:
+        parts.append(near_area)
+    base = ", ".join(parts)
+    search_query = base if "london" in base.lower() else f"{base}, London, UK"
+    params = {
+        "query": search_query,
+        "key": api_key,
+        "region": "uk",
+        "location": _GOOGLE_PLACES_LOCATION_BIAS,
+        "radius": _GOOGLE_PLACES_RADIUS_M,
+    }
+    url = "https://maps.googleapis.com/maps/api/place/textsearch/json"
+    print(f"[Google Places] GET textsearch (query={search_query!r})")
+    try:
+        resp = requests.get(url, params=params, timeout=8)
+        print(f"[Google Places] Status: {resp.status_code}")
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        print(f"[Google Places] FAILED: {e}")
+        return []
+    status = str(data.get("status") or "")
+    if status not in ("OK", "ZERO_RESULTS"):
+        print(f"[Google Places] API status={status}; message={data.get('error_message')!r}")
+        return []
+    places = data.get("results") or []
+    if not isinstance(places, list):
+        return []
+    results: List[Dict[str, Any]] = []
+    for p in places[:max_results]:
+        loc = (p.get("geometry") or {}).get("location") or {}
+        lat_raw = loc.get("lat")
+        lng_raw = loc.get("lng")
+        try:
+            lat = float(lat_raw)
+            lng = float(lng_raw)
+        except (TypeError, ValueError):
+            continue
+        place_id = f"{lat},{lng}"
+        name = (p.get("name") or "").strip() or query
+        addr = (p.get("formatted_address") or "").strip()
+        types = [str(t).replace("_", " ") for t in (p.get("types") or []) if t]
+        results.append(
+            {
+                "id": place_id,
+                "name": name,
+                "qualifier": addr or ", ".join(types[:3]) if types else "",
+                "shortLabel": name,
+                "place_types": types,
+            }
+        )
+    print(f"[Google Places] Returned {len(results)} results")
+    return results
+
+
+def _fetch_merged_journey_location_options(query: str, max_results: int = 20, near_area: str | None = None) -> List[Dict[str, Any]]:
+    """
+    Fetch from both Google Places Text Search and OSM Nominatim, dedupe by id,
+    then coalesce near-duplicate names in the same area.
+
+    near_area: optional area hint (e.g. "Sudbury") passed to both APIs so
+    results are geographically biased from the start.
+    """
+    google_opts = _google_places_text_search(query, max_results=max_results, near_area=near_area)
+    for o in google_opts:
+        o["_source"] = "google"
+    osm_opts = _osm_place_search(query, max_results=max_results, near_area=near_area)
+    for o in osm_opts:
+        o["_source"] = "osm"
+    combined = _dedupe_exact_coord_options(google_opts + osm_opts)
+    print(
+        f"[Journey] Merged search: Google={len(google_opts)} OSM={len(osm_opts)} "
+        f"after id-dedupe={len(combined)}"
+    )
+    return _coalesce_near_duplicate_options(combined, query)
 
 
 @dataclass
@@ -862,17 +1154,62 @@ class JourneyChatbot:
     Very simple, stateful dialogue manager for a TfL journey-planning assistant.
     In a real app you would keep user_state in a DB or server-side session.
     Here we keep a single in-memory state dictionary keyed by 'global'.
-    Uses Google Places API for place disambiguation when GOOGLE_PLACES_API_KEY is set.
+    Uses OpenStreetMap Nominatim for place disambiguation.
     """
 
     def __init__(self):
         self.tfl_client = TflJourneyClient()
-        self.google_places_api_key = os.environ.get("GOOGLE_PLACES_API_KEY", "").strip()
         self.state: Dict[str, Dict[str, Any]] = {"global": {}}
 
     def reset(self) -> None:
         """Reset all journey-planning state for a fresh conversation."""
         self.state["global"].clear()
+
+    @staticmethod
+    def _looks_like_compound_journey_text(q: str) -> bool:
+        """True if *q* looks like a full journey sentence, not a single place name."""
+        if not (q or "").strip():
+            return False
+        sl = q.lower()
+        if "plan" in sl and "journey" in sl:
+            return True
+        # Spaced " from " / " to " — not e.g. "frome" as a town name at start
+        return " from " in f" {q} " and " to " in sl
+
+    def _sanitize_compound_location_queries(
+        self, user_state: Dict[str, Any], raw_message: str
+    ) -> None:
+        """
+        When the LLM puts an entire utterance into origin (or similar), OSM search
+        receives a useless query and returns []. Recover from/to via the same
+        rule-based extractor used when the LLM is disabled.
+        """
+        fq = (user_state.get("fromQuery") or "").strip()
+        tq = (user_state.get("toQuery") or "").strip()
+        if not self._looks_like_compound_journey_text(fq) and not self._looks_like_compound_journey_text(
+            tq
+        ):
+            return
+        msg = (raw_message or "").strip()
+        if not msg:
+            return
+        try:
+            slots = get_journey_slot_extractor().extract_journey_slots(msg)
+        except Exception as exc:
+            print(f"[JourneyChatbot] Compound slot recovery failed: {exc}")
+            return
+        if slots.get("origin"):
+            user_state["fromQuery"] = slots["origin"]
+            print(f"[JourneyChatbot] Sanitized fromQuery → {slots['origin']!r}")
+            if slots.get("origin_near_area"):
+                user_state["_nlp_origin_near_area"] = slots["origin_near_area"]
+                print(f"[JourneyChatbot] Slot extractor origin_near_area → {slots['origin_near_area']!r}")
+        if slots.get("destination"):
+            user_state["toQuery"] = slots["destination"]
+            print(f"[JourneyChatbot] Sanitized toQuery → {slots['destination']!r}")
+            if slots.get("destination_near_area"):
+                user_state["_nlp_destination_near_area"] = slots["destination_near_area"]
+                print(f"[JourneyChatbot] Slot extractor destination_near_area → {slots['destination_near_area']!r}")
 
     # ---- Public API -----------------------------------------------------
 
@@ -911,7 +1248,7 @@ class JourneyChatbot:
         # Store LLM-extracted journey parameters in user_state so they
         # propagate through to the TfL API call in _continue_planning.
         if nlp_entities:
-            for key in ("via", "mode", "journey_preference", "timeIs", "near_area", "towards"):
+            for key in ("via", "mode", "journey_preference", "timeIs", "near_area", "towards", "origin_near_area", "destination_near_area"):
                 if key in nlp_entities and nlp_entities[key]:
                     user_state[f"_nlp_{key}"] = nlp_entities[key]
                     print(f"[JourneyChatbot] Stored _nlp_{key}={nlp_entities[key]!r}")
@@ -932,6 +1269,11 @@ class JourneyChatbot:
                 user_state.pop(k, None)
             user_state.pop("pending_location_rephrase_for", None)
             user_state["journey_planning_active"] = True
+            # Old "near X" anchor from the failed query must not skew the new search.
+            user_state.pop("_nlp_near_area", None)
+            user_state.pop("_nlp_origin_near_area", None)
+            user_state.pop("_nlp_destination_near_area", None)
+            user_state.pop("_nlp_towards", None)
             # Continue planning immediately with the updated query.
             return self._continue_planning(text, user_state, now, username=username)
 
@@ -939,11 +1281,50 @@ class JourneyChatbot:
         #    Rule-based regex extraction (_apply_full_plan_if_present,
         #    _maybe_extract_initial_intent) has been removed.
         if nlp_origin and "fromQuery" not in user_state:
-            user_state["fromQuery"] = nlp_origin
-            print(f"[JourneyChatbot] fromQuery from LLM: {nlp_origin!r}")
+            # Strip any residual "near X" from LLM origin (belt-and-braces)
+            origin_clean, origin_area = _extract_near_area(nlp_origin)
+            user_state["fromQuery"] = origin_clean
+            if origin_area and not user_state.get("_nlp_origin_near_area"):
+                user_state["_nlp_origin_near_area"] = origin_area
+                print(f"[JourneyChatbot] Extracted origin_near_area from LLM origin: {origin_area!r}")
+            print(f"[JourneyChatbot] fromQuery from LLM: {origin_clean!r}")
         if nlp_destination and "toQuery" not in user_state:
-            user_state["toQuery"] = nlp_destination
-            print(f"[JourneyChatbot] toQuery from LLM: {nlp_destination!r}")
+            # Strip any residual "near X" from LLM destination (belt-and-braces)
+            dest_clean, dest_area = _extract_near_area(nlp_destination)
+            user_state["toQuery"] = dest_clean
+            if dest_area and not user_state.get("_nlp_destination_near_area"):
+                user_state["_nlp_destination_near_area"] = dest_area
+                print(f"[JourneyChatbot] Extracted destination_near_area from LLM dest: {dest_area!r}")
+            print(f"[JourneyChatbot] toQuery from LLM: {dest_clean!r}")
+
+        # If we're still missing a resolved place id (e.g. OSM failed and pending_* was
+        # lost) but the LLM extracted a new place for that side, prefer it over the
+        # stale query. Skip when we're choosing from numbered options or pin-drop.
+        if not user_state.get("pending_location_rephrase_for"):
+            if (
+                "fromLocationId" not in user_state
+                and not user_state.get("fromOptions")
+                and not user_state.get("fromPinDrop")
+                and nlp_origin
+                and (nlp_origin or "").strip()
+                != (user_state.get("fromQuery") or "").strip()
+            ):
+                user_state["fromQuery"] = (nlp_origin or "").strip()
+                user_state.pop("_nlp_near_area", None)
+                user_state.pop("_nlp_origin_near_area", None)
+                user_state.pop("_nlp_destination_near_area", None)
+                user_state.pop("_nlp_towards", None)
+            if (
+                "toLocationId" not in user_state
+                and not user_state.get("toOptions")
+                and not user_state.get("toPinDrop")
+                and nlp_destination
+                and (nlp_destination or "").strip()
+                != (user_state.get("toQuery") or "").strip()
+            ):
+                user_state["toQuery"] = (nlp_destination or "").strip()
+
+        self._sanitize_compound_location_queries(user_state, text)
 
         # Also extract date/time from LLM entities if available and no when set yet
         if nlp_entities and "when" not in user_state:
@@ -966,6 +1347,7 @@ class JourneyChatbot:
             for key in (
                 "fromQuery", "toQuery",
                 "fromLocationId", "toLocationId",
+                "fromLocationName", "toLocationName",
                 "fromOptions", "toOptions",
                 "fromQuestion", "toQuestion",
                 "askedWhen", "when",
@@ -1039,7 +1421,10 @@ class JourneyChatbot:
             if not journeys:
                 reply = "I couldn't find any journeys for that time. Try a different time?"
             else:
-                reply = "Here are your journey options." + (f", {username}." if username else ".")
+                reply = f"Here are your journey options from {from_text} to {to_text}"
+                if username:
+                    reply += f", {username}"
+                reply += "."
             if self.tfl_client.last_url:
                 reply += f"\n\n[debug] TfL URL: {self.tfl_client.last_url}"
 
@@ -1083,10 +1468,11 @@ class JourneyChatbot:
         _journey_pref = user_state.get("_nlp_journey_preference")
 
         def _journey_reply(with_name: bool = False) -> str:
-            base = "Here are your journey options"
+            from_name = user_state.get("fromLocationName") or user_state.get("fromQuery", "")
+            to_name = user_state.get("toLocationName") or user_state.get("toQuery", "")
+            base = f"Here are your journey options from {from_name} to {to_name}"
             if with_name and username:
                 base += f", {username}"
-            # Mention active preferences so the user knows what was applied
             notes = []
             if _mode:
                 notes.append(f"mode: {_mode}")
@@ -1107,28 +1493,20 @@ class JourneyChatbot:
         if "_nlp_timeIs" in user_state and "when" in user_state:
             user_state["when"]["timeIs"] = user_state["_nlp_timeIs"]
 
-        # 1) If we have from, to and when, try the journey API with place names first.
-        if "fromQuery" in user_state and "toQuery" in user_state and "when" in user_state:
-            journeys = self.tfl_client.get_journeys_by_queries(
-                from_query=user_state["fromQuery"],
-                to_query=user_state["toQuery"],
-                when=user_state["when"],
-                via=_via,
-                mode=_mode,
-                journey_preference=_journey_pref,
-            )
-            if journeys:
-                reply = _journey_reply(True)
-                if self.tfl_client.last_url:
-                    reply += f"\n\n[debug] TfL URL: {self.tfl_client.last_url}"
-                state_for_response = copy.deepcopy(user_state)
-                out = {"reply": reply, "journeys": journeys, "state": state_for_response}
-                if self.tfl_client.last_url:
-                    out["tfl_journey_url"] = self.tfl_client.last_url
-
-                # After a journey has been planned and displayed, clear journey-planning state.
-                self._reset_journey_state(user_state)
-                return out
+        # 1) Resolve from and to through proper disambiguation.
+        #
+        # Previously this step sent raw place names directly to TfL's
+        # Journey API (get_journeys_by_queries). If TfL could resolve the
+        # names, it returned journeys and disambiguation was skipped
+        # entirely. This caused silent wrong-location selection for
+        # ambiguous queries like "Lavender Avenue" (exists in multiple
+        # parts of London) — TfL would auto-pick one without presenting
+        # alternatives.
+        #
+        # Now we always resolve from/to through the disambiguation engine
+        # first. For unambiguous queries the engine auto-resolves instantly
+        # (single candidate or high-confidence match); for ambiguous ones
+        # the user gets to choose from well-labelled options.
 
         # 2) Ensure fromLocationId is resolved.
         if "fromLocationId" not in user_state:
@@ -1142,11 +1520,16 @@ class JourneyChatbot:
                 text, user_state, key_prefix="to", now=now, username=username
             )
 
-        # 4) If no when yet, assume NOW (we don't ask for time; extract or default).
+        # 4) Both locations resolved — show draggable pin confirmation map before
+        #    fetching the TfL journey, unless the user has already confirmed.
+        if not user_state.get("_pins_confirmed"):
+            return self._build_confirm_pins_response(user_state)
+
+        # 5) If no when yet, assume NOW (we don't ask for time; extract or default).
         if "when" not in user_state:
             user_state["when"] = {"datetime": now, "timeIs": "Departing"}
 
-        # 5) We have everything, fetch journeys with resolved IDs.
+        # 6) We have everything, fetch journeys with resolved IDs.
         journeys = self.tfl_client.get_journeys(
             from_id=user_state["fromLocationId"],
             to_id=user_state["toLocationId"],
@@ -1207,16 +1590,25 @@ class JourneyChatbot:
         username: str | None = None,
     ) -> Dict[str, Any]:
         """
-        Handles both asking disambiguation questions and interpreting very short answers.
-        key_prefix is 'from' or 'to'. When a location is resolved (single option or user pick),
-        continues the flow in the same request so we can resolve the other location and
-        return journey options without requiring another user message.
+        Handles journey location disambiguation with weighted scoring.
 
-        Uses the unified DisambiguationEngine for geospatial + semantic + fuzzy scoring
-        to rank candidates and decide whether to auto-resolve or present options.
+        Uses the journey disambiguation pipeline which scores candidates on:
+          - proximity to user (browser geolocation)
+          - proximity to the other end (destination if resolving origin, vice versa)
+          - context clues ("near Kingsbury" anchor)
+          - name similarity
+          - user history (localStorage-persisted selection counts)
+          - route feasibility (placeholder)
+
+        Three possible outcomes:
+          A. auto_select  — proceed silently with top candidate
+          B. clarify      — show top candidates, ask user to pick
+          C. show_list    — show ranked list (same cap)
+
         """
         query_key = f"{key_prefix}Query"
         chosen_id_key = f"{key_prefix}LocationId"
+        chosen_name_key = f"{key_prefix}LocationName"
         pending_options_key = f"{key_prefix}Options"
         pending_question_key = f"{key_prefix}Question"
 
@@ -1234,20 +1626,23 @@ class JourneyChatbot:
         if query_key not in user_state:
             user_state["journey_planning_active"] = True
             other_query_key = "toQuery" if key_prefix == "from" else "fromQuery"
-            if key_prefix == "to" and user_state.get(other_query_key) == (text or "").strip():
+            awaiting_key = f"awaiting_{key_prefix}Query"
+            was_awaiting = bool(user_state.get(awaiting_key))
+            if key_prefix == "to" and not was_awaiting and user_state.get(other_query_key) == (text or "").strip():
+                user_state[awaiting_key] = True
                 return {
                     "reply": f"Where are you travelling { 'from' if key_prefix == 'from' else 'to' }?",
                     "journeys": [],
                     "state": user_state,
                 }
-            if key_prefix == "to" and (text or "").strip().isdigit():
+            if key_prefix == "to" and not was_awaiting and (text or "").strip().isdigit():
+                user_state[awaiting_key] = True
                 return {
                     "reply": "Where are you travelling to?",
                     "journeys": [],
                     "state": user_state,
                 }
-            awaiting_key = f"awaiting_{key_prefix}Query"
-            if user_state.get(other_query_key) and not user_state.get(awaiting_key):
+            if user_state.get(other_query_key) and not was_awaiting:
                 direction = "from" if key_prefix == "from" else "to"
                 user_state[awaiting_key] = True
                 return {
@@ -1269,7 +1664,7 @@ class JourneyChatbot:
                     or (" want to travel " in t)
                     or (" need to travel " in t)
                 )
-                if looks_like_full_request:
+                if looks_like_full_request and not was_awaiting:
                     direction = "from" if key_prefix == "from" else "to"
                     user_state[awaiting_key] = True
                     return {
@@ -1277,7 +1672,32 @@ class JourneyChatbot:
                         "journeys": [],
                         "state": user_state,
                     }
-                user_state[query_key] = cleaned
+                if looks_like_full_request and was_awaiting:
+                    # User pasted the full journey again instead of a single place — recover slots.
+                    try:
+                        slots = get_journey_slot_extractor().extract_journey_slots(cleaned)
+                    except Exception:
+                        slots = {}
+                    slot = (
+                        slots.get("origin")
+                        if key_prefix == "from"
+                        else slots.get("destination")
+                    )
+                    if slot and str(slot).strip():
+                        user_state[query_key] = str(slot).strip()
+                        user_state.pop(awaiting_key, None)
+                    else:
+                        direction = "starting point" if key_prefix == "from" else "destination"
+                        return {
+                            "reply": (
+                                f"I still need just the {direction} (e.g. a street or station name), "
+                                "not the full \"plan a journey from … to …\" sentence."
+                            ),
+                            "journeys": [],
+                            "state": user_state,
+                        }
+                else:
+                    user_state[query_key] = cleaned
             else:
                 return {
                     "reply": f"Where are you travelling { 'from' if key_prefix == 'from' else 'to' }?",
@@ -1294,9 +1714,13 @@ class JourneyChatbot:
             if choice.isdigit():
                 idx = int(choice)
                 if 1 <= idx <= len(options):
-                    user_state[chosen_id_key] = options[idx - 1]["id"]
+                    selected = options[idx - 1]
+                    user_state[chosen_id_key] = selected["id"]
+                    user_state[chosen_name_key] = selected.get("name", "")
                     user_state.pop(pending_options_key, None)
                     user_state.pop(pending_question_key, None)
+                    # Record selection for user history
+                    self._record_location_choice(user_state, selected["id"])
                     return _continue_after_resolve()
 
             # Try exact or partial match on name or qualifier.
@@ -1309,30 +1733,50 @@ class JourneyChatbot:
 
             if len(matched) == 1:
                 user_state[chosen_id_key] = matched[0]["id"]
+                user_state[chosen_name_key] = matched[0].get("name", "")
                 user_state.pop(pending_options_key, None)
                 user_state.pop(pending_question_key, None)
+                self._record_location_choice(user_state, matched[0]["id"])
                 return _continue_after_resolve()
 
             if len(matched) > 1:
                 return {
-                    "reply": "Could you be a bit more specific? For example, reply with the number (e.g. 1 or 2) or the full place name.",
+                    "reply": "Could you be a bit more specific? Tap or click a numbered label on the map, or type the option number (e.g. 1 or 2) or the full place name in the chat.",
                     "journeys": [],
                     "state": user_state,
                 }
 
-        # 3) Get place options: Google Places API if key set, else TfL disambiguation.
+        # 4) Resolve candidates from Google Places + OSM, then coalesce same-name/nearby dupes.
         query = user_state[query_key]
-        if self.google_places_api_key:
-            options = _google_places_search(query, self.google_places_api_key, max_results=5)
-        else:
-            options = self.tfl_client.disambiguate_location(query)
+
+        # Safety-net: strip any residual "near X" / "(near X)" from query before search.
+        # The LLM should already have separated these, but if the user typed it directly
+        # (e.g. as a rephrase) the query might still contain the context clause.
+        query_clean, fallback_near = _extract_near_area(query)
+        if fallback_near:
+            query = query_clean
+            user_state[query_key] = query_clean
+            # Store the near_area if we don't already have one for this side
+            side_name = "origin" if key_prefix == "from" else "destination"
+            near_key = f"_nlp_{side_name}_near_area"
+            if not user_state.get(near_key):
+                user_state[near_key] = fallback_near
+                print(f"[JourneyChatbot] Extracted residual near_area from query: {fallback_near!r}")
+
+        # Pass near_area to the search so OSM/Google return geographically
+        # biased candidates from the start (e.g. "Harrow Road, Sudbury, London"
+        # rather than all Harrow Roads across London).
+        search_near = user_state.get(f"_nlp_{'origin' if key_prefix == 'from' else 'destination'}_near_area") or user_state.get("_nlp_near_area")
+        options = _fetch_merged_journey_location_options(query, max_results=20, near_area=search_near)
 
         if not options:
             user_state["journey_planning_active"] = True
             user_state["pending_location_rephrase_for"] = key_prefix
+            side_word = "starting point" if key_prefix == "from" else "destination"
             reply = (
-                f"I couldn't find anything matching '{query}'. "
-                "Could you rephrase or give a nearby station or area?"
+                f"I couldn't find anything matching '{query}' for your {side_word}. "
+                "Reply with a single place or station name (e.g. 'Wembley Central' or 'Stonebridge Park'). "
+                "I'll use your next message as that location."
             )
             if self.tfl_client.last_url:
                 reply += f"\n\n[debug] TfL URL: {self.tfl_client.last_url}"
@@ -1342,61 +1786,195 @@ class JourneyChatbot:
                 "state": user_state,
             }
 
-        # ---- Unified Disambiguation Engine ----
-        # Convert options to DisambiguationCandidate objects
-        candidates = candidates_from_journey_options(options)
+        # Build disambiguation context
+        role = "origin" if key_prefix == "from" else "destination"
 
-        # Build a spatial anchor from LLM-extracted near_area or the query itself
-        anchor = self._build_spatial_anchor(query, user_state)
+        # User location from browser geolocation (passed via user_state)
+        user_lat = user_state.get("_user_lat")
+        user_lon = user_state.get("_user_lon")
 
-        # Run the disambiguation engine
-        engine = get_disambiguation_engine()
-        result = engine.disambiguate(
-            query=query,
-            candidates=candidates,
-            anchor=anchor,
-            mode="journey",
+        # Other end coordinates (if already resolved)
+        other_end_lat, other_end_lon = None, None
+        if key_prefix == "from" and "toLocationId" in user_state:
+            other_end_lat, other_end_lon = _parse_lat_lon_from_id(user_state["toLocationId"])
+        elif key_prefix == "to" and "fromLocationId" in user_state:
+            other_end_lat, other_end_lon = _parse_lat_lon_from_id(user_state["fromLocationId"])
+
+        # Near area anchor — per-location context from LLM extraction.
+        # e.g. "from Harrow Road (near Sudbury) to Lavender Avenue (near Wembley)"
+        # When resolving origin, use origin_near_area; for destination, use destination_near_area.
+        # Falls back to the legacy single near_area if per-location fields are absent.
+        near_area_anchor = None
+        if key_prefix == "from":
+            near_area = user_state.get("_nlp_origin_near_area") or user_state.get("_nlp_near_area")
+        else:
+            near_area = user_state.get("_nlp_destination_near_area") or user_state.get("_nlp_near_area")
+        near_area_structured = None
+        if near_area:
+            grounder = get_grounder()
+            near_result = grounder.ground(near_area)
+            if near_result:
+                near_area_anchor = SpatialAnchor(
+                    lat=near_result["lat"],
+                    lng=near_result["lng"],
+                    source="near_area",
+                )
+                # Extract structured hard-boundary fields from grounded result
+                near_area_structured = NearAreaStructured(
+                    suburb=near_result.get("suburb", "") or "",
+                    borough=near_result.get("borough", "") or "",
+                    postcode_prefix=near_result.get("postcode_prefix", "") or "",
+                )
+                print(
+                    f"[JourneyChatbot] Near area anchor for {key_prefix}: {near_area} → "
+                    f"({near_area_anchor.lat}, {near_area_anchor.lng}) | "
+                    f"suburb={near_area_structured.suburb!r} "
+                    f"borough={near_area_structured.borough!r} "
+                    f"postcode_prefix={near_area_structured.postcode_prefix!r}"
+                )
+
+        # User history from localStorage (passed via user_state)
+        user_history = JourneyUserHistory.from_dict(
+            user_state.get("_user_journey_history")
         )
 
-        if result.resolved and result.chosen:
-            # Auto-resolved: use the chosen candidate directly
-            user_state[chosen_id_key] = result.chosen.id
-            print(f"[JourneyChatbot] Auto-resolved '{query}' → '{result.chosen.name}' (score={result.top_score:.3f})")
-            return _continue_after_resolve()
+        # Convert options to DisambiguationCandidate list
+        candidates = candidates_from_journey_options(options)
 
-        if result.action == "ask_rephrase":
+        # Build context
+        ctx = JourneyDisambiguationContext(
+            role=role,
+            user_lat=user_lat,
+            user_lon=user_lon,
+            other_end_lat=other_end_lat,
+            other_end_lon=other_end_lon,
+            near_area_anchor=near_area_anchor,
+            near_area_text=near_area if near_area else None,
+            near_area_structured=near_area_structured,
+            user_history=user_history,
+        )
+
+        # Run the disambiguation pipeline
+        result = journey_disambiguate(query, candidates, ctx)
+
+        # Drop low name-match candidates (full ranked list is still in `candidates`)
+        filtered_ranked = [c for c in candidates if _journey_name_match_passes(c)]
+        hidden_name_match_count = len(candidates) - len(filtered_ranked)
+
+        # --- Handle outcome ---
+        direction = "from" if key_prefix == "from" else "to"
+
+        # A. Auto-select: proceed silently (only if name match clears the bar)
+        if result.action == "auto_select" and result.chosen:
+            if _journey_name_match_passes(result.chosen):
+                user_state[chosen_id_key] = result.chosen.id
+                user_state[chosen_name_key] = result.chosen.name
+                self._record_location_choice(user_state, result.chosen.id)
+                print(
+                    f"[JourneyChatbot] Auto-selected '{result.chosen.name}' "
+                    f"(score={result.top_score:.4f}, gap={result.confidence_gap:.4f})"
+                )
+                return _continue_after_resolve()
+            print(
+                f"[JourneyChatbot] Auto-select suppressed: name_similarity "
+                f"{getattr(result.chosen, 'name_similarity', None)!r} "
+                f"< {_JOURNEY_NAME_MATCH_MIN_DISPLAY:.0%}"
+            )
+
+        # Nothing left after name filter — ask user to rephrase
+        if not filtered_ranked:
             user_state["journey_planning_active"] = True
             user_state["pending_location_rephrase_for"] = key_prefix
+            side_word = "starting point" if key_prefix == "from" else "destination"
+            pct = int(round(_JOURNEY_NAME_MATCH_MIN_DISPLAY * 100))
             reply = (
-                f"I couldn't confidently match '{query}' to a specific location. "
-                "Could you rephrase or give a nearby station or area?"
+                f"I found possible places for '{query}', but none matched your wording closely enough "
+                f"(name match below {pct}%). Try a clearer name, spelling, or add the area or postcode "
+                f"for your {side_word}. Reply with that location and I'll use your next message."
             )
+            if self.tfl_client.last_url:
+                reply += f"\n\n[debug] TfL URL: {self.tfl_client.last_url}"
             return {
                 "reply": reply,
                 "journeys": [],
                 "state": user_state,
             }
 
-        # present_options: show ranked candidates to user
-        # Convert ranked candidates back to option dicts for state storage
-        ranked_options = [c.to_dict() for c in result.candidates]
-        user_state[pending_options_key] = ranked_options
-        direction = "from" if key_prefix == "from" else "to"
+        # Only one viable candidate after filtering — resolve without prompting
+        if len(filtered_ranked) == 1:
+            only = filtered_ranked[0]
+            user_state[chosen_id_key] = only.id
+            user_state[chosen_name_key] = only.name
+            self._record_location_choice(user_state, only.id)
+            print(
+                f"[JourneyChatbot] Auto-selected sole candidate after name filter: "
+                f"'{only.name}' (name_similarity={getattr(only, 'name_similarity', None)!r}, "
+                f"hidden_by_name={hidden_name_match_count})"
+            )
+            return _continue_after_resolve()
+
+        # B/C. Clarify or show_list: cap options; list is from name-filtered ranking
+        presented = filtered_ranked[:_JOURNEY_DISAMBIG_UI_MAX]
+
+        # Convert candidates back to option dicts for storage
+        presented_options = []
+        for c in presented:
+            opt = c.to_dict()
+            # Ensure qualifier is preserved from original options
+            for orig in options:
+                if orig["id"] == c.id:
+                    opt["qualifier"] = orig.get("qualifier", "")
+                    opt["shortLabel"] = orig.get("shortLabel", c.name)
+                    break
+            presented_options.append(opt)
+
+        user_state[pending_options_key] = presented_options
+
+        # Build the reply message
         lines = []
-        for i, c in enumerate(result.candidates, 1):
-            label = c.label or c.name
-            qualifier = f" ({c.qualifier})" if c.qualifier else ""
-            distance_info = f" [{c.distance_km:.1f}km away]" if c.distance_km is not None else ""
-            lines.append(f"  {i}. {label}{qualifier}{distance_info}")
-        question = (
-            f"Which place did you mean for '{query}' ({direction})?\n"
-            + "\n".join(lines)
-            + "\n\nReply with the number (e.g. 1 or 2) or the place name."
-        )
+        for i, o in enumerate(presented_options, 1):
+            label = (o.get("shortLabel") or o.get("name") or "").strip()
+            qual = (o.get("qualifier") or "").strip()
+            score_val = o.get("score", 0)
+            name_sim = o.get("name_similarity")
+            if qual and "," in qual:
+                qualifier = f" ({qual})"
+            else:
+                qualifier = ""
+            score_str = f" — score: {score_val:.0%}" if score_val > 0 else ""
+            if name_sim is not None:
+                try:
+                    score_str += f", name match: {float(name_sim):.0%}"
+                except (TypeError, ValueError):
+                    pass
+            lines.append(f"  {i}. {label}{qualifier}{score_str}")
+
+        if result.action == "clarify":
+            intro = f"Did you mean one of these for '{query}' ({direction})?"
+        else:
+            intro = f"Which place did you mean for '{query}' ({direction})?"
+
+        hidden_note = ""
+        if hidden_name_match_count > 0:
+            pct = int(round(_JOURNEY_NAME_MATCH_MIN_DISPLAY * 100))
+            h = hidden_name_match_count
+            hidden_note = (
+                f"\n\n({h} other candidate{'s were' if h != 1 else ' was'} not shown because "
+                f"{'their' if h != 1 else 'its'} name match to your query was below {pct}%.)"
+            )
+
+        footer = "\n\nTap or click a numbered label on the map, or type the number (e.g. 1 or 2) or the place name in the chat."
+
+        question = intro + hidden_note + "\n" + "\n".join(lines) + footer
         user_state[pending_question_key] = question
 
         # Build place_disambiguation for frontend map
-        place_disambiguation = _build_place_disambiguation_for_map(ranked_options, query, direction)
+        place_disambiguation = _build_place_disambiguation_for_map(presented_options, query, direction)
+        place_disambiguation["scores"] = {
+            o.get("id", ""): o.get("score", 0) for o in presented_options
+        }
+        place_disambiguation["hidden_candidates_count"] = hidden_name_match_count
+        place_disambiguation["name_match_min_display"] = _JOURNEY_NAME_MATCH_MIN_DISPLAY
 
         reply = question
         if self.tfl_client.last_url:
@@ -1409,45 +1987,18 @@ class JourneyChatbot:
             "place_disambiguation": place_disambiguation,
         }
 
-    def _build_spatial_anchor(
-        self, query: str, user_state: Dict[str, Any]
-    ) -> Optional[SpatialAnchor]:
+    def _record_location_choice(self, user_state: Dict[str, Any], location_id: str) -> None:
+        """Record a location selection for user history tracking.
+
+        Stores in user_state so it can be sent back to the frontend
+        for localStorage persistence.
         """
-        Build a SpatialAnchor for disambiguation from available context.
-
-        Priority:
-          1. LLM-extracted 'near_area' entity → ground via Places API
-          2. LLM-extracted 'towards' context  → ground via Places API
-          3. The query itself                  → ground via Places API (weaker anchor)
-        """
-        grounder = get_grounder()
-        if not grounder.available:
-            return None
-
-        # Check for near_area from LLM entities stored in user_state
-        near_area = user_state.get("_nlp_near_area")
-        if near_area:
-            places_result = grounder.ground(near_area)
-            anchor = anchor_from_places(places_result, source="near_area")
-            if anchor:
-                print(f"[JourneyChatbot] Spatial anchor from near_area='{near_area}': ({anchor.lat}, {anchor.lng})")
-                return anchor
-
-        # Check for towards context
-        towards = user_state.get("_nlp_towards")
-        if towards:
-            places_result = grounder.ground(towards)
-            anchor = anchor_from_places(places_result, source="towards")
-            if anchor:
-                print(f"[JourneyChatbot] Spatial anchor from towards='{towards}': ({anchor.lat}, {anchor.lng})")
-                return anchor
-
-        # Fall back to grounding the query itself (weaker — the query IS the ambiguous thing)
-        places_result = grounder.ground(query)
-        anchor = anchor_from_places(places_result, source="places_query")
-        if anchor:
-            print(f"[JourneyChatbot] Spatial anchor from query='{query}': ({anchor.lat}, {anchor.lng})")
-        return anchor
+        history = user_state.get("_user_journey_history", {})
+        chosen = history.get("chosen_locations", {})
+        chosen[location_id] = chosen.get(location_id, 0) + 1
+        history["chosen_locations"] = chosen
+        user_state["_user_journey_history"] = history
+        user_state["_updated_journey_history"] = True  # flag for frontend
 
     def _handle_datetime(
         self, text: str, user_state: Dict[str, Any], now: datetime
@@ -1478,6 +2029,42 @@ class JourneyChatbot:
             "state": user_state,
         }
 
+    def _build_confirm_pins_response(self, user_state: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Build a 'confirm_pins' response payload that tells the frontend to render
+        a Google Maps with two draggable markers — one for origin, one for destination.
+        The user can drag them to fine-tune the exact pickup/dropoff points before the
+        route is fetched from TfL.
+        """
+        from_id = user_state.get("fromLocationId", "")
+        to_id = user_state.get("toLocationId", "")
+        from_lat, from_lon = _parse_lat_lon_from_id(from_id)
+        to_lat, to_lon = _parse_lat_lon_from_id(to_id)
+
+        from_name = user_state.get("fromLocationName") or user_state.get("fromQuery", "Origin")
+        to_name = user_state.get("toLocationName") or user_state.get("toQuery", "Destination")
+
+        return {
+            "reply": (
+                f"I've pinpointed **{from_name}** and **{to_name}** on the map. "
+                "Drag either pin to fine-tune the exact spot, then tap **Plan Route** when you're ready."
+            ),
+            "journeys": [],
+            "confirm_pins": {
+                "from": {
+                    "lat": from_lat,
+                    "lon": from_lon,
+                    "name": from_name,
+                },
+                "to": {
+                    "lat": to_lat,
+                    "lon": to_lon,
+                    "name": to_name,
+                },
+            },
+            "state": user_state,
+        }
+
     def _reset_journey_state(self, user_state: Dict[str, Any]) -> None:
         """
         Reset journey-planning specific state after a journey has been planned
@@ -1488,6 +2075,8 @@ class JourneyChatbot:
             "toQuery",
             "fromLocationId",
             "toLocationId",
+            "fromLocationName",
+            "toLocationName",
             "fromOptions",
             "toOptions",
             "fromQuestion",
@@ -1502,7 +2091,14 @@ class JourneyChatbot:
             "_nlp_mode",
             "_nlp_journey_preference",
             "_nlp_timeIs",
+            "_nlp_near_area",
+            "_nlp_origin_near_area",
+            "_nlp_destination_near_area",
             "pending_location_rephrase_for",
+            "_pins_confirmed",
+            # User location (re-sent each request)
+            "_user_lat",
+            "_user_lon",
         ):
             user_state.pop(key, None)
 

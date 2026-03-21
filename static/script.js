@@ -27,14 +27,276 @@ const avatarFileInput = document.getElementById('avatarFileInput');
 
 const AVATAR_STORAGE_KEY_PREFIX = 'travelAssistantAvatar:';
 
-// Journey planner UI elements
-const journeyInputsSection = document.getElementById('journey-inputs');
-const journeyPlannerToggle = document.getElementById('journey-planner-toggle');
-const fromInput = document.getElementById('from-input');
-const toInput = document.getElementById('to-input');
-const dateInput = document.getElementById('date-input');
-const timeInput = document.getElementById('time-input');
-const planBtn = document.getElementById('plan-btn');
+// ---------------------------------------------------------------------------
+// Journey Disambiguation: Geolocation + User History (localStorage)
+// ---------------------------------------------------------------------------
+
+const JOURNEY_HISTORY_KEY = 'travelAssistantJourneyHistory';
+const TEST_LOCATION_KEY = 'travelAssistantTestLocation';
+
+/** Current user geolocation (updated after permission + in background). */
+let userGeoLat = null;
+let userGeoLon = null;
+
+/** Optional { lat, lon } — when set, sent instead of real GPS (local testing). */
+let testLocationOverride = null;
+
+function loadTestLocationFromStorage() {
+    try {
+        const raw = localStorage.getItem(TEST_LOCATION_KEY);
+        if (!raw) return null;
+        const o = JSON.parse(raw);
+        if (
+            o &&
+            typeof o.lat === 'number' &&
+            typeof o.lon === 'number' &&
+            !Number.isNaN(o.lat) &&
+            !Number.isNaN(o.lon)
+        ) {
+            return { lat: o.lat, lon: o.lon };
+        }
+    } catch (e) {
+        /* ignore */
+    }
+    return null;
+}
+
+function saveTestLocationToStorage(loc) {
+    if (!loc) {
+        localStorage.removeItem(TEST_LOCATION_KEY);
+        return;
+    }
+    try {
+        localStorage.setItem(TEST_LOCATION_KEY, JSON.stringify({ lat: loc.lat, lon: loc.lon }));
+    } catch (e) {
+        console.warn('[TestLocation] Failed to save:', e);
+    }
+}
+
+function clearTestLocationOverride() {
+    testLocationOverride = null;
+    saveTestLocationToStorage(null);
+    syncTestLocationPanel();
+    updateLocationButtonUI();
+}
+
+/**
+ * Parse "51.5, -0.12" or "51.5 -0.12" into { lat, lon }.
+ */
+function parseLatLonPair(text) {
+    const t = (text || '').trim();
+    if (!t) return null;
+    const parts = t.split(/[\s,]+/).filter(Boolean);
+    if (parts.length < 2) return null;
+    const lat = parseFloat(parts[0]);
+    const lon = parseFloat(parts[1]);
+    if (Number.isNaN(lat) || Number.isNaN(lon)) return null;
+    if (lat < -90 || lat > 90 || lon < -180 || lon > 180) return null;
+    return { lat, lon };
+}
+
+function setTestLocationOverride(loc) {
+    testLocationOverride = loc;
+    saveTestLocationToStorage(loc);
+    syncTestLocationPanel();
+    updateLocationButtonUI();
+}
+
+function syncTestLocationPanel() {
+    const status = document.getElementById('testLocationStatus');
+    const manual = document.getElementById('testLocationManual');
+    const preset = document.getElementById('testLocationPreset');
+    if (!status) return;
+
+    if (testLocationOverride) {
+        const { lat, lon } = testLocationOverride;
+        status.textContent = `Using test: ${lat.toFixed(5)}, ${lon.toFixed(5)} (overrides GPS)`;
+        if (manual && !manual.matches(':focus')) {
+            manual.value = `${lat}, ${lon}`;
+        }
+        if (preset) {
+            let matched = '';
+            Array.from(preset.options).forEach((o) => {
+                if (!o.value) return;
+                const p = parseLatLonPair(o.value.replace(',', ' '));
+                if (p && Math.abs(p.lat - lat) < 0.0002 && Math.abs(p.lon - lon) < 0.0002) {
+                    matched = o.value;
+                }
+            });
+            preset.value = matched || '';
+        }
+    } else {
+        status.textContent = userGeoLat !== null ? 'Using real GPS when available.' : 'No GPS yet — use header Location or a test override.';
+        if (manual && !manual.matches(':focus')) {
+            manual.value = '';
+        }
+        if (preset) preset.value = '';
+    }
+}
+
+function updateLocationButtonUI() {
+    const btn = document.getElementById('shareLocationButton');
+    const label = document.getElementById('shareLocationLabel');
+    if (!btn || !label) return;
+    if (testLocationOverride) {
+        btn.setAttribute('aria-pressed', 'true');
+        label.textContent = 'Test loc';
+        btn.classList.add('header-action-btn--location-on');
+        btn.title = `Test override active: ${testLocationOverride.lat.toFixed(4)}, ${testLocationOverride.lon.toFixed(4)} — click to use real GPS instead`;
+        return;
+    }
+    const ok = userGeoLat !== null && userGeoLon !== null;
+    btn.setAttribute('aria-pressed', ok ? 'true' : 'false');
+    label.textContent = ok ? 'Location on' : 'Location';
+    btn.classList.toggle('header-action-btn--location-on', ok);
+    btn.title =
+        'Approximate location helps disambiguate places (e.g. same street name). Not sent as journey start/end unless you type it.';
+}
+
+function applyGeoPosition(pos) {
+    userGeoLat = pos.coords.latitude;
+    userGeoLon = pos.coords.longitude;
+    updateLocationButtonUI();
+    if (!testLocationOverride) syncTestLocationPanel();
+}
+
+/**
+ * Ask the browser for the user's position. Browsers only show a clear permission
+ * prompt when this runs after a user gesture — use the header "Location" button
+ * for that. A silent attempt on load may succeed or fail without any in-app text.
+ */
+function requestShareLocation(isUserClick) {
+    if (isUserClick) {
+        clearTestLocationOverride();
+    }
+    if (!navigator.geolocation) {
+        if (isUserClick) showShareFeedback('Geolocation not supported in this browser');
+        return;
+    }
+    navigator.geolocation.getCurrentPosition(
+        (pos) => {
+            applyGeoPosition(pos);
+            if (isUserClick) {
+                showShareFeedback('Location saved — helps disambiguate place names');
+            } else {
+                // eslint-disable-next-line no-console
+                console.log('[Geo] User location:', userGeoLat, userGeoLon);
+            }
+        },
+        (err) => {
+            updateLocationButtonUI();
+            if (isUserClick) {
+                const msg =
+                    err && err.code === 1
+                        ? 'Location blocked — allow it in the browser address bar'
+                        : 'Could not read location';
+                showShareFeedback(msg);
+            } else {
+                // eslint-disable-next-line no-console
+                console.log('[Geo] Geolocation unavailable:', err && err.message ? err.message : err);
+            }
+        },
+        { enableHighAccuracy: false, timeout: 15000, maximumAge: 300000 }
+    );
+}
+
+testLocationOverride = loadTestLocationFromStorage();
+syncTestLocationPanel();
+updateLocationButtonUI();
+
+if (navigator.geolocation) {
+    requestShareLocation(false);
+    navigator.geolocation.watchPosition(
+        (pos) => applyGeoPosition(pos),
+        () => {},
+        { enableHighAccuracy: false, timeout: 15000, maximumAge: 60000 }
+    );
+}
+
+const shareLocationButton = document.getElementById('shareLocationButton');
+if (shareLocationButton) {
+    shareLocationButton.addEventListener('click', () => requestShareLocation(true));
+}
+
+(function initTestLocationPanel() {
+    const applyBtn = document.getElementById('testLocationApplyBtn');
+    const clearBtn = document.getElementById('testLocationClearBtn');
+    const preset = document.getElementById('testLocationPreset');
+    const manual = document.getElementById('testLocationManual');
+    if (!applyBtn || !clearBtn) return;
+
+    applyBtn.addEventListener('click', () => {
+        let loc = null;
+        if (manual && manual.value.trim()) {
+            loc = parseLatLonPair(manual.value);
+            if (!loc) {
+                showShareFeedback('Invalid lat, lon — use two numbers');
+                return;
+            }
+        } else if (preset && preset.value) {
+            loc = parseLatLonPair(preset.value.replace(',', ' '));
+        }
+        if (!loc) {
+            showShareFeedback('Choose a preset or enter lat, lon');
+            return;
+        }
+        setTestLocationOverride(loc);
+        showShareFeedback('Test location applied');
+    });
+
+    clearBtn.addEventListener('click', () => {
+        clearTestLocationOverride();
+        showShareFeedback('Test location cleared');
+    });
+})();
+
+/** Get journey history from localStorage. */
+function getJourneyHistory() {
+    try {
+        const raw = localStorage.getItem(JOURNEY_HISTORY_KEY);
+        return raw ? JSON.parse(raw) : {};
+    } catch (e) {
+        return {};
+    }
+}
+
+/** Save updated journey history to localStorage. */
+function saveJourneyHistory(history) {
+    try {
+        localStorage.setItem(JOURNEY_HISTORY_KEY, JSON.stringify(history));
+    } catch (e) {
+        console.warn('[JourneyHistory] Failed to save:', e);
+    }
+}
+
+/**
+ * Build the extra payload fields for journey disambiguation.
+ * Included in every /chat request so the backend can use them for scoring.
+ */
+function getJourneyContextPayload() {
+    const payload = {};
+    if (testLocationOverride) {
+        payload.userLat = testLocationOverride.lat;
+        payload.userLon = testLocationOverride.lon;
+    } else if (userGeoLat !== null && userGeoLon !== null) {
+        payload.userLat = userGeoLat;
+        payload.userLon = userGeoLon;
+    }
+    const history = getJourneyHistory();
+    if (history && Object.keys(history).length > 0) {
+        payload.journeyHistory = history;
+    }
+    return payload;
+}
+
+// Journey planner UI elements (interface disabled)
+const journeyInputsSection = null;
+const journeyPlannerToggle = null;
+const fromInput = null;
+const toInput = null;
+const dateInput = null;
+const timeInput = null;
+const planBtn = null;
 
 // Text shortcut UI elements
 const shortcutKeyInput = document.getElementById('shortcut-key-input');
@@ -269,12 +531,12 @@ function getWelcomeMessageHtml() {
     return `
         <p>${greeting}</p>
         <ul>
-            <li>Current traffic and congestion on your route</li>
-            <li>Rough delay expectations</li>
-            <li>Choosing a good time to set off</li>
-            <li>Simple route suggestions</li>
+            <li>Bus and train timetables (next arrivals)</li>
+            <li>Live service status and disruption updates (TfL lines and bus routes)</li>
+            <li>Journey planning in London with step-by-step route legs</li>
         </ul>
-        <p>You can ask things like: "How busy is the A1 right now?" or "What time is best to drive into the city?"</p>
+        <p>You can ask things like: "What's the bus schedule for Blackbird Hill?", "Is the Jubilee line running?", or "Plan a journey from Neasden to Waterloo".</p>
+        <p class="welcome-location-hint">Optional: use the <strong>Location</strong> button in the header to share approximate position — it helps when several places share the same name. The app does not use it as your journey start unless you type that.</p>
     `;
 }
 
@@ -568,23 +830,70 @@ function sendMessage() {
     // Show typing indicator
     const typingId = showTypingIndicator();
 
-    // Send message to backend
+    // Send message to backend (include geolocation + journey history)
+    const chatPayload = { message: message, ...getJourneyContextPayload() };
     fetch('/chat', {
         method: 'POST',
         headers: {
             'Content-Type': 'application/json',
         },
-        body: JSON.stringify({ message: message })
+        body: JSON.stringify(chatPayload)
     })
         .then(response => response.json())
         .then(data => {
             // Remove typing indicator
             removeTypingIndicator(typingId);
+            // Persist updated journey history if backend sent it back
+            if (data.updated_journey_history) {
+                saveJourneyHistory(data.updated_journey_history);
+            }
             handleChatResponse(data);
+            // For testing: hard-coded demo of live traffic map for Wembley.
+            maybeRenderTrafficTestMap(message);
         })
         .catch(error => {
             removeTypingIndicator(typingId);
             addMessageAndStore('Sorry, I encountered an error. Please try again.', 'bot');
+            console.error('Error:', error);
+        });
+}
+
+/**
+ * Send a short follow-up reply back to the chatbot without using the text box.
+ * Used for clicks on disambiguation maps so that picking a marker behaves like
+ * replying with "1", "2", or the place name in the normal chat flow.
+ */
+function sendDisambiguationChoice(choiceText) {
+    const message = (choiceText || '').trim();
+    if (!message) return;
+
+    // Show the user's selection in the conversation.
+    addMessageAndStore(message, 'user');
+
+    // Show typing indicator
+    const typingId = showTypingIndicator();
+
+    // Send message to backend (include geolocation + journey history)
+    const chatPayload = { message, ...getJourneyContextPayload() };
+    fetch('/chat', {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(chatPayload)
+    })
+        .then((response) => response.json())
+        .then((data) => {
+            removeTypingIndicator(typingId);
+            if (data.updated_journey_history) {
+                saveJourneyHistory(data.updated_journey_history);
+            }
+            handleChatResponse(data);
+        })
+        .catch((error) => {
+            removeTypingIndicator(typingId);
+            addMessageAndStore('Sorry, I encountered an error. Please try again.', 'bot');
+            // eslint-disable-next-line no-console
             console.error('Error:', error);
         });
 }
@@ -795,13 +1104,70 @@ function updateInfoPanel(data) {
         confidenceDisplay.style.color = data.confidence > 0.7 ? '#28a745' : data.confidence > 0.5 ? '#ffc107' : '#dc3545';
     }
 
-    // Update entities
+    // Update entities — render as styled tag chips grouped by category
     if (data.entities && Object.keys(data.entities).length > 0) {
-        const entitiesList = Object.entries(data.entities)
-            .map(([key, value]) => `${key}: ${value}`)
-            .join(', ');
-        entitiesDisplay.textContent = entitiesList;
+        entitiesDisplay.innerHTML = '';
+
+        // Category groupings and colors for entity keys
+        const categoryMap = {
+            origin:             { label: 'Origin',           cat: 'journey', color: '#2563eb' },
+            destination:        { label: 'Destination',      cat: 'journey', color: '#2563eb' },
+            via:                { label: 'Via',              cat: 'journey', color: '#2563eb' },
+            date:               { label: 'Date',             cat: 'journey', color: '#2563eb' },
+            time:               { label: 'Time',             cat: 'journey', color: '#2563eb' },
+            time_preference:    { label: 'Time Pref',        cat: 'journey', color: '#2563eb' },
+            mode:               { label: 'Modes',            cat: 'prefs',   color: '#7c3aed' },
+            journey_preference: { label: 'Optimise',         cat: 'prefs',   color: '#7c3aed' },
+            travel_mode:        { label: 'Mode',             cat: 'prefs',   color: '#7c3aed' },
+            timetable_mode:     { label: 'Timetable',        cat: 'prefs',   color: '#7c3aed' },
+            accessibility:      { label: 'Accessibility',    cat: 'prefs',   color: '#7c3aed' },
+            bus_route:          { label: 'Bus Route',        cat: 'transport', color: '#dc2626' },
+            line:               { label: 'Line',             cat: 'transport', color: '#dc2626' },
+            route:              { label: 'Route',            cat: 'transport', color: '#dc2626' },
+            location:           { label: 'Location',         cat: 'transport', color: '#059669' },
+            road:               { label: 'Road',             cat: 'transport', color: '#059669' },
+            llm_urgency:        { label: 'Urgency',          cat: 'context',  color: '#d97706' },
+            llm_mood:           { label: 'Mood',             cat: 'context',  color: '#d97706' },
+            llm_utterance_type: { label: 'Type',             cat: 'context',  color: '#d97706' },
+        };
+
+        // Filter out internal/private keys and technical IDs not useful to display
+        const hiddenKeys = new Set(['_', 'from_id', 'to_id', 'timeIs', 'timetable_stop_source', 'csv_stop_name']);
+        const entries = Object.entries(data.entities)
+            .filter(([key]) => !key.startsWith('_') && !hiddenKeys.has(key));
+
+        if (entries.length === 0) {
+            entitiesDisplay.textContent = 'None detected';
+            return;
+        }
+
+        const placeKeys = new Set(['origin', 'destination', 'via']);
+
+        entries.forEach(([key, value]) => {
+            const meta = categoryMap[key] || { label: key, cat: 'other', color: '#6b7280' };
+            const chip = document.createElement('span');
+            const isPlace = placeKeys.has(key);
+            chip.className = 'entity-chip entity-cat-' + meta.cat + (isPlace ? ' entity-chip-place' : '');
+            chip.style.cssText = `
+                display: inline-block;
+                margin: 2px 4px 2px 0;
+                padding: 2px 8px;
+                border-radius: 12px;
+                font-size: 0.8rem;
+                background: ${meta.color}18;
+                color: ${meta.color};
+                border: 1px solid ${meta.color}40;
+                white-space: nowrap;
+            `;
+            const labelHtml = `<strong>${escapeHtml(meta.label)}:</strong>`;
+            const valueHtml = isPlace
+                ? ` <span class="entity-chip-value">${escapeHtml(String(value))}</span>`
+                : ` ${escapeHtml(String(value))}`;
+            chip.innerHTML = labelHtml + valueHtml;
+            entitiesDisplay.appendChild(chip);
+        });
     } else {
+        entitiesDisplay.innerHTML = '';
         entitiesDisplay.textContent = 'None detected';
     }
 }
@@ -972,11 +1338,6 @@ function buildJourneyCard(journey) {
     timeline.appendChild(destRow);
     card.appendChild(timeline);
 
-    const actions = document.createElement('div');
-    actions.className = 'journey-card-actions';
-    actions.innerHTML = '<button type="button" class="journey-card-btn">View details</button><button type="button" class="journey-card-btn">Map view</button>';
-    card.appendChild(actions);
-
     return card;
 }
 
@@ -1048,11 +1409,6 @@ function appendJourneyCards(journeys, debugText, options) {
                 return;
             }
         }
-
-        const btn = e.target.closest('.journey-card-btn');
-        if (!btn) return;
-        // Map and external journey views are disabled to keep everything inside the app.
-        return;
     });
 
     if (debugText && debugText.includes('[debug]')) {
@@ -1259,16 +1615,46 @@ function renderTimetableDisambiguationMap(disamb) {
             mapTypeControl: false,
             streetViewControl: false,
             fullscreenControl: false,
-            clickableIcons: false, // prevent default POI popups with "View on Google Maps"
+            clickableIcons: false,
         });
 
         const bounds = new google.maps.LatLngBounds();
+
+        // Score lookup for label coloring.
+        // Journey planner passes scores in a separate {id: score} dict;
+        // timetable disambiguation embeds score inside each option object.
+        const scoresDict = disamb.scores || {};
+
         points.forEach((pt) => {
+            // Color marker based on score (green = high, orange = medium, red = low)
+            const opt = disamb.options[parseInt(pt.label) - 1] || {};
+            const score = scoresDict[opt.id || ''] || opt.score || 0;
+            let markerColor = '#EA4335'; // red (low)
+            if (score >= 0.7) markerColor = '#34A853'; // green (high)
+            else if (score >= 0.4) markerColor = '#FBBC05'; // yellow/orange (medium)
+
             const marker = new google.maps.Marker({
                 position: pt.position,
                 map,
-                label: pt.label,
-                title: pt.title,
+                label: {
+                    text: pt.label,
+                    color: '#FFFFFF',
+                    fontWeight: 'bold',
+                },
+                title: `${pt.title} (${Math.round(score * 100)}%)`,
+                icon: {
+                    path: google.maps.SymbolPath.CIRCLE,
+                    fillColor: markerColor,
+                    fillOpacity: 1,
+                    strokeColor: '#FFFFFF',
+                    strokeWeight: 2,
+                    scale: 14,
+                },
+            });
+            marker.addListener('click', () => {
+                if (typeof sendDisambiguationChoice === 'function') {
+                    sendDisambiguationChoice(pt.label);
+                }
             });
             bounds.extend(pt.position);
         });
@@ -1313,6 +1699,241 @@ function renderTimetableDisambiguationMap(disamb) {
     content.removeChild(mapWrap);
 }
 
+// Hard-coded demo: show a Google Maps traffic layer centred on Wembley
+// when the user asks specifically for "traffic in wembley".
+function maybeRenderTrafficTestMap(originalMessage) {
+    if (!originalMessage) return;
+    const text = String(originalMessage).toLowerCase().trim();
+    if (text !== 'traffic in wembley') return;
+    if (!chatMessages) return;
+    if (!window.google || !google.maps) {
+        // Google Maps script not ready; nothing to render.
+        return;
+    }
+
+    const wrap = document.createElement('div');
+    wrap.className = 'message bot-message';
+
+    const content = document.createElement('div');
+    content.className = 'message-content';
+
+    const heading = document.createElement('p');
+    heading.textContent = 'Here is live traffic in Wembley (test view).';
+    content.appendChild(heading);
+
+    const mapDiv = document.createElement('div');
+    mapDiv.className = 'traffic-test-map';
+    mapDiv.style.width = '100%';
+    mapDiv.style.height = '260px';
+    mapDiv.style.borderRadius = '8px';
+    mapDiv.style.overflow = 'hidden';
+    mapDiv.style.marginTop = '8px';
+    content.appendChild(mapDiv);
+
+    wrap.appendChild(content);
+    chatMessages.appendChild(wrap);
+    chatMessages.scrollTop = chatMessages.scrollHeight;
+
+    const wembleyCenter = { lat: 51.5560, lng: -0.2796 }; // Approximate Wembley Stadium area
+    const map = new google.maps.Map(mapDiv, {
+        center: wembleyCenter,
+        zoom: 13,
+        mapTypeControl: false,
+        streetViewControl: false,
+        fullscreenControl: false,
+    });
+
+    const trafficLayer = new google.maps.TrafficLayer();
+    trafficLayer.setMap(map);
+}
+
+/**
+ * renderConfirmPinsMap — shows a Google Maps with two draggable pins (green = origin,
+ * red = destination) attached to the last bot message. The user can drag them to
+ * fine-tune exact locations, then click "Plan Route" to confirm.
+ */
+function renderConfirmPinsMap(pinData) {
+    if (!pinData || !pinData.from || !pinData.to) return;
+    if (!window.google || !google.maps) return;
+
+    const botMessages = chatMessages ? chatMessages.querySelectorAll('.message.bot-message') : null;
+    if (!botMessages || botMessages.length === 0) return;
+    const lastBot = botMessages[botMessages.length - 1];
+    const content = lastBot.querySelector('.message-content');
+    if (!content) return;
+
+    // Remove any previous confirm-pins map in this message
+    const existing = content.querySelector('.confirm-pins-map-wrap');
+    if (existing) existing.remove();
+
+    // Outer wrapper
+    const wrap = document.createElement('div');
+    wrap.className = 'confirm-pins-map-wrap';
+
+    // Map container (will be initialised after browser layout pass)
+    const mapDiv = document.createElement('div');
+    mapDiv.className = 'confirm-pins-map';
+    wrap.appendChild(mapDiv);
+
+    // Legend row
+    const legend = document.createElement('div');
+    legend.className = 'confirm-pins-legend';
+    legend.innerHTML = `
+        <span class="confirm-pins-legend-item">
+            <svg width="16" height="16" viewBox="0 0 16 16"><circle cx="8" cy="8" r="8" fill="#34A853"/><text x="8" y="12" text-anchor="middle" fill="white" font-size="9" font-weight="bold">A</text></svg>
+            ${pinData.from.name || 'Origin'}
+        </span>
+        <span class="confirm-pins-legend-item">
+            <svg width="16" height="16" viewBox="0 0 16 16"><circle cx="8" cy="8" r="8" fill="#EA4335"/><text x="8" y="12" text-anchor="middle" fill="white" font-size="9" font-weight="bold">B</text></svg>
+            ${pinData.to.name || 'Destination'}
+        </span>`;
+    wrap.appendChild(legend);
+
+    // "Plan Route" button
+    const btn = document.createElement('button');
+    btn.textContent = 'Plan Route';
+    btn.className = 'confirm-pins-btn';
+
+    // Keep track of current pin positions (mutable as user drags)
+    const pinState = {
+        from: { lat: Number(pinData.from.lat), lon: Number(pinData.from.lon) },
+        to:   { lat: Number(pinData.to.lat),   lon: Number(pinData.to.lon)   },
+    };
+
+    btn.onclick = () => {
+        btn.disabled = true;
+        btn.textContent = 'Planning…';
+        const payload = {
+            message: '',
+            confirmPins: {
+                from: { lat: pinState.from.lat, lon: pinState.from.lon },
+                to:   { lat: pinState.to.lat,   lon: pinState.to.lon   },
+            },
+        };
+        if (testLocationOverride) {
+            payload.userLat = testLocationOverride.lat;
+            payload.userLon = testLocationOverride.lon;
+        } else if (userGeoLat != null) {
+            payload.userLat = userGeoLat;
+            payload.userLon = userGeoLon;
+        }
+        fetch('/chat', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+        })
+        .then(r => r.json())
+        .then(d => {
+            btn.textContent = 'Route planned ✓';
+            handleChatResponse(d);
+        })
+        .catch(() => {
+            btn.disabled = false;
+            btn.textContent = 'Plan Route';
+        });
+    };
+    wrap.appendChild(btn);
+
+    // Insert the whole wrap BEFORE the Read-aloud/Share buttons so it sits
+    // naturally between the message text and the action bar.
+    const actionsWrap = content.querySelector('.message-actions-wrap');
+    if (actionsWrap) {
+        content.insertBefore(wrap, actionsWrap);
+    } else {
+        content.appendChild(wrap);
+    }
+    chatMessages.scrollTop = chatMessages.scrollHeight;
+
+    // Initialise the Google Map AFTER the browser has done a layout pass so the
+    // mapDiv has real pixel dimensions (Maps silently fails on zero-size divs).
+    requestAnimationFrame(() => {
+        setTimeout(() => {
+            const fromPos = { lat: pinState.from.lat, lng: pinState.from.lon };
+            const toPos   = { lat: pinState.to.lat,   lng: pinState.to.lon   };
+            const center  = {
+                lat: (fromPos.lat + toPos.lat) / 2,
+                lng: (fromPos.lng + toPos.lng) / 2,
+            };
+
+            const map = new google.maps.Map(mapDiv, {
+                center,
+                zoom: 13,
+                mapTypeControl: false,
+                streetViewControl: false,
+                fullscreenControl: false,
+                clickableIcons: false,
+                gestureHandling: 'cooperative',
+            });
+
+            // Fit both pins in view
+            const bounds = new google.maps.LatLngBounds();
+            bounds.extend(fromPos);
+            bounds.extend(toPos);
+            map.fitBounds(bounds, { top: 40, right: 40, bottom: 40, left: 40 });
+
+            // Origin marker — green A, draggable
+            const fromMarker = new google.maps.Marker({
+                position: fromPos,
+                map,
+                draggable: true,
+                title: pinData.from.name || 'Origin',
+                label: { text: 'A', color: '#fff', fontWeight: 'bold', fontSize: '13px' },
+                icon: {
+                    path: google.maps.SymbolPath.CIRCLE,
+                    fillColor: '#34A853',
+                    fillOpacity: 1,
+                    strokeColor: '#fff',
+                    strokeWeight: 2,
+                    scale: 16,
+                },
+                zIndex: 2,
+            });
+
+            // Destination marker — red B, draggable
+            const toMarker = new google.maps.Marker({
+                position: toPos,
+                map,
+                draggable: true,
+                title: pinData.to.name || 'Destination',
+                label: { text: 'B', color: '#fff', fontWeight: 'bold', fontSize: '13px' },
+                icon: {
+                    path: google.maps.SymbolPath.CIRCLE,
+                    fillColor: '#EA4335',
+                    fillOpacity: 1,
+                    strokeColor: '#fff',
+                    strokeWeight: 2,
+                    scale: 16,
+                },
+                zIndex: 2,
+            });
+
+            // Info windows
+            const fromInfo = new google.maps.InfoWindow({
+                content: `<strong>${pinData.from.name || 'Origin'}</strong><br><small>Drag to adjust</small>`,
+            });
+            const toInfo = new google.maps.InfoWindow({
+                content: `<strong>${pinData.to.name || 'Destination'}</strong><br><small>Drag to adjust</small>`,
+            });
+
+            fromMarker.addListener('click', () => { toInfo.close(); fromInfo.open(map, fromMarker); });
+            toMarker.addListener('click',   () => { fromInfo.close(); toInfo.open(map, toMarker); });
+
+            fromMarker.addListener('dragend', (e) => {
+                pinState.from.lat = e.latLng.lat();
+                pinState.from.lon = e.latLng.lng();
+                fromInfo.close();
+            });
+            toMarker.addListener('dragend', (e) => {
+                pinState.to.lat = e.latLng.lat();
+                pinState.to.lon = e.latLng.lng();
+                toInfo.close();
+            });
+
+            chatMessages.scrollTop = chatMessages.scrollHeight;
+        }, 50);
+    });
+}
+
 function handleChatResponse(data) {
     if (data.error) {
         addMessageAndStore('Sorry, I encountered an error: ' + data.error, 'bot');
@@ -1325,13 +1946,10 @@ function handleChatResponse(data) {
             fromId: data.from_id || '',
             toId: data.to_id || '',
         };
+        // Store journey payload and render journey cards inline in the chat,
+        // but do not show or toggle any dedicated journey planner interface.
         addMessageAndStore(data.response || '', 'bot', { journeys: data.journeys, journeyOptions });
         appendJourneyCards(data.journeys, data.response || '', journeyOptions);
-        showJourneyInputsIfNeeded();
-        if (journeyInputsSection && journeyInputsSection.classList.contains('hidden')) {
-            journeyInputsSection.classList.remove('hidden');
-            updateJourneyPlannerToggle(true);
-        }
     } else if (data.timetable || data.disruption) {
         const payload = {};
         if (data.timetable) payload.timetable = data.timetable;
@@ -1341,13 +1959,6 @@ function handleChatResponse(data) {
         if (data.disruption) appendDisruptionCard(data.disruption, data.response);
     } else if (data.response) {
         addMessageAndStore(data.response, 'bot');
-        if (data.disambiguation) {
-            showJourneyInputsIfNeeded();
-            if (journeyInputsSection && journeyInputsSection.classList.contains('hidden')) {
-                journeyInputsSection.classList.remove('hidden');
-                updateJourneyPlannerToggle(true);
-            }
-        }
     }
 
     // When the backend is asking "Which direction for '<query>'?" for bus timetable,
@@ -1359,121 +1970,27 @@ function handleChatResponse(data) {
     if (data.journey_disambiguation && data.journey_disambiguation.options && data.journey_disambiguation.options.length > 0) {
         renderTimetableDisambiguationMap(data.journey_disambiguation);
     }
+    // Both locations confirmed — show draggable pin map before fetching the route.
+    if (data.confirm_pins && data.confirm_pins.from && data.confirm_pins.to) {
+        renderConfirmPinsMap(data.confirm_pins);
+    }
 
     updateInfoPanel(data);
 }
 
 function sendPlannedJourney() {
-    if (!fromInput || !toInput) return;
-    const from = fromInput.value.trim();
-    const to = toInput.value.trim();
-    const date = dateInput ? dateInput.value : '';
-    const time = timeInput ? timeInput.value : '';
-    const fromId = fromCoord || '';
-    const toId = toCoord || '';
-
-    if (!from || !to) {
-        addMessageAndStore('Please choose both a start and destination before planning.', 'bot');
-        return;
-    }
-
-    let whenPhrase = '';
-    if (date && time) {
-        whenPhrase = ` on ${date} at ${time}`;
-    } else if (time) {
-        whenPhrase = ` at ${time}`;
-    }
-
-    const query = `Plan a journey from ${from} to ${to}${whenPhrase}`;
-    addMessageAndStore(query, 'user');
-
-    const typingId = showTypingIndicator();
-
-    fetch('/chat', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: query, from, to, date, time, fromId, toId }),
-    })
-        .then((res) => res.json())
-        .then((data) => {
-            removeTypingIndicator(typingId);
-            handleChatResponse(data);
-        })
-        .catch(() => {
-            removeTypingIndicator(typingId);
-            addMessageAndStore('Sorry, something went wrong talking to the server.', 'bot');
-        });
+    // Journey planner interface is disabled; do nothing.
+    return;
 }
 
 function initPlacesAutocomplete() {
-    if (!window.google || !google.maps || !google.maps.places) {
-        return;
-    }
-
-    // Restrict Google Places autocomplete to Greater London area
-    const londonBounds = new google.maps.LatLngBounds(
-        // Approximate SW and NE corners of Greater London
-        new google.maps.LatLng(51.28, -0.489),
-        new google.maps.LatLng(51.686, 0.236)
-    );
-
-    if (fromInput) {
-        const fromAutocomplete = new google.maps.places.Autocomplete(fromInput, {
-            fields: ['geometry', 'name'],
-            bounds: londonBounds,
-            strictBounds: true,
-        });
-        fromAutocomplete.addListener('place_changed', () => {
-            const place = fromAutocomplete.getPlace();
-            if (
-                place &&
-                place.geometry &&
-                place.geometry.location &&
-                londonBounds.contains(place.geometry.location)
-            ) {
-                const lat = place.geometry.location.lat();
-                const lng = place.geometry.location.lng();
-                fromCoord = `${lat},${lng}`;
-            } else {
-                fromCoord = '';
-            }
-        });
-    }
-
-    if (toInput) {
-        const toAutocomplete = new google.maps.places.Autocomplete(toInput, {
-            fields: ['geometry', 'name'],
-            bounds: londonBounds,
-            strictBounds: true,
-        });
-        toAutocomplete.addListener('place_changed', () => {
-            const place = toAutocomplete.getPlace();
-            if (
-                place &&
-                place.geometry &&
-                place.geometry.location &&
-                londonBounds.contains(place.geometry.location)
-            ) {
-                const lat = place.geometry.location.lat();
-                const lng = place.geometry.location.lng();
-                toCoord = `${lat},${lng}`;
-            } else {
-                toCoord = '';
-            }
-        });
-    }
+    // Journey planner inputs are disabled; no Places autocomplete wiring needed.
 }
 
 // Expose callback for Google Places script (if configured)
 window.initPlacesAutocomplete = initPlacesAutocomplete;
 
-// Wire up journey planner controls if present
-if (journeyPlannerToggle) {
-    journeyPlannerToggle.addEventListener('click', toggleJourneyPlanner);
-}
-if (planBtn) {
-    planBtn.addEventListener('click', sendPlannedJourney);
-}
+// Journey planner controls are disabled; no event wiring.
 
 // Sidebar actions
 if (newChatButton) {

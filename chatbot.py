@@ -117,6 +117,8 @@ class TrafficChatbot:
         user_message: str,
         user_key: Optional[str] = None,
         username: Optional[str] = None,
+        user_lat: Optional[float] = None,
+        user_lon: Optional[float] = None,
     ) -> Dict[str, Any]:
         """
         Process user message and generate response.
@@ -139,6 +141,11 @@ class TrafficChatbot:
         # this call, so all the existing code that reads/writes
         # self.conversation_state works correctly per-user.
         self.conversation_state = self._get_user_conversation_state(user_key)
+
+        # Store device location for use during disambiguation scoring
+        if user_lat is not None and user_lon is not None:
+            self.conversation_state['_user_lat'] = user_lat
+            self.conversation_state['_user_lon'] = user_lon
 
         # Also sync FSM state for new code paths
         user_fsm_state = self._get_user_state(user_key)
@@ -491,23 +498,22 @@ class TrafficChatbot:
     def _reorder_options_by_preference(
         self, options: List[Dict[str, Any]], user_key: Optional[str]
     ) -> List[Dict[str, Any]]:
-        """Reorder disambiguation options so last chosen and frequent stops appear first."""
-        if not options or not user_key:
-            return list(options)
-        prefs = self._user_preferences.get(user_key)
-        if not prefs:
-            return list(options)
-        last_id = prefs.get('last_chosen_stop_id')
-        frequent = prefs.get('frequent_stops') or {}
+        """Sort disambiguation options: score descending first, then user preference.
 
-        def sort_key(opt: Dict[str, Any]) -> Tuple[int, int]:
+        Primary key: score (descending) — already set by DisambiguationEngine.
+        Secondary key: last-chosen / frequent-stop preference (tiebreaker only).
+        """
+        prefs = self._user_preferences.get(user_key) if user_key else None
+        last_id = (prefs or {}).get('last_chosen_stop_id')
+        frequent = (prefs or {}).get('frequent_stops') or {}
+
+        def sort_key(opt: Dict[str, Any]) -> Tuple[float, int, int]:
+            score = float(opt.get('score') or 0.0)
             oid = opt.get('id') or ''
-            if oid == last_id:
-                first = 0
-            else:
-                first = 1
+            pref_primary = 0 if oid == last_id else 1
             count = frequent.get(oid, 0)
-            return (first, -count)
+            # Negate score so that higher scores sort first
+            return (-score, pref_primary, -count)
 
         return sorted(options, key=sort_key)
 
@@ -797,17 +803,28 @@ class TrafficChatbot:
         query = disamb.get('query', '')
         mode = disamb.get('timetable_mode', 'bus')
         is_train_direction = disamb.get('train_direction_disambiguation') is True
-        lines = [f"  {i}. {opt.get('label', opt.get('name', 'Unknown'))}" for i, opt in enumerate(options, 1)]
-        station_list = '\n'.join(lines[:10])
+
+        # Build numbered option list with score percentages next to each candidate
+        opt_lines = []
+        for i, opt in enumerate(options[:10], 1):
+            label = opt.get('label', opt.get('name', 'Unknown'))
+            score = opt.get('score')
+            if score is not None and float(score) > 0:
+                pct = round(float(score) * 100)
+                opt_lines.append(f"  {i}. {label}  ({pct}% match)")
+            else:
+                opt_lines.append(f"  {i}. {label}")
+        station_list = '\n'.join(opt_lines)
+
         if is_train_direction:
             primary = f"Which platform or direction for '{query}'?"
-            next_steps = "Reply with the number (e.g. 1 or 2), direction (e.g. Northbound, Southbound), or platform (e.g. Platform 1)."
+            next_steps = "Tap or click a numbered label on the map, or type the number (e.g. 1 or 2), a direction (e.g. Northbound), or platform (e.g. Platform 1) in the chat."
         elif mode == 'train':
             primary = f"Which train station for '{query}'?"
-            next_steps = "Reply with the number (e.g. 1 or 2) or the station name (e.g. Baker Street)."
+            next_steps = "Tap or click a numbered label on the map, or type the number (e.g. 1 or 2) or the station name (e.g. Baker Street) in the chat."
         else:
             primary = f"Which direction for '{query}'?"
-            next_steps = "Reply with anything that includes your choice (e.g. 1 or 2, Stop AA, or the direction name like Willesden)."
+            next_steps = "Tap or click a numbered label on the map, or type your choice (e.g. 1 or 2, Stop AA, or the direction name like Willesden) in the chat."
         details = f"Choose one:\n{station_list}"
         return {'primary': primary, 'details': details, 'next_steps': next_steps}
 
@@ -931,7 +948,7 @@ class TrafficChatbot:
                 formatted += f"\n{i}. {alt}"
         
         if next_steps:
-            formatted += f"\n\nNext: {next_steps}"
+            formatted += f"\n\n{next_steps}"
         
         return formatted
     
@@ -1227,7 +1244,9 @@ class TrafficChatbot:
                     # Build user context for preference boosting
                     user_ctx = self._build_user_context(user_key)
 
-                    # Run the disambiguation engine
+                    # Run the disambiguation engine.
+                    # Pass the towards entity so the scorer can boost candidates
+                    # whose direction matches even when live-arrivals didn't resolve.
                     engine = get_disambiguation_engine()
                     result = engine.disambiguate(
                         query=query,
@@ -1235,6 +1254,9 @@ class TrafficChatbot:
                         anchor=anchor,
                         user_context=user_ctx,
                         mode=mode or "bus",
+                        towards_query=towards,
+                        user_lat=self.conversation_state.get('_user_lat'),
+                        user_lon=self.conversation_state.get('_user_lon'),
                     )
 
                     if result.resolved and result.chosen:

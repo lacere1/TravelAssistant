@@ -79,9 +79,13 @@
                 <div class="header-row">
                     <div class="header-text">
                         <h1>Travel assistant</h1>
-                        <p class="subtitle">Practical help with routes, traffic, and planning your journeys</p>
+                        <p class="subtitle">Timetables, live disruptions, and journey planning in London</p>
                     </div>
                     <div class="header-actions">
+                        <button type="button" id="shareLocationButton" class="header-action-btn" aria-label="Share approximate location for journey suggestions" aria-pressed="false" title="Helps pick the right place when names are ambiguous (e.g. same street in different areas). Your coordinates are not used as trip start/end unless you type them.">
+                            <span aria-hidden="true">📍</span>
+                            <span id="shareLocationLabel" class="header-action-label">Location</span>
+                        </button>
                         <button type="button" id="themeToggle" class="theme-toggle header-action-btn" aria-label="Toggle light/dark mode" title="Toggle light/dark mode">
                             <span class="theme-icon theme-icon-sun" aria-hidden="true">☀</span>
                             <span class="theme-icon theme-icon-moon hidden" aria-hidden="true">🌙</span>
@@ -100,84 +104,21 @@
                                 <div class="message-content">
                                     <p>Hi, I'm your travel assistant. I can help you with:</p>
                                     <ul>
-                                        <li>Current traffic and congestion on your route</li>
-                                        <li>Rough delay expectations</li>
-                                        <li>Choosing a good time to set off</li>
-                                        <li>Simple route suggestions</li>
+                                        <li>Bus and train timetables (next arrivals)</li>
+                                        <li>Live service status and disruption updates (TfL lines and bus routes)</li>
+                                        <li>Journey planning in London with step-by-step route legs</li>
                                     </ul>
-                                    <p>You can ask things like: "How busy is the A1 right now?" or "What time is best to drive into the city?"</p>
+                                    <p>You can ask things like: "What's the bus schedule for Blackbird Hill?", "Is the Jubilee line running?", or "Plan a journey from Neasden to Waterloo".</p>
+                                    <p class="welcome-location-hint">Optional: use the <strong>Location</strong> button in the header to share approximate position — it helps when several places share the same name. The app does not use it as your journey start unless you type that.</p>
                                 </div>
                             </div>
                         </div>
-
-                        <div class="journey-planner-toggle-wrap">
-                            <button
-                                type="button"
-                                id="journey-planner-toggle"
-                                class="journey-planner-toggle-btn hidden"
-                                aria-expanded="false"
-                                aria-controls="journey-inputs"
-                            >
-                                Show journey planner
-                            </button>
-                        </div>
-
-                        <section
-                            id="journey-inputs"
-                            class="journey-inputs hidden"
-                            aria-label="Refine journey"
-                        >
-                            <div class="journey-field">
-                                <label for="from-input">From</label>
-                                <input
-                                    id="from-input"
-                                    type="text"
-                                    autocomplete="off"
-                                    placeholder="Start location (e.g. Harlesden)"
-                                />
-                                <ul id="from-suggestions" class="suggestions-list" role="listbox"></ul>
-                            </div>
-
-                            <div class="journey-field">
-                                <label for="to-input">To</label>
-                                <input
-                                    id="to-input"
-                                    type="text"
-                                    autocomplete="off"
-                                    placeholder="Destination (e.g. Oxford Street)"
-                                />
-                                <ul id="to-suggestions" class="suggestions-list" role="listbox"></ul>
-                            </div>
-
-                            <div class="journey-field journey-when">
-                                <label for="date-input">When</label>
-                                <div class="journey-when-row">
-                                    <input
-                                        id="date-input"
-                                        type="date"
-                                        aria-label="Travel date"
-                                    />
-                                    <input
-                                        id="time-input"
-                                        type="time"
-                                        aria-label="Travel time"
-                                    />
-                                </div>
-                                <small class="journey-when-hint">
-                                    Example: <strong>2026-02-12</strong> and <strong>17:30</strong>
-                                </small>
-                            </div>
-
-                            <div class="journey-actions">
-                                <button id="plan-btn" type="button">Plan</button>
-                            </div>
-                        </section>
 
                         <div class="chat-input-container">
                             <input 
                                 type="text" 
                                 id="userInput" 
-                                placeholder="Ask about traffic, delays, routes..." 
+                                placeholder="Ask for timetables, disruptions, or a London journey..." 
                                 autocomplete="off"
                             >
                             <button type="button" id="voiceInputButton" class="voice-btn" aria-label="Voice input (speak to type)" title="Voice input">
@@ -190,6 +131,35 @@
                 </div>
 
                 <aside class="side-panel" aria-label="Detected intent and entities">
+                    <section class="test-location-section" aria-label="Test location override">
+                        <h2 class="test-location-title">Test location</h2>
+                        <p class="test-location-help">
+                            Pretend you’re somewhere else for journey place disambiguation (same as sharing GPS). Not saved on the server — only this browser.
+                        </p>
+                        <label class="test-location-label" for="testLocationPreset">Preset</label>
+                        <select id="testLocationPreset" class="test-location-select">
+                            <option value="">— Use real GPS —</option>
+                            <option value="51.5730,-0.2667">Kingsbury / Lavender Ave area (NW9)</option>
+                            <option value="51.3927,-0.1567">Mitcham Junction station area</option>
+                            <option value="51.5074,-0.1278">Charing Cross (central)</option>
+                            <option value="51.5033,-0.1145">Waterloo</option>
+                            <option value="51.5580,-0.2810">Wembley</option>
+                        </select>
+                        <label class="test-location-label" for="testLocationManual">Or lat, lon</label>
+                        <input
+                            type="text"
+                            id="testLocationManual"
+                            class="test-location-input"
+                            placeholder="e.g. 51.57, -0.27"
+                            autocomplete="off"
+                            spellcheck="false"
+                        />
+                        <div class="test-location-actions">
+                            <button type="button" id="testLocationApplyBtn" class="test-location-btn">Apply</button>
+                            <button type="button" id="testLocationClearBtn" class="test-location-btn test-location-btn-secondary">Clear</button>
+                        </div>
+                        <p id="testLocationStatus" class="test-location-status" aria-live="polite"></p>
+                    </section>
                     <div class="info-panel">
                         <div class="info-item">
                             <strong>Detected Intent:</strong> <span id="intentDisplay">-</span>
@@ -198,7 +168,8 @@
                             <strong>Confidence:</strong> <span id="confidenceDisplay">-</span>
                         </div>
                         <div class="info-item">
-                            <strong>Entities:</strong> <span id="entitiesDisplay">-</span>
+                            <strong>Entities:</strong>
+                            <div id="entitiesDisplay" class="entities-grid">-</div>
                         </div>
                     </div>
 
