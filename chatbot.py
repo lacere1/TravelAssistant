@@ -22,6 +22,55 @@ import re
 from difflib import SequenceMatcher
 from typing import Dict, Optional, Any, List, Tuple
 
+
+def _unique_platform_numbers_from_trains(direction_trains: List[Dict[str, Any]]) -> List[str]:
+    """Sorted unique platform numbers from all arrivals in a direction (not only the first)."""
+    seen = set()
+    ordered: List[str] = []
+    for train in direction_trains:
+        pn = (train.get('platform_number') or '').strip()
+        if not pn and train.get('platform'):
+            m = re.search(r'platform\s*(\d+)', (train.get('platform') or ''), re.IGNORECASE)
+            pn = m.group(1) if m else ''
+        if pn and pn not in seen:
+            seen.add(pn)
+            ordered.append(pn)
+
+    def _sort_key(x: str) -> int:
+        try:
+            return int(x)
+        except ValueError:
+            return 9999
+
+    ordered.sort(key=_sort_key)
+    return ordered
+
+
+def _format_train_direction_disambiguation_label(direction: str, direction_trains: List[Dict[str, Any]]) -> str:
+    """
+    Human-readable line for one direction, listing every distinct platform number (or platform name)
+    seen in live arrivals for that direction.
+    """
+    nums = _unique_platform_numbers_from_trains(direction_trains)
+    if nums:
+        if len(nums) == 1:
+            return f"{direction} (Platform {nums[0]})"
+        return f"{direction} (Platforms {', '.join(nums)})"
+
+    raw_labels: List[str] = []
+    seen_raw = set()
+    for train in direction_trains:
+        raw = (train.get('platform') or '').strip()
+        if raw and raw not in seen_raw:
+            seen_raw.add(raw)
+            raw_labels.append(raw)
+    if not raw_labels:
+        return direction
+    if len(raw_labels) == 1:
+        return f"{direction} ({raw_labels[0]})"
+    return f"{direction} ({'; '.join(raw_labels)})"
+
+
 class TrafficChatbot:
     def __init__(self):
         """Initialize chatbot with NLP, API, and ML components"""
@@ -50,6 +99,37 @@ class TrafficChatbot:
         self._user_preferences: Dict[str, Dict[str, Any]] = {}
 
         print("Traffic Chatbot initialized successfully")
+
+    def get_user_preferences(self, user_key: str) -> tuple:
+        """Return (last_chosen_stop_id, frequent_stops) from the authoritative
+        _user_preferences store (used by _build_user_context and updated on
+        every auto-resolve and manual-pick path).
+
+        Safe to call even when no preferences exist yet.
+        """
+        prefs = self._user_preferences.get(user_key) or {}
+        return (prefs.get('last_chosen_stop_id'), dict(prefs.get('frequent_stops') or {}))
+
+    def inject_user_preferences(
+        self,
+        user_key: str,
+        last_chosen_stop_id,
+        frequent_stops: dict,
+    ) -> None:
+        """Seed both preference stores from SQLite after a server restart.
+
+        - state_tracker: used by resolve_disambiguation / FSM transitions.
+        - _user_preferences: used by _build_user_context (disambiguation scoring)
+          and _reorder_options_by_preference (option ordering).
+
+        No-op if the user already has a live in-memory session.
+        """
+        self.state_tracker.inject_preferences(user_key, last_chosen_stop_id, frequent_stops)
+        if user_key not in self._user_preferences:
+            self._user_preferences[user_key] = {
+                'last_chosen_stop_id': last_chosen_stop_id,
+                'frequent_stops': dict(frequent_stops),
+            }
 
     def reset_user(self, user_key: Optional[str] = None) -> None:
         """
@@ -804,12 +884,20 @@ class TrafficChatbot:
         mode = disamb.get('timetable_mode', 'bus')
         is_train_direction = disamb.get('train_direction_disambiguation') is True
 
-        # Build numbered option list with score percentages next to each candidate
+        # Build numbered option list with scores next to each candidate.
+        # Bus timetables: show explicit numeric score (and %) for every stop.
         opt_lines = []
         for i, opt in enumerate(options[:10], 1):
             label = opt.get('label', opt.get('name', 'Unknown'))
             score = opt.get('score')
-            if score is not None and float(score) > 0:
+            if mode == 'bus':
+                if score is not None:
+                    s = float(score)
+                    pct = round(s * 100)
+                    opt_lines.append(f"  {i}. {label}  (score {s:.4f} · {pct}%)")
+                else:
+                    opt_lines.append(f"  {i}. {label}")
+            elif score is not None and float(score) > 0:
                 pct = round(float(score) * 100)
                 opt_lines.append(f"  {i}. {label}  ({pct}% match)")
             else:
@@ -1291,7 +1379,13 @@ class TrafficChatbot:
                     self.conversation_state['timetable_disambiguation'] = {
                         'options': ranked_options,
                         'query': query,
-                        'timetable_mode': timetable_mode or mode
+                        'timetable_mode': timetable_mode or mode,
+                        'top_score': round(result.top_score, 4),
+                        'scores': {
+                            str(o['id']): o.get('score')
+                            for o in ranked_options
+                            if o.get('id') is not None
+                        },
                     }
                     # FSM transition: enter disambiguation state
                     self.state_tracker.start_disambiguation(
@@ -1402,20 +1496,20 @@ class TrafficChatbot:
                 chosen_direction = None
                 if original_message:
                     text = original_message.strip().lower()
-                    # Build direction -> platform number for this stop (same as options below)
-                    direction_platforms = {}
+                    # Build direction -> all platform numbers for this stop (same as options below)
+                    direction_platforms: Dict[str, List[str]] = {}
                     for direction in meaningful_directions:
                         direction_trains = train_arrivals_by_direction.get(direction, [])
-                        first_train = direction_trains[0] if direction_trains else {}
-                        platform_num = (first_train.get('platform_number') or '').strip()
-                        if not platform_num and first_train.get('platform'):
-                            m = re.search(r'platform\s*(\d+)', (first_train.get('platform') or ''), re.IGNORECASE)
-                            platform_num = m.group(1) if m else ''
-                        direction_platforms[direction] = platform_num
+                        direction_platforms[direction] = _unique_platform_numbers_from_trains(direction_trains)
                     # 1) Match "platform N" in query
-                    for direction, platform_num in direction_platforms.items():
-                        if platform_num and re.search(r'\bplatform\s*' + re.escape(platform_num) + r'\b', text):
-                            chosen_direction = direction
+                    for direction, platform_nums in direction_platforms.items():
+                        for platform_num in platform_nums:
+                            if platform_num and re.search(
+                                r'\bplatform\s*' + re.escape(platform_num) + r'\b', text
+                            ):
+                                chosen_direction = direction
+                                break
+                        if chosen_direction:
                             break
                     # 2) Match direction words: northbound, southbound, westbound, eastbound, etc.
                     if not chosen_direction:
@@ -1494,18 +1588,16 @@ class TrafficChatbot:
                         key=lambda x: (direction_order.index(x) if x in direction_order else 999, x)
                     ):
                         direction_trains = train_arrivals_by_direction.get(direction, [])
-                        first_train = direction_trains[0] if direction_trains else {}
-                        platform_num = (first_train.get('platform_number') or '').strip()
-                        if not platform_num and first_train.get('platform'):
-                            m = re.search(r'platform\s*(\d+)', (first_train.get('platform') or ''), re.IGNORECASE)
-                            platform_num = m.group(1) if m else ''
-                        label = f"{direction} (Platform {platform_num})" if platform_num else direction
+                        platform_nums = _unique_platform_numbers_from_trains(direction_trains)
+                        label = _format_train_direction_disambiguation_label(direction, direction_trains)
                         train_direction_options.append({
                             'id': direction,
                             'name': direction,
                             'label': label,
                             'direction': direction,
-                            'platform': platform_num or None,
+                            # First platform for legacy callers; full list in platforms
+                            'platform': platform_nums[0] if platform_nums else None,
+                            'platforms': platform_nums,
                             # Reuse stop-level coordinates when available so the frontend
                             # can still show the station on a map for platform choices.
                             'lat': timetable_data.get('stop_lat'),

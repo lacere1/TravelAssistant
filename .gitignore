@@ -32,6 +32,7 @@ htmlcov/
 *.sqlite3
 *.db
 *.pid
+*.db
 
 # Flask / instance data (if you add one)
 instance/

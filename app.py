@@ -2,7 +2,10 @@ from flask import Flask, render_template, request, jsonify, session
 from datetime import datetime
 import os
 import re
+import sqlite3
+import json
 from dotenv import load_dotenv
+from werkzeug.security import generate_password_hash, check_password_hash
 
 # Load environment variables from the .env file in the project root
 load_dotenv()
@@ -13,13 +16,68 @@ from journey_planner import JourneyChatbot, TflJourneyClient
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev-secret-key-change-in-production')
 
-# Very simple in-memory user store for demo purposes only.
-# In production you would use a database and password hashing.
-USERS = {}
+# ---------------------------------------------------------------------------
+# SQLite persistence
+# ---------------------------------------------------------------------------
+DATABASE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'travel_assistant.db')
 
-# Very simple in-memory store for user-defined text shortcuts.
-# In production this should live in persistent storage.
-USER_SHORTCUTS = {}
+
+def get_db() -> sqlite3.Connection:
+    """Open a new database connection with Row factory.
+
+    journal_mode=WAL is ideal for concurrent reads, but falls back to DELETE
+    on filesystems that don't support POSIX file-locking (e.g. SMB/CIFS mounts).
+    """
+    conn = sqlite3.connect(DATABASE, timeout=10)
+    conn.row_factory = sqlite3.Row
+    # Use DELETE journal mode for broadest filesystem compatibility
+    conn.execute("PRAGMA journal_mode=DELETE")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    return conn
+
+
+def init_db() -> None:
+    """Create tables if they don't exist yet."""
+    with get_db() as conn:
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                username     TEXT PRIMARY KEY,
+                password_hash TEXT NOT NULL,
+                created_at   TEXT NOT NULL
+            )
+        ''')
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS shortcuts (
+                username TEXT NOT NULL,
+                key      TEXT NOT NULL,
+                value    TEXT NOT NULL,
+                PRIMARY KEY (username, key)
+            )
+        ''')
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS stop_preferences (
+                username             TEXT PRIMARY KEY,
+                last_chosen_stop_id  TEXT,
+                frequent_stops       TEXT NOT NULL DEFAULT '{}'
+            )
+        ''')
+        # Add journey_history column if it doesn't exist yet (safe migration)
+        try:
+            conn.execute(
+                "ALTER TABLE stop_preferences ADD COLUMN journey_history TEXT NOT NULL DEFAULT '{}'"
+            )
+        except sqlite3.OperationalError:
+            pass  # column already exists
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS chat_history (
+                username TEXT PRIMARY KEY,
+                data     TEXT NOT NULL DEFAULT '[]'
+            )
+        ''')
+        conn.commit()
+
+
+init_db()
 
 # Initialize chatbots
 traffic_chatbot = TrafficChatbot()
@@ -90,13 +148,81 @@ def _current_user_key() -> str:
     return session.get('username') or '_anon'
 
 
+def _load_stop_prefs(username: str) -> tuple:
+    """Load stop preferences from DB.
+
+    Returns (last_chosen_stop_id, frequent_stops_dict).
+    Called once per chat request so the in-memory state is warm on first use
+    after a server restart.
+    """
+    with get_db() as conn:
+        row = conn.execute(
+            'SELECT last_chosen_stop_id, frequent_stops FROM stop_preferences WHERE username = ?',
+            (username,)
+        ).fetchone()
+    if row is None:
+        return (None, {})
+    return (row['last_chosen_stop_id'], json.loads(row['frequent_stops'] or '{}'))
+
+
+def _save_stop_prefs(username: str, last_chosen_stop_id, frequent_stops: dict) -> None:
+    """Persist stop preferences to DB (upsert)."""
+    with get_db() as conn:
+        conn.execute(
+            '''INSERT INTO stop_preferences (username, last_chosen_stop_id, frequent_stops)
+               VALUES (?, ?, ?)
+               ON CONFLICT(username) DO UPDATE SET
+                 last_chosen_stop_id = excluded.last_chosen_stop_id,
+                 frequent_stops      = excluded.frequent_stops''',
+            (username, last_chosen_stop_id, json.dumps(frequent_stops))
+        )
+        conn.commit()
+
+
+def _load_journey_history(username: str) -> dict:
+    """Load journey location history from DB for the given user."""
+    with get_db() as conn:
+        row = conn.execute(
+            'SELECT journey_history FROM stop_preferences WHERE username = ?',
+            (username,)
+        ).fetchone()
+    if row is None:
+        return {}
+    return json.loads(row['journey_history'] or '{}')
+
+
+def _save_journey_history(username: str, history: dict) -> None:
+    """Persist journey history to DB (upsert, preserving other preference columns)."""
+    with get_db() as conn:
+        conn.execute(
+            '''INSERT INTO stop_preferences (username, journey_history)
+               VALUES (?, ?)
+               ON CONFLICT(username) DO UPDATE SET
+                 journey_history = excluded.journey_history''',
+            (username, json.dumps(history))
+        )
+        conn.commit()
+
+
+def _get_shortcuts_for_user(username: str) -> dict:
+    """Fetch all shortcuts for a user from the database as a {key: value} dict."""
+    with get_db() as conn:
+        rows = conn.execute(
+            'SELECT key, value FROM shortcuts WHERE username = ?', (username,)
+        ).fetchall()
+    return {row['key']: row['value'] for row in rows}
+
+
 def _apply_shortcuts_to_text(username: str, text: str) -> str:
     """
     Apply user-defined shortcuts to a free-text string.
     Replaces whole-word matches of each shortcut (case-insensitive).
     """
-    shortcuts_for_user = USER_SHORTCUTS.get(username) or {}
-    if not shortcuts_for_user or not text:
+    if not text:
+        return text
+
+    shortcuts_for_user = _get_shortcuts_for_user(username)
+    if not shortcuts_for_user:
         return text
 
     result = text
@@ -120,11 +246,12 @@ def shortcuts():
     username = _current_user_key()
 
     if request.method == 'GET':
-        shortcuts_for_user = USER_SHORTCUTS.get(username) or {}
-        return jsonify([
-            {'key': k, 'value': v}
-            for k, v in sorted(shortcuts_for_user.items())
-        ])
+        with get_db() as conn:
+            rows = conn.execute(
+                'SELECT key, value FROM shortcuts WHERE username = ? ORDER BY key',
+                (username,)
+            ).fetchall()
+        return jsonify([{'key': r['key'], 'value': r['value']} for r in rows])
 
     data = request.get_json(force=True) or {}
     key = (data.get('key') or '').strip()
@@ -133,8 +260,13 @@ def shortcuts():
     if not key or not value:
         return jsonify({'error': 'Both key and value are required.'}), 400
 
-    shortcuts_for_user = USER_SHORTCUTS.setdefault(username, {})
-    shortcuts_for_user[key.lower()] = value
+    with get_db() as conn:
+        conn.execute(
+            '''INSERT INTO shortcuts (username, key, value) VALUES (?, ?, ?)
+               ON CONFLICT(username, key) DO UPDATE SET value = excluded.value''',
+            (username, key.lower(), value)
+        )
+        conn.commit()
 
     return jsonify({'ok': True, 'key': key.lower(), 'value': value})
 
@@ -143,14 +275,19 @@ def shortcuts():
 def delete_shortcut(key):
     """Delete a single shortcut for the current user."""
     username = _current_user_key()
-    shortcuts_for_user = USER_SHORTCUTS.get(username) or {}
     key_lower = (key or '').lower()
 
-    if key_lower in shortcuts_for_user:
-        del shortcuts_for_user[key_lower]
-        return jsonify({'ok': True})
+    with get_db() as conn:
+        cursor = conn.execute(
+            'DELETE FROM shortcuts WHERE username = ? AND key = ?',
+            (username, key_lower)
+        )
+        conn.commit()
 
-    return jsonify({'error': 'Shortcut not found.'}), 404
+    if cursor.rowcount == 0:
+        return jsonify({'error': 'Shortcut not found.'}), 404
+
+    return jsonify({'ok': True})
 
 
 @app.route('/login', methods=['POST'])
@@ -163,17 +300,28 @@ def login():
     if not username or not password:
         return jsonify({'error': 'Username and password are required.'}), 400
 
-    is_new_user = username not in USERS
+    with get_db() as conn:
+        row = conn.execute(
+            'SELECT password_hash FROM users WHERE username = ?', (username,)
+        ).fetchone()
+
+    is_new_user = row is None
     if is_new_user:
         if len(username) <= 3:
             return jsonify({'error': 'Username must be longer than 3 characters.'}), 400
         if len(password) < 8:
             return jsonify({'error': 'Password must be at least 8 characters.'}), 400
+        password_hash = generate_password_hash(password)
+        with get_db() as conn:
+            conn.execute(
+                'INSERT INTO users (username, password_hash, created_at) VALUES (?, ?, ?)',
+                (username, password_hash, datetime.utcnow().isoformat())
+            )
+            conn.commit()
     else:
-        if USERS[username] != password:
+        if not check_password_hash(row['password_hash'], password):
             return jsonify({'error': 'Incorrect password.'}), 400
 
-    USERS[username] = password
     session['username'] = username
     return jsonify({'username': username})
 
@@ -254,10 +402,9 @@ def _build_journey_jsonify(jp_response: dict, entities: dict, confidence: float 
         "entities": entities,
         "confidence": confidence,
     }
-    # Send updated journey history back so frontend can persist to localStorage
+    # Journey history is now persisted server-side in SQLite.
+    # No need to send it back to the frontend.
     jp_state = jp_response.get("state", {})
-    if jp_state.get("_updated_journey_history"):
-        resp["updated_journey_history"] = jp_state.get("_user_journey_history", {})
     _sync_journey_rephrase_session(jp_state)
     return resp
 
@@ -322,6 +469,15 @@ def _looks_like_journey_message(text: str) -> bool:
     return False
 
 
+def _maybe_save_journey_history(username: str, jp_response: dict) -> None:
+    """If the journey planner updated history this request, persist it to SQLite."""
+    if not username:
+        return
+    jp_state = jp_response.get("state", {})
+    if jp_state.get("_updated_journey_history"):
+        _save_journey_history(username, jp_state.get("_user_journey_history", {}))
+
+
 @app.route('/chat', methods=['POST'])
 def chat():
     """Unified chat endpoint for both the traffic assistant and journey planner."""
@@ -337,10 +493,9 @@ def chat():
         date_str = (data.get('date') or '').strip() or None
         time_str = (data.get('time') or '').strip() or None
 
-        # Browser geolocation and user history (sent from frontend)
+        # Browser geolocation (sent from frontend)
         user_lat = data.get('userLat')
         user_lon = data.get('userLon')
-        user_journey_history = data.get('journeyHistory')  # localStorage dict
 
         # Pin-confirmation submission: user dragged/accepted the origin+destination pins.
         # Update stored location IDs with the (possibly adjusted) coordinates and mark
@@ -369,12 +524,22 @@ def chat():
 
         username = session.get('username')
 
+        # Restore stop preferences from DB into the in-memory state tracker.
+        # inject_preferences() is a no-op if the user already has a live session,
+        # so this only matters after a server restart.
+        if username:
+            last_stop_id, freq_stops = _load_stop_prefs(username)
+            traffic_chatbot.inject_user_preferences(
+                user_key, last_stop_id, freq_stops
+            )
+
         # If we asked the user to rephrase a location, restore that flow from
         # session when in-memory state was lost (e.g. server reload).
         _restore_journey_rephrase_from_session()
 
-        # Inject geolocation and history into journey planner state so
+        # Inject geolocation and journey history into journey planner state so
         # the disambiguation engine can use them for scoring.
+        # Journey history is now loaded from SQLite rather than localStorage.
         jp_state = journey_chatbot.state.setdefault("global", {})
         if user_lat is not None and user_lon is not None:
             try:
@@ -382,8 +547,8 @@ def chat():
                 jp_state["_user_lon"] = float(user_lon)
             except (TypeError, ValueError):
                 pass
-        if user_journey_history and isinstance(user_journey_history, dict):
-            jp_state["_user_journey_history"] = user_journey_history
+        if username:
+            jp_state["_user_journey_history"] = _load_journey_history(username)
 
         # Run the NLP pipeline once per request so we can:
         # - detect journey origin/destination slots even when the text does not
@@ -424,6 +589,7 @@ def chat():
             if to_id:
                 entities["to_id"] = to_id
             _sync_journey_rephrase_session(jp_response.get("state", {}))
+            _maybe_save_journey_history(username, jp_response)
             return jsonify({
                 # Main text used by existing frontend
                 "response": jp_response.get("reply", ""),
@@ -463,6 +629,7 @@ def chat():
             for k, v in nlp_entities.items():
                 if k.startswith("llm_") or k in ("route_preference", "accessibility", "time_preference", "origin", "destination", "via", "mode", "journey_preference", "date", "time"):
                     jp_entities[k] = v
+            _maybe_save_journey_history(username, jp_response)
             return jsonify(_build_journey_jsonify(jp_response, jp_entities))
 
         # 3) If the free-text clearly looks like a journey query OR the NLP
@@ -497,6 +664,7 @@ def chat():
             for k, v in nlp_entities.items():
                 if k.startswith("llm_") or k in ("route_preference", "accessibility", "time_preference"):
                     jp_entities[k] = v
+            _maybe_save_journey_history(username, jp_response)
             return jsonify(_build_journey_jsonify(jp_response, jp_entities))
 
         # 4) Fallback: use the existing traffic chatbot for everything else.
@@ -510,6 +678,16 @@ def chat():
             user_lat=user_lat,
             user_lon=user_lon,
         )
+
+        # Persist any updated stop preferences back to SQLite so they survive
+        # a server restart.  Only save for logged-in users.
+        if username:
+            # Read from _user_preferences — the authoritative store updated on
+            # every resolve path (auto-resolve, towards-match, and manual pick).
+            # state_tracker is only updated on manual picks, so using it here
+            # would silently drop auto-resolved preferences.
+            last_stop_id, freq_stops = traffic_chatbot.get_user_preferences(user_key)
+            _save_stop_prefs(username, last_stop_id, freq_stops)
 
         # Merge LLM context fields into the traffic response entities
         traffic_entities = traffic_response.get('entities', {})
@@ -530,6 +708,40 @@ def chat():
         })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+
+@app.route('/chat_history', methods=['GET'])
+def get_chat_history():
+    """Return the saved conversation list for the current user."""
+    username = session.get('username')
+    if not username:
+        return jsonify([])
+    with get_db() as conn:
+        row = conn.execute(
+            'SELECT data FROM chat_history WHERE username = ?', (username,)
+        ).fetchone()
+    if row is None:
+        return jsonify([])
+    return jsonify(json.loads(row['data'] or '[]'))
+
+
+@app.route('/chat_history', methods=['PUT'])
+def save_chat_history():
+    """Persist the full conversation list for the current user."""
+    username = session.get('username')
+    if not username:
+        return jsonify({'error': 'Not logged in'}), 401
+    data = request.get_json(force=True)
+    if not isinstance(data, list):
+        return jsonify({'error': 'Expected a JSON array'}), 400
+    with get_db() as conn:
+        conn.execute(
+            '''INSERT INTO chat_history (username, data) VALUES (?, ?)
+               ON CONFLICT(username) DO UPDATE SET data = excluded.data''',
+            (username, json.dumps(data))
+        )
+        conn.commit()
+    return jsonify({'ok': True})
 
 
 @app.route('/suggest')

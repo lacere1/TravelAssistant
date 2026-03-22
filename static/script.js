@@ -28,10 +28,9 @@ const avatarFileInput = document.getElementById('avatarFileInput');
 const AVATAR_STORAGE_KEY_PREFIX = 'travelAssistantAvatar:';
 
 // ---------------------------------------------------------------------------
-// Journey Disambiguation: Geolocation + User History (localStorage)
+// Journey Disambiguation: Geolocation (history now stored server-side in SQLite)
 // ---------------------------------------------------------------------------
 
-const JOURNEY_HISTORY_KEY = 'travelAssistantJourneyHistory';
 const TEST_LOCATION_KEY = 'travelAssistantTestLocation';
 
 /** Current user geolocation (updated after permission + in background). */
@@ -250,28 +249,11 @@ if (shareLocationButton) {
     });
 })();
 
-/** Get journey history from localStorage. */
-function getJourneyHistory() {
-    try {
-        const raw = localStorage.getItem(JOURNEY_HISTORY_KEY);
-        return raw ? JSON.parse(raw) : {};
-    } catch (e) {
-        return {};
-    }
-}
-
-/** Save updated journey history to localStorage. */
-function saveJourneyHistory(history) {
-    try {
-        localStorage.setItem(JOURNEY_HISTORY_KEY, JSON.stringify(history));
-    } catch (e) {
-        console.warn('[JourneyHistory] Failed to save:', e);
-    }
-}
-
 /**
  * Build the extra payload fields for journey disambiguation.
  * Included in every /chat request so the backend can use them for scoring.
+ * Journey history is now persisted server-side in SQLite — no longer sent
+ * from localStorage.
  */
 function getJourneyContextPayload() {
     const payload = {};
@@ -281,10 +263,6 @@ function getJourneyContextPayload() {
     } else if (userGeoLat !== null && userGeoLon !== null) {
         payload.userLat = userGeoLat;
         payload.userLon = userGeoLon;
-    }
-    const history = getJourneyHistory();
-    if (history && Object.keys(history).length > 0) {
-        payload.journeyHistory = history;
     }
     return payload;
 }
@@ -313,8 +291,7 @@ let hasShownJourneyInputs = false;
 let fromCoord = '';
 let toCoord = '';
 
-// Local chat history state (per user, stored in localStorage)
-const STORAGE_KEY_BASE = 'travelAssistantChats';
+// Local chat history state (per user, persisted server-side in SQLite)
 let currentUser = null;
 let conversations = [];
 let activeChatId = null;
@@ -322,10 +299,6 @@ let isRestoringMessages = false;
 let currentSearchTerm = '';
 let showStarredOnly = false;
 let selectedChatIds = new Set();
-
-function getStorageKey() {
-    return currentUser ? `${STORAGE_KEY_BASE}:${currentUser}` : STORAGE_KEY_BASE;
-}
 
 function migrateConversation(convo) {
     if (convo.starred === undefined) convo.starred = false;
@@ -337,11 +310,16 @@ function migrateConversation(convo) {
     return convo;
 }
 
-function loadConversations() {
+async function loadConversations() {
     selectedChatIds.clear();
+    if (!currentUser) {
+        conversations = [];
+        return;
+    }
     try {
-        const raw = localStorage.getItem(getStorageKey());
-        const loaded = raw ? JSON.parse(raw) : [];
+        const resp = await fetch('/chat_history');
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const loaded = await resp.json();
         conversations = Array.isArray(loaded) ? loaded.map(migrateConversation) : [];
     } catch (e) {
         conversations = [];
@@ -351,12 +329,12 @@ function loadConversations() {
 }
 
 function saveConversations() {
-    try {
-        localStorage.setItem(getStorageKey(), JSON.stringify(conversations));
-    } catch (e) {
-        // eslint-disable-next-line no-console
-        console.error('Failed to save conversations', e);
-    }
+    if (!currentUser) return;
+    fetch('/chat_history', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(conversations),
+    }).catch(e => console.error('Failed to save conversations', e));
 }
 
 function ensureActiveConversation(initialText) {
@@ -843,10 +821,6 @@ function sendMessage() {
         .then(data => {
             // Remove typing indicator
             removeTypingIndicator(typingId);
-            // Persist updated journey history if backend sent it back
-            if (data.updated_journey_history) {
-                saveJourneyHistory(data.updated_journey_history);
-            }
             handleChatResponse(data);
             // For testing: hard-coded demo of live traffic map for Wembley.
             maybeRenderTrafficTestMap(message);
@@ -885,9 +859,6 @@ function sendDisambiguationChoice(choiceText) {
         .then((response) => response.json())
         .then((data) => {
             removeTypingIndicator(typingId);
-            if (data.updated_journey_history) {
-                saveJourneyHistory(data.updated_journey_history);
-            }
             handleChatResponse(data);
         })
         .catch((error) => {
@@ -1575,6 +1546,93 @@ function appendDisruptionCard(disruptionData, messageText) {
     chatMessages.scrollTop = chatMessages.scrollHeight;
 }
 
+/**
+ * When several options share the same (or ~same) coordinates, markers stack and are hard to click.
+ * Nudge each marker a few metres in a ring around the shared point. Does not change backend data.
+ * Never throws — failures leave positions unchanged so the map can still render.
+ */
+function spreadOverlappingMarkerPositions(points) {
+    if (!points || points.length < 2) return;
+
+    try {
+        const groups = new Map();
+        for (const pt of points) {
+            if (!pt || !pt.position) continue;
+            const lat = Number(pt.position.lat);
+            const lng = Number(pt.position.lng);
+            if (!isFinite(lat) || !isFinite(lng)) continue;
+            const key = `${lat.toFixed(6)},${lng.toFixed(6)}`;
+            if (!groups.has(key)) groups.set(key, []);
+            groups.get(key).push(pt);
+        }
+
+        const radiusM = 7;
+        for (const pts of groups.values()) {
+            if (pts.length < 2) continue;
+            const baseLat = Number(pts[0].position.lat);
+            const baseLng = Number(pts[0].position.lng);
+            if (!isFinite(baseLat) || !isFinite(baseLng)) continue;
+            const latRad = (baseLat * Math.PI) / 180;
+            const metersPerDegLat = 111320;
+            const metersPerDegLon = 111320 * Math.cos(latRad);
+            if (!isFinite(metersPerDegLon) || Math.abs(metersPerDegLon) < 1e-6) continue;
+            pts.forEach((pt, i) => {
+                const angle = (2 * Math.PI * i) / pts.length;
+                const northM = radiusM * Math.sin(angle);
+                const eastM = radiusM * Math.cos(angle);
+                pt.position = {
+                    lat: baseLat + northM / metersPerDegLat,
+                    lng: baseLng + eastM / metersPerDegLon,
+                };
+            });
+        }
+    } catch (e) {
+        console.warn('spreadOverlappingMarkerPositions', e);
+    }
+}
+
+/** Place numbered markers for timetable / journey disambiguation; fits map to bounds. */
+function addDisambiguationMarkersToMap(map, points, disamb) {
+    if (!map || !points || !points.length) return;
+    const bounds = new google.maps.LatLngBounds();
+    const scoresDict = disamb.scores || {};
+    points.forEach((pt) => {
+        const opt = disamb.options[parseInt(pt.label, 10) - 1] || {};
+        const score = scoresDict[opt.id || ''] || opt.score || 0;
+        let markerColor = '#EA4335';
+        if (score >= 0.7) markerColor = '#34A853';
+        else if (score >= 0.4) markerColor = '#FBBC05';
+
+        const marker = new google.maps.Marker({
+            position: pt.position,
+            map,
+            label: {
+                text: pt.label,
+                color: '#FFFFFF',
+                fontWeight: 'bold',
+            },
+            title: `${pt.title} (score ${Number(score).toFixed(4)} · ${Math.round(score * 100)}%)`,
+            icon: {
+                path: google.maps.SymbolPath.CIRCLE,
+                fillColor: markerColor,
+                fillOpacity: 1,
+                strokeColor: '#FFFFFF',
+                strokeWeight: 2,
+                scale: 14,
+            },
+        });
+        marker.addListener('click', () => {
+            if (typeof sendDisambiguationChoice === 'function') {
+                sendDisambiguationChoice(pt.label);
+            }
+        });
+        bounds.extend(pt.position);
+    });
+    if (!bounds.isEmpty()) {
+        map.fitBounds(bounds);
+    }
+}
+
 function renderTimetableDisambiguationMap(disamb) {
     if (!disamb || !Array.isArray(disamb.options) || disamb.options.length === 0) return;
     if (!window.google || !google.maps) return;
@@ -1596,8 +1654,20 @@ function renderTimetableDisambiguationMap(disamb) {
     // Collect valid coordinates, if present on options (bus stops or train stations)
     const points = disamb.options
         .map((opt, index) => {
-            const lat = typeof opt.lat === 'number' ? opt.lat : (opt.lat ? Number(opt.lat) : NaN);
-            const lon = typeof opt.lon === 'number' ? opt.lon : (opt.lon ? Number(opt.lon) : NaN);
+            const rawLat = opt.lat;
+            const rawLon = opt.lon != null ? opt.lon : opt.lng;
+            const lat =
+                typeof rawLat === 'number'
+                    ? rawLat
+                    : rawLat != null && rawLat !== ''
+                      ? Number(rawLat)
+                      : NaN;
+            const lon =
+                typeof rawLon === 'number'
+                    ? rawLon
+                    : rawLon != null && rawLon !== ''
+                      ? Number(rawLon)
+                      : NaN;
             if (!isFinite(lat) || !isFinite(lon)) return null;
             return {
                 position: { lat, lng: lon },
@@ -1607,7 +1677,13 @@ function renderTimetableDisambiguationMap(disamb) {
         })
         .filter(Boolean);
 
-    // Case 1: we have explicit coordinates (bus or multi-station train disambiguation)
+    try {
+        spreadOverlappingMarkerPositions(points);
+    } catch (e) {
+        console.warn('renderTimetableDisambiguationMap spread', e);
+    }
+
+    // Case 1: we have explicit coordinates (bus, train with stop_lat/lon, multi-station, etc.)
     if (points.length) {
         const map = new google.maps.Map(mapWrap, {
             center: points[0].position,
@@ -1617,56 +1693,12 @@ function renderTimetableDisambiguationMap(disamb) {
             fullscreenControl: false,
             clickableIcons: false,
         });
-
-        const bounds = new google.maps.LatLngBounds();
-
-        // Score lookup for label coloring.
-        // Journey planner passes scores in a separate {id: score} dict;
-        // timetable disambiguation embeds score inside each option object.
-        const scoresDict = disamb.scores || {};
-
-        points.forEach((pt) => {
-            // Color marker based on score (green = high, orange = medium, red = low)
-            const opt = disamb.options[parseInt(pt.label) - 1] || {};
-            const score = scoresDict[opt.id || ''] || opt.score || 0;
-            let markerColor = '#EA4335'; // red (low)
-            if (score >= 0.7) markerColor = '#34A853'; // green (high)
-            else if (score >= 0.4) markerColor = '#FBBC05'; // yellow/orange (medium)
-
-            const marker = new google.maps.Marker({
-                position: pt.position,
-                map,
-                label: {
-                    text: pt.label,
-                    color: '#FFFFFF',
-                    fontWeight: 'bold',
-                },
-                title: `${pt.title} (${Math.round(score * 100)}%)`,
-                icon: {
-                    path: google.maps.SymbolPath.CIRCLE,
-                    fillColor: markerColor,
-                    fillOpacity: 1,
-                    strokeColor: '#FFFFFF',
-                    strokeWeight: 2,
-                    scale: 14,
-                },
-            });
-            marker.addListener('click', () => {
-                if (typeof sendDisambiguationChoice === 'function') {
-                    sendDisambiguationChoice(pt.label);
-                }
-            });
-            bounds.extend(pt.position);
-        });
-
-        if (!bounds.isEmpty()) {
-            map.fitBounds(bounds);
-        }
+        addDisambiguationMarkersToMap(map, points, disamb);
         return;
     }
 
-    // Case 2: train platform/direction disambiguation with no per-option coords:
-    // show a single marker for the station itself using geocoding of disamb.query.
+    // Case 2: train platform/direction disambiguation with no per-option coords — geocode station,
+    // then place one marker per option at the same point and spread (same as overlapping bus/train).
     if (disamb.train_direction_disambiguation && disamb.query) {
         const geocoder = new google.maps.Geocoder();
         geocoder.geocode({ address: disamb.query }, (results, status) => {
@@ -1675,22 +1707,27 @@ function renderTimetableDisambiguationMap(disamb) {
                 return;
             }
             const loc = results[0].geometry.location;
-            const center = { lat: loc.lat(), lng: loc.lng() };
+            const centerLat = loc.lat();
+            const centerLng = loc.lng();
+            const trainPoints = disamb.options.map((opt, index) => ({
+                position: { lat: centerLat, lng: centerLng },
+                label: String(index + 1),
+                title: opt.label || opt.name || '',
+            }));
+            try {
+                spreadOverlappingMarkerPositions(trainPoints);
+            } catch (e) {
+                console.warn('renderTimetableDisambiguationMap train spread', e);
+            }
             const map = new google.maps.Map(mapWrap, {
-                center,
+                center: trainPoints[0].position,
                 zoom: 16,
                 mapTypeControl: false,
                 streetViewControl: false,
                 fullscreenControl: false,
                 clickableIcons: false,
             });
-            // Single marker for the station
-            // (no label number needed; there is only one physical station here)
-            new google.maps.Marker({
-                position: center,
-                map,
-                title: disamb.query,
-            });
+            addDisambiguationMarkersToMap(map, trainPoints, disamb);
         });
         return;
     }
@@ -2082,7 +2119,7 @@ function updateAvatarDisplay() {
     }
 }
 
-function setLoggedIn(username) {
+async function setLoggedIn(username) {
     currentUser = username || null;
     if (accountLoggedOut && accountLoggedIn && currentUsernameEl) {
         accountLoggedOut.classList.add('hidden');
@@ -2090,7 +2127,7 @@ function setLoggedIn(username) {
         currentUsernameEl.textContent = currentUser || '';
     }
     updateAvatarDisplay();
-    loadConversations();
+    await loadConversations();
     activeChatId = conversations[0]?.id || null;
     renderChatList(currentSearchTerm);
     if (activeChatId) {
@@ -2100,7 +2137,7 @@ function setLoggedIn(username) {
     }
 }
 
-function setLoggedOut() {
+async function setLoggedOut() {
     currentUser = null;
     if (accountLoggedOut && accountLoggedIn && currentUsernameEl) {
         accountLoggedOut.classList.remove('hidden');
@@ -2108,8 +2145,8 @@ function setLoggedOut() {
         currentUsernameEl.textContent = '';
     }
     updateAvatarDisplay();
-    loadConversations();
-    activeChatId = conversations[0]?.id || null;
+    await loadConversations();  // currentUser is null so returns [] immediately
+    activeChatId = null;
     renderChatList(currentSearchTerm);
     clearMessages();
 }

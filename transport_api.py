@@ -102,6 +102,54 @@ class TransportDataFetcher:
 
         # If we couldn't expand, just return the original
         return leaf_ids_unique if leaf_ids_unique else [stop_id]
+
+    def _build_bus_disambiguation_response(
+        self, bus_stop_matches: List[Dict[str, Any]], stop_query: str
+    ) -> Dict[str, Any]:
+        """Build disambiguation_needed payload for bus timetable (shared by multi-match and group→leaves)."""
+        labelled_stops: List[str] = []
+        disambiguation_options: List[Dict[str, Any]] = []
+        for match in bus_stop_matches:
+            stop_id = match.get('id', '')
+            name = match.get('name') or stop_query
+            towards = (match.get('towards') or '').strip()
+            platform = self._platform_from_stop_id(stop_id)
+            if (not towards or not platform) and stop_id:
+                arr_platform, arr_towards = self._get_stop_direction_from_arrivals(stop_id)
+                if arr_platform:
+                    platform = arr_platform
+                if arr_towards:
+                    towards = arr_towards
+            if platform and towards:
+                label = f"{name} – Stop {platform} (towards {towards})"
+            elif towards:
+                label = f"{name} (towards {towards})"
+            elif platform:
+                label = f"{name} – Stop {platform}"
+            else:
+                label = self._format_bus_stop_disambiguation_name(
+                    match, stop_query, enrich_from_arrivals=False
+                )
+            labelled_stops.append(label)
+            disambiguation_options.append(
+                {
+                    'id': stop_id,
+                    'name': name,
+                    'towards': towards,
+                    'platform': platform,
+                    'label': label,
+                    'lat': match.get('lat'),
+                    'lon': match.get('lon'),
+                }
+            )
+        return {
+            'error': 'disambiguation_needed',
+            'query': stop_query,
+            'mode': 'bus',
+            'stations': labelled_stops,
+            'count': len(labelled_stops),
+            'disambiguation_options': disambiguation_options,
+        }
     
     def get_route_traffic(self, route: str) -> Optional[Dict[str, Any]]:
         """
@@ -737,7 +785,7 @@ class TransportDataFetcher:
                             # Keep train stops, but filter bus stops
                             train_matches = [m for m in matches if any(mode in m.get('modes', []) for mode in ['tube', 'train', 'dlr', 'overground', 'tram', 'national-rail'])]
                             matches = filtered_stops + train_matches
-                        # Skip disambiguation - proceed to fetch arrivals for all stops serving the route
+                        # May still disambiguate below if multiple stops remain (e.g. same name, different IDs).
                     elif route_was_specified and len(filtered_stops) == 0:
                         # User specified a route but no stops serve that route - return error with available routes
                         available_routes = set()
@@ -795,11 +843,8 @@ class TransportDataFetcher:
                             'available_routes_str': routes_str
                         }
                 
-                # Only check for disambiguation if user did NOT specify a route
-                # If route was specified, we already filtered and will return all matching stops
-                
-                # If multiple bus stops found and no route specified, check for disambiguation
-                if len(bus_stop_matches) > 1 and not route_was_specified:
+                # If multiple bus stops remain after search (and optional route filter), check for disambiguation
+                if len(bus_stop_matches) > 1:
                     # For grouped bus stops (e.g. 490G...), break them down into individual child stops
                     # so each platform/direction becomes its own disambiguation option.
                     expanded_matches = []
@@ -846,6 +891,17 @@ class TransportDataFetcher:
                     lons = [m.get('lon') for m in bus_stop_matches if m.get('lon') is not None]
                     
                     needs_disambiguation = False
+                    
+                    # Same TfL display name, multiple distinct stop IDs (e.g. both sides of a road) — always ask.
+                    ids_by_display_name: Dict[str, set] = {}
+                    for m in bus_stop_matches:
+                        disp = (m.get('name') or '').strip()
+                        sid = m.get('id')
+                        if not disp or not sid:
+                            continue
+                        ids_by_display_name.setdefault(disp, set()).add(sid)
+                    if any(len(ids) > 1 for ids in ids_by_display_name.values()):
+                        needs_disambiguation = True
                     
                     # Grouped stops: same station name (or icsId) with different "towards" = direction disambiguation
                     towards_set = set((m.get('towards') or '').strip() for m in bus_stop_matches if (m.get('towards') or '').strip())
@@ -904,49 +960,44 @@ class TransportDataFetcher:
                     # When Search API does not provide direction (e.g. Tudor Gardens x2), fetch Arrivals per stop
                     # to get platformName and towards so labels show "Stop AA (towards Willesden)".
                     if needs_disambiguation:
-                        labelled_stops = []
-                        disambiguation_options = []
-                        for match in bus_stop_matches:
-                            stop_id = match.get('id', '')
-                            name = match.get('name') or stop_query
-                            towards = (match.get('towards') or '').strip()
-                            platform = self._platform_from_stop_id(stop_id)
-                            # Enrich from Arrivals when Search didn't give direction (same logic as timetable grouping)
-                            if (not towards or not platform) and stop_id:
-                                arr_platform, arr_towards = self._get_stop_direction_from_arrivals(stop_id)
-                                if arr_platform:
-                                    platform = arr_platform
-                                if arr_towards:
-                                    towards = arr_towards
-                            # Build label so user always sees direction when we have it (like bus_arrivals_grouped stop_label)
-                            if platform and towards:
-                                label = f"{name} – Stop {platform} (towards {towards})"
-                            elif towards:
-                                label = f"{name} (towards {towards})"
-                            elif platform:
-                                label = f"{name} – Stop {platform}"
-                            else:
-                                label = self._format_bus_stop_disambiguation_name(match, stop_query, enrich_from_arrivals=False)
-                            labelled_stops.append(label)
-                            disambiguation_options.append({
-                                'id': stop_id,
-                                'name': name,
-                                'towards': towards,
-                                'platform': platform,
-                                'label': label,
-                                # Pass through coordinates so the frontend can show a map
-                                'lat': match.get('lat'),
-                                'lon': match.get('lon'),
-                            })
-                        return {
-                            'error': 'disambiguation_needed',
-                            'query': stop_query,
-                            'mode': 'bus',
-                            'stations': labelled_stops,
-                            'count': len(labelled_stops),
-                            'disambiguation_options': disambiguation_options
-                        }
-                    # If all stops are at same location (coordinates within 0.05), proceed (show all stops together)
+                        return self._build_bus_disambiguation_response(bus_stop_matches, stop_query)
+                    # Otherwise (e.g. different base names within 0.05°), proceed and merge arrivals.
+                
+                # One Search result: TfL bus group (490G...) often maps to several leaf stops — disambiguate, don't merge.
+                if len(bus_stop_matches) == 1:
+                    only = bus_stop_matches[0]
+                    gid = only.get('id') or ''
+                    if 'bus' in (only.get('modes') or []) and gid:
+                        leaf_ids = self._expand_to_leaf_bus_stops(gid)
+                        if len(leaf_ids) > 1:
+                            base_name = only.get('name', stop_query)
+                            leaf_matches: List[Dict[str, Any]] = []
+                            for lid in leaf_ids:
+                                leaf_matches.append({
+                                    'id': lid,
+                                    'name': base_name,
+                                    'towards': '',
+                                    'lat': None,
+                                    'lon': None,
+                                    'modes': ['bus'],
+                                })
+                            for lm in leaf_matches:
+                                try:
+                                    info_resp = requests.get(
+                                        f"{self.tfl_base_url}/StopPoint/{lm['id']}",
+                                        params=self._tfl_params(),
+                                        timeout=5,
+                                    )
+                                    if info_resp.status_code == 200:
+                                        info_data = info_resp.json()
+                                        lm['lat'] = info_data.get('lat')
+                                        lm['lon'] = info_data.get('lon')
+                                        tw = (info_data.get('towards') or '').strip()
+                                        if tw:
+                                            lm['towards'] = tw
+                                except Exception:
+                                    pass
+                            return self._build_bus_disambiguation_response(leaf_matches, stop_query)
             
             for match in matches:
                 stop_id = match.get('id')

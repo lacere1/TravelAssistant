@@ -208,6 +208,36 @@ class DialogStateTracker:
         state.state = DialogState.PROCESSING
         return state
 
+    def inject_preferences(
+        self,
+        user_key: str,
+        last_chosen_stop_id: Optional[str],
+        frequent_stops: Dict[str, int],
+    ) -> None:
+        """Seed the user's in-memory state with preferences loaded from the DB.
+
+        Only applies when the user has no live in-memory state (e.g. first request
+        after a server restart).  If a session is already active the in-memory
+        values are authoritative and are left untouched.
+        """
+        if user_key in self._user_states:
+            # Active session — don't overwrite live data with stale DB snapshot
+            return
+        state = UserState()
+        state.last_chosen_stop_id = last_chosen_stop_id
+        state.frequent_stops = dict(frequent_stops)
+        self._user_states[user_key] = state
+
+    def get_preferences(self, user_key: str) -> tuple:
+        """Return (last_chosen_stop_id, frequent_stops) for the user.
+
+        Safe to call even when no state exists yet (returns empty values).
+        """
+        state = self._user_states.get(user_key)
+        if state is None:
+            return (None, {})
+        return (state.last_chosen_stop_id, dict(state.frequent_stops))
+
     def start_awaiting_disruption_line(
         self, user_key: str, disruption_type: str
     ) -> UserState:

@@ -2083,7 +2083,14 @@ header h1 {
     gap: 14px;
     margin: 8px 0 6px;
     font-size: 13px;
-    color: #555;
+    color: #fff;
+}
+
+/* Light bot bubble is white — give the legend a strip so white text stays readable */
+:root:not([data-theme="dark"]) .confirm-pins-legend {
+    padding: 8px 10px;
+    border-radius: 8px;
+    background: rgba(0, 0, 0, 0.55);
 }
 
 .confirm-pins-legend-item {

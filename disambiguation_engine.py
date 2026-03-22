@@ -159,8 +159,8 @@ class DisambiguationResult:
 # a small neutral constant (_NEUTRAL_GEO) instead.  This means scores honestly
 # reflect how much information is available:
 #
-#   • Perfect name match, no geo at all → ~0.72  ("name matches but I don't
-#     know where you are")
+#   • Perfect name match, no geo at all → ~0.59 raw → ~0.65 after calibration
+#     ("name matches but I don't know where you are")
 #   • Perfect name match + user nearby  → ~0.90+  (clearly the right area)
 #   • Perfect name match + anchor + user nearby → caps at 1.0 (very confident)
 #
@@ -176,10 +176,17 @@ _W_TOWARDS    = 0.28
 _TOWARDS_NAME_SHRINK = 0.70   # multiply exact & fuzzy by this when towards active
 
 # Neutral contribution for absent geo signals (rather than 0 or redistribution)
-_NEUTRAL_GEO = 0.36   # "unknown distance" — keeps name-led scores usable
+_NEUTRAL_GEO = 0.39   # "unknown distance" — slightly higher so name-only matches
+                      # are not stuck at ~57% before calibration
 
-# Confidence thresholds (tuned for the non-normalised model)
-_THRESHOLD_AUTO    = 0.84   # slightly above old 0.82 — name weights are higher
+# After raw + pref_boost, apply a mild affine so strong string matches read closer
+# to user intuition (the additive model caps name-only cases low because both geo
+# channels sit at neutral). Ordering is unchanged (positive slope).
+_TIMETABLE_SCORE_SCALE = 1.06
+_TIMETABLE_SCORE_OFFSET = 0.025
+
+# Confidence thresholds (tuned for *calibrated* timetable scores — see above)
+_THRESHOLD_AUTO    = 0.91   # ~equivalent to raw ~0.84 before calibration
 _THRESHOLD_PRESENT = 0.30   # show options if any reasonable match
 
 # Geospatial filter radius (km)
@@ -410,11 +417,12 @@ class DisambiguationEngine:
     ) -> List[DisambiguationCandidate]:
         """Score each candidate using a non-normalised additive model.
 
-        Non-normalised means absent signals contribute _NEUTRAL_GEO (0.36)
-        rather than zero or redistributed weight. This keeps scores honest:
-          • Perfect name match, no geo  → ~0.72  (name matches, location unknown)
-          • Perfect name match + anchor → ~0.90  (we know the area)
-          • Perfect name match + user nearby → ~0.90  (device is close)
+        Non-normalised means absent signals contribute _NEUTRAL_GEO (~0.39)
+        rather than zero or redistributed weight. Calibrated scores (affine on
+        raw + pref_boost) read higher for the same ranking:
+          • Perfect name match, no geo  → ~0.65 calibrated  (location unknown)
+          • Perfect name match + anchor → ~0.92+  (we know the area)
+          • Perfect name match + user nearby → ~0.92+  (device is close)
           • Perfect name + anchor + user nearby → ~1.0  (capped; very confident)
 
         When towards_query is provided, exact/fuzzy are shrunk by
@@ -486,14 +494,18 @@ class DisambiguationEngine:
             )
 
             pref_boost = self._preference_boost(c, user_context)
-            c.score = min(1.0, raw_score + pref_boost)
+            combined = raw_score + pref_boost
+            c.score = min(
+                1.0,
+                combined * _TIMETABLE_SCORE_SCALE + _TIMETABLE_SCORE_OFFSET,
+            )
 
             print(
                 f"[DisambiguationEngine] '{c.name}' "
                 f"exact={exact_score:.2f} fuzzy={fuzzy_score:.2f} "
                 f"anchor={anchor_score:.2f} user_prox={user_prox_score:.2f}"
                 + (f" towards={towards_score:.2f}" if has_towards else "")
-                + f" pref={pref_boost:.3f} → score={c.score:.4f}"
+                + f" pref={pref_boost:.3f} → raw={combined:.4f} score={c.score:.4f}"
             )
 
         return candidates
@@ -658,32 +670,34 @@ class DisambiguationEngine:
         Convert a distance in km to a 0–1 score using stepped decay.
 
         Farther locations score strictly lower so anchor / device proximity can
-        separate same-name stops. Steps are tighter than a flat borough-wide band.
+        separate same-name stops. Breakpoints are in km (roughly 2× the older
+        tight bands) so area anchors and coarse geolocation still credit
+        plausible stops without treating ~1 km as “far.”
 
-          ≤ 0.25 km →  1.00
-          ≤ 0.50 km →  0.88
-          ≤ 1.00 km →  0.70
-          ≤ 2.00 km →  0.48
-          ≤ 3.50 km →  0.28
-          ≤ 5.00 km →  0.12
-          ≤ 8.00 km →  0.03
-            > 8.0 km →  0.00
+          ≤ 0.50 km →  1.00
+          ≤ 1.00 km →  0.88
+          ≤ 2.00 km →  0.70
+          ≤ 4.00 km →  0.48
+          ≤ 7.00 km →  0.28
+          ≤ 10.0 km →  0.12
+          ≤ 16.0 km →  0.03
+            > 16.0 km →  0.00
         """
         if dist_km is None:
             return _NEUTRAL_GEO
-        if dist_km <= 0.25:
-            return 1.0
         if dist_km <= 0.5:
-            return 0.88
+            return 1.0
         if dist_km <= 1.0:
-            return 0.70
+            return 0.88
         if dist_km <= 2.0:
+            return 0.70
+        if dist_km <= 4.0:
             return 0.48
-        if dist_km <= 3.5:
+        if dist_km <= 7.0:
             return 0.28
-        if dist_km <= 5.0:
+        if dist_km <= 10.0:
             return 0.12
-        if dist_km <= 8.0:
+        if dist_km <= 16.0:
             return 0.03
         return 0.0
 
