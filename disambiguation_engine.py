@@ -1,31 +1,15 @@
 """
 Unified Disambiguation Engine for London Transport Locations.
 
-Provides a single, shared disambiguation pipeline for both the timetable path
-(bus stops, train stations) and the journey planner path (origin/destination
-location resolution). Replaces the three separate ad-hoc implementations that
-previously lived in chatbot.py, transport_api.py, and journey_planner.py.
+Timetable lookups (bus stops, train stations) use ``DisambiguationEngine.disambiguate``:
+  Stage 1 — Geospatial filtering when a spatial anchor exists (e.g. ``near_area``).
+  Stage 2 — No multi-signal name/geo ranking. If the user supplied a ``towards``
+            phrase, candidates are ordered by towards match strength; the list is
+            always shown (no threshold-based auto-pick). Otherwise the filtered
+            list is shown without ranking.
 
-Architecture (two-stage ranking):
-  Stage 1 — Geospatial filtering:
-      If a spatial anchor is available (from Google Places or LLM-extracted
-      "near_area" entity), candidates outside a configurable radius are dropped.
-      The anchor represents where the user most likely meant geographically.
-
-  Stage 2 — Multi-signal scoring:
-      Remaining candidates are scored with a weighted combination of:
-        (a) Exact / token-overlap string match on stop name or code  (weight 0.40)
-        (b) Semantic similarity via sentence-transformers embedding   (weight 0.30)
-        (c) SequenceMatcher fuzzy ratio                               (weight 0.15)
-        (d) Geospatial proximity bonus (closer = higher)              (weight 0.15)
-
-  Confidence thresholds decide outcome:
-        >= 0.85  →  auto-resolve (silent pick, record in preferences)
-        0.60–0.84 →  present top-N candidates for user to choose
-        <  0.60  →  ask user to rephrase
-
-Per-user preferences (frequent stops, last chosen) boost candidate scores
-so the system learns from repeated interactions.
+Journey planning origin/destination resolution uses ``journey_disambiguate`` with
+weighted multi-signal scoring (see ``JourneyDisambiguationContext``).
 """
 
 from __future__ import annotations
@@ -102,8 +86,7 @@ class DisambiguationCandidate:
         if self.distance_km is not None:
             d["distance_km"] = round(self.distance_km, 3)
         d["score"] = round(self.score, 4)
-        if self.name_similarity is not None:
-            d["name_similarity"] = round(self.name_similarity, 4)
+        # name_similarity is intentionally excluded — internal scoring signal only
         return d
 
 
@@ -152,47 +135,17 @@ class DisambiguationResult:
 # Core engine
 # ---------------------------------------------------------------------------
 
-# --- Non-normalised additive scoring model ---
-#
-# Weights represent each signal's *maximum contribution* to the final score.
-# Absent signals are NOT redistributed to the remaining ones — they contribute
-# a small neutral constant (_NEUTRAL_GEO) instead.  This means scores honestly
-# reflect how much information is available:
-#
-#   • Perfect name match, no geo at all → ~0.59 raw → ~0.65 after calibration
-#     ("name matches but I don't know where you are")
-#   • Perfect name match + user nearby  → ~0.90+  (clearly the right area)
-#   • Perfect name match + anchor + user nearby → caps at 1.0 (very confident)
-#
-# This prevents same-name candidates all scoring an identical 90% and makes
-# the user-proximity signal a real differentiator.
-_W_EXACT      = 0.25   # name: exact / token-overlap
-_W_FUZZY      = 0.08   # name: SequenceMatcher ratio
-_W_GEO_ANCHOR = 0.28   # anchor proximity (near_area grounding)
-_W_USER_PROX  = 0.38   # user device proximity
-# When towards is specified, exact/fuzzy shrink to make room without
-# the total exceeding 1.0 (score is still capped at 1.0 anyway).
-_W_TOWARDS    = 0.28
-_TOWARDS_NAME_SHRINK = 0.70   # multiply exact & fuzzy by this when towards active
+# Neutral contribution when distance is unknown (stepped geo score helper)
+_NEUTRAL_GEO = 0.39
 
-# Neutral contribution for absent geo signals (rather than 0 or redistribution)
-_NEUTRAL_GEO = 0.39   # "unknown distance" — slightly higher so name-only matches
-                      # are not stuck at ~57% before calibration
-
-# After raw + pref_boost, apply a mild affine so strong string matches read closer
-# to user intuition (the additive model caps name-only cases low because both geo
-# channels sit at neutral). Ordering is unchanged (positive slope).
-_TIMETABLE_SCORE_SCALE = 1.06
-_TIMETABLE_SCORE_OFFSET = 0.025
-
-# Confidence thresholds (tuned for *calibrated* timetable scores — see above)
-_THRESHOLD_AUTO    = 0.91   # ~equivalent to raw ~0.84 before calibration
-_THRESHOLD_PRESENT = 0.30   # show options if any reasonable match
+# Legacy constructor defaults (unused by current timetable ``disambiguate`` logic)
+_THRESHOLD_AUTO = 0.91
+_THRESHOLD_PRESENT = 0.30
 
 # Geospatial filter radius (km)
 _DEFAULT_RADIUS_KM = 1.5  # 1.5km for bus stops (area-level anchors like "near Kingsbury"
                            # can be 800m–1km from stops on the area's edge)
-_WIDE_RADIUS_KM = 3.0     # 3km for train stations / journey planner locations
+_WIDE_RADIUS_KM = 3.0     # 3km for train stations (timetable ``disambiguate``)
 
 # Maximum candidates to present to user
 _MAX_PRESENT = 5
@@ -203,20 +156,15 @@ class DisambiguationEngine:
     """
     Unified location disambiguation for London transport.
 
-    Usage:
-        engine = DisambiguationEngine(sentence_model=shared_model)
+    Usage (timetable):
+        engine = DisambiguationEngine()
         result = engine.disambiguate(
             query="Lavender Avenue",
             candidates=[...],
             anchor=SpatialAnchor(lat=51.55, lng=-0.29, source="near_area"),
-            user_context=UserContext(frequent_stops={"490001234A": 5}),
+            towards_query="Wembley",
         )
-        if result.resolved:
-            # use result.chosen
-        elif result.action == "present_options":
-            # show result.candidates[:5] to user
-        else:
-            # ask user to rephrase
+        # Journey locations use ``journey_disambiguate`` instead.
     """
 
     def __init__(
@@ -230,13 +178,11 @@ class DisambiguationEngine:
     ):
         """
         Args:
-            sentence_model: Unused (kept for backward-compat). Semantic scoring
-                            has been removed; exact + fuzzy + geo + towards are
-                            the active signals.
-            auto_threshold:  Score above which we auto-resolve.
-            present_threshold: Score above which we present options.
+            sentence_model: Unused (kept for backward-compat).
+            auto_threshold: Legacy (unused by timetable ``disambiguate``).
+            present_threshold: Legacy (unused by timetable ``disambiguate``).
             default_radius_km: Geospatial filter radius for bus stops.
-            wide_radius_km: Geospatial filter radius for stations/journey locations.
+            wide_radius_km: Geospatial filter radius for train stations.
             max_present: Max candidates to present to the user.
         """
         self._sentence_model = sentence_model  # retained for API compat
@@ -245,7 +191,6 @@ class DisambiguationEngine:
         self._default_radius_km = default_radius_km
         self._wide_radius_km = wide_radius_km
         self._max_present = max_present
-        # Weights are module-level constants; no instance copies needed.
 
     # ------------------------------------------------------------------
     # Public API
@@ -270,16 +215,17 @@ class DisambiguationEngine:
             query: The user's original location query string.
             candidates: List of candidate locations from TfL / Places API.
             anchor: Optional spatial anchor for geospatial filtering.
-            user_context: Optional per-user preferences.
-            mode: "bus", "train", or "journey" — affects default radius.
+            user_context: Unused for timetable (kept for API compatibility).
+            mode: "bus" or "train" — affects default radius.
             radius_km: Override geospatial filter radius (km).
-            towards_query: Optional direction text (e.g. "Wembley"). When
-                           present, a towards-match signal is injected.
-            user_lat: Device latitude (from browser geolocation).
-            user_lon: Device longitude (from browser geolocation).
+            towards_query: Optional direction text (e.g. "Wembley"). When set,
+                candidates are ordered by ``_towards_match_score``; the user always
+                picks from the list (no auto-resolve from scores).
+            user_lat: Unused for timetable (kept for API compatibility).
+            user_lon: Unused for timetable (kept for API compatibility).
 
         Returns:
-            DisambiguationResult with ranked candidates and action.
+            DisambiguationResult with candidates and action.
         """
         if not candidates:
             return DisambiguationResult(
@@ -298,7 +244,7 @@ class DisambiguationEngine:
 
         # Determine radius
         if radius_km is None:
-            radius_km = self._wide_radius_km if mode in ("train", "journey") else self._default_radius_km
+            radius_km = self._wide_radius_km if mode == "train" else self._default_radius_km
 
         # Stage 1: Geospatial filtering
         filtered = self._geospatial_filter(candidates, anchor, radius_km)
@@ -308,68 +254,47 @@ class DisambiguationEngine:
         if not filtered:
             filtered = candidates
 
-        # Journey mode (temporary): disable ranking/dedup heuristics and
-        # simply present the first 10 candidates after geospatial filtering.
-        if mode == "journey":
-            unranked = filtered[:10]
-            if not unranked:
-                return DisambiguationResult(
-                    resolved=False, candidates=[], top_score=0.0, action="ask_rephrase"
+        # Bus/train timetable: optional ``towards`` phrase orders candidates via
+        # `_towards_match_score` only; always present options (no score thresholds).
+        has_towards = bool(towards_query and towards_query.strip())
+        if has_towards:
+            towards_lower = towards_query.strip().lower()
+            towards_tokens = set(self._tokenize(towards_lower))
+            scored = list(filtered)
+            for c in scored:
+                c.score = self._towards_match_score(
+                    towards_lower, towards_tokens, c
                 )
-            for c in unranked:
-                c.score = 0.0
+            scored.sort(key=lambda c: c.score, reverse=True)
+            top_score = scored[0].score if scored else 0.0
+            if top_score <= 0.0:
+                for c in scored:
+                    c.score = 0.0
+                top_score = 0.0
+            print(
+                f"[DisambiguationEngine] Timetable towards ordering "
+                f"(towards='{towards_query}') top_score={top_score:.3f}"
+            )
             return DisambiguationResult(
                 resolved=False,
-                candidates=unranked,
-                top_score=0.0,
+                candidates=scored[: self._max_present],
+                top_score=top_score,
                 action="present_options",
             )
 
-        # Non-journey modes (bus/train timetable): full scoring pipeline.
-
-        # Stage 2: Multi-signal scoring
-        scored = self._score_candidates(
-            query, filtered, anchor, user_context, towards_query, user_lat, user_lon
+        listing = filtered[: self._max_present]
+        if not listing:
+            return DisambiguationResult(
+                resolved=False, candidates=[], top_score=0.0, action="ask_rephrase"
+            )
+        for c in listing:
+            c.score = 0.0
+        return DisambiguationResult(
+            resolved=False,
+            candidates=listing,
+            top_score=0.0,
+            action="present_options",
         )
-
-        # Sort by score descending
-        scored.sort(key=lambda c: c.score, reverse=True)
-
-        top_score = scored[0].score if scored else 0.0
-
-        # Decision logic
-        if top_score >= self._auto_threshold:
-            # Check the gap between #1 and #2 — only auto-resolve if clear winner
-            if len(scored) >= 2:
-                gap = scored[0].score - scored[1].score
-                if gap < 0.10:
-                    return DisambiguationResult(
-                        resolved=False,
-                        candidates=scored[: self._max_present],
-                        top_score=top_score,
-                        action="present_options",
-                    )
-            return DisambiguationResult(
-                resolved=True,
-                candidates=scored[: self._max_present],
-                top_score=top_score,
-                action="auto_resolved",
-                chosen=scored[0],
-            )
-        elif top_score >= self._present_threshold:
-            return DisambiguationResult(
-                resolved=False,
-                candidates=scored[: self._max_present],
-                top_score=top_score,
-                action="present_options",
-            )
-        else:
-            return DisambiguationResult(
-                resolved=False,
-                candidates=scored[: self._max_present],
-                top_score=top_score,
-                action="ask_rephrase",
-            )
 
     # ------------------------------------------------------------------
     # Stage 1: Geospatial filtering
@@ -402,222 +327,8 @@ class DisambiguationEngine:
         return kept
 
     # ------------------------------------------------------------------
-    # Stage 2: Multi-signal scoring
-    # ------------------------------------------------------------------
-
-    def _score_candidates(
-        self,
-        query: str,
-        candidates: List[DisambiguationCandidate],
-        anchor: Optional[SpatialAnchor],
-        user_context: Optional[UserContext],
-        towards_query: Optional[str] = None,
-        user_lat: Optional[float] = None,
-        user_lon: Optional[float] = None,
-    ) -> List[DisambiguationCandidate]:
-        """Score each candidate using a non-normalised additive model.
-
-        Non-normalised means absent signals contribute _NEUTRAL_GEO (~0.39)
-        rather than zero or redistributed weight. Calibrated scores (affine on
-        raw + pref_boost) read higher for the same ranking:
-          • Perfect name match, no geo  → ~0.65 calibrated  (location unknown)
-          • Perfect name match + anchor → ~0.92+  (we know the area)
-          • Perfect name match + user nearby → ~0.92+  (device is close)
-          • Perfect name + anchor + user nearby → ~1.0  (capped; very confident)
-
-        When towards_query is provided, exact/fuzzy are shrunk by
-        _TOWARDS_NAME_SHRINK and a towards signal is added at _W_TOWARDS.
-        """
-        query_lower = query.strip().lower()
-        query_tokens = set(self._tokenize(query_lower))
-
-        has_towards = bool(towards_query and towards_query.strip())
-        has_anchor = anchor is not None
-        has_user_geo = (user_lat is not None and user_lon is not None)
-
-        if has_towards:
-            w_exact = _W_EXACT * _TOWARDS_NAME_SHRINK
-            w_fuzzy = _W_FUZZY * _TOWARDS_NAME_SHRINK
-            w_towards = _W_TOWARDS
-            towards_lower = towards_query.strip().lower()
-            towards_tokens = set(self._tokenize(towards_lower))
-            print(
-                f"[DisambiguationEngine] Scoring with towards='{towards_query}' — "
-                f"weights: exact={w_exact:.2f} fuzzy={w_fuzzy:.2f} "
-                f"anchor={_W_GEO_ANCHOR:.2f} user_prox={_W_USER_PROX:.2f} "
-                f"towards={w_towards:.2f}"
-            )
-        else:
-            w_exact = _W_EXACT
-            w_fuzzy = _W_FUZZY
-            w_towards = 0.0
-            towards_lower = ""
-            towards_tokens = set()
-
-        for c in candidates:
-            # (a) Exact / token-overlap name match
-            exact_score = self._exact_match_score(query_lower, query_tokens, c)
-
-            # (b) Fuzzy SequenceMatcher ratio
-            fuzzy_score = self._fuzzy_score(query_lower, c)
-
-            # (c) Anchor proximity — absolute stepped decay
-            if has_anchor and c.lat is not None and c.lon is not None:
-                # distance_km was set during geospatial filter; recompute if missing
-                if c.distance_km is None:
-                    c.distance_km = haversine_km(anchor.lat, anchor.lng, c.lat, c.lon)
-                anchor_score = self._stepped_geo_score(c.distance_km)
-            else:
-                anchor_score = _NEUTRAL_GEO  # unknown — neutral, not punishing
-
-            # (d) User device proximity — absolute stepped decay
-            if has_user_geo and c.lat is not None and c.lon is not None:
-                user_dist_km = haversine_km(user_lat, user_lon, c.lat, c.lon)
-                user_prox_score = self._stepped_geo_score(user_dist_km)
-            else:
-                user_prox_score = _NEUTRAL_GEO  # device location unknown — neutral
-
-            # (e) Towards / direction match
-            towards_score = 0.0
-            if has_towards:
-                towards_score = self._towards_match_score(
-                    towards_lower, towards_tokens, c
-                )
-
-            # Non-normalised additive combination (cap at 1.0)
-            raw_score = (
-                w_exact * exact_score
-                + w_fuzzy * fuzzy_score
-                + _W_GEO_ANCHOR * anchor_score
-                + _W_USER_PROX * user_prox_score
-                + w_towards * towards_score
-            )
-
-            pref_boost = self._preference_boost(c, user_context)
-            combined = raw_score + pref_boost
-            c.score = min(
-                1.0,
-                combined * _TIMETABLE_SCORE_SCALE + _TIMETABLE_SCORE_OFFSET,
-            )
-
-            print(
-                f"[DisambiguationEngine] '{c.name}' "
-                f"exact={exact_score:.2f} fuzzy={fuzzy_score:.2f} "
-                f"anchor={anchor_score:.2f} user_prox={user_prox_score:.2f}"
-                + (f" towards={towards_score:.2f}" if has_towards else "")
-                + f" pref={pref_boost:.3f} → raw={combined:.4f} score={c.score:.4f}"
-            )
-
-        return candidates
-
-    # ------------------------------------------------------------------
-    # Scoring signal: exact / token-overlap
-    # ------------------------------------------------------------------
-
-    def _exact_match_score(
-        self,
-        query_lower: str,
-        query_tokens: set,
-        candidate: DisambiguationCandidate,
-    ) -> float:
-        """
-        Score based on exact string and token-level matching.
-
-        Returns 0.0–1.0 where:
-          1.0 = exact match on name or stop code
-          0.8 = all query tokens appear in candidate name
-          0.5–0.8 = partial token overlap
-          0.0 = no overlap
-        """
-        name_lower = (candidate.name or "").lower()
-        label_lower = (candidate.label or candidate.name or "").lower()
-
-        # Perfect exact match
-        if query_lower == name_lower or query_lower == label_lower:
-            return 1.0
-
-        # Query is a substring of name or vice versa
-        if query_lower in name_lower or name_lower in query_lower:
-            return 0.9
-
-        # Token overlap
-        name_tokens = set(self._tokenize(name_lower))
-        if not name_tokens or not query_tokens:
-            return 0.0
-
-        overlap = query_tokens & name_tokens
-        if overlap == query_tokens:
-            # All query tokens appear in name
-            return 0.8
-
-        # Partial overlap: Jaccard-like
-        union = query_tokens | name_tokens
-        jaccard = len(overlap) / len(union) if union else 0.0
-        return jaccard * 0.7
-
-    # ------------------------------------------------------------------
-    # Scoring signal: semantic similarity
-    # ------------------------------------------------------------------
-
-    def _compute_semantic_scores(
-        self,
-        query: str,
-        candidates: List[DisambiguationCandidate],
-    ) -> Optional[List[float]]:
-        """Compute cosine similarity between query and each candidate name."""
-        if self._sentence_model is None or not candidates:
-            return None
-
-        try:
-            texts = [query] + [c.label or c.name or "" for c in candidates]
-            embeddings = self._sentence_model.encode(texts, show_progress_bar=False)
-
-            query_emb = embeddings[0]
-            scores: List[float] = []
-            for i in range(1, len(embeddings)):
-                sim = self._cosine_similarity(query_emb, embeddings[i])
-                # Normalize to 0–1 range (cosine sim for text is typically 0–1)
-                scores.append(max(0.0, min(1.0, sim)))
-            return scores
-        except Exception as e:
-            print(f"[DisambiguationEngine] Semantic scoring failed: {e}")
-            return None
-
-    @staticmethod
-    def _cosine_similarity(a, b) -> float:
-        """Compute cosine similarity between two vectors."""
-        import numpy as np
-        dot = np.dot(a, b)
-        norm_a = np.linalg.norm(a)
-        norm_b = np.linalg.norm(b)
-        if norm_a == 0 or norm_b == 0:
-            return 0.0
-        return float(dot / (norm_a * norm_b))
-
-    # ------------------------------------------------------------------
-    # Scoring signal: fuzzy string matching
-    # ------------------------------------------------------------------
-
-    def _fuzzy_score(
-        self,
-        query_lower: str,
-        candidate: DisambiguationCandidate,
-    ) -> float:
-        """SequenceMatcher ratio between query and candidate name/label."""
-        name = (candidate.name or "").lower()
-        label = (candidate.label or "").lower()
-
-        score_name = SequenceMatcher(None, query_lower, name).ratio()
-        score_label = SequenceMatcher(None, query_lower, label).ratio() if label != name else 0.0
-
-        # Also check towards field (for "bus times towards X" queries)
-        towards = (candidate.towards or "").lower()
-        score_towards = SequenceMatcher(None, query_lower, towards).ratio() if towards else 0.0
-
-        return max(score_name, score_label, score_towards)
-
-    # ------------------------------------------------------------------
-    # Scoring signal: towards / direction match
+    # Timetable: towards / direction match (also used for ordering when
+    # ``towards_query`` is passed to ``disambiguate``).
     # ------------------------------------------------------------------
 
     def _towards_match_score(
@@ -708,36 +419,6 @@ class DisambiguationEngine:
     ) -> float:
         """Legacy shim — delegates to _stepped_geo_score. Kept for API compat."""
         return self._stepped_geo_score(candidate.distance_km)
-
-    # ------------------------------------------------------------------
-    # User preference boost
-    # ------------------------------------------------------------------
-
-    def _preference_boost(
-        self,
-        candidate: DisambiguationCandidate,
-        user_context: Optional[UserContext],
-    ) -> float:
-        """
-        Small additive boost for stops the user has chosen before.
-        Max boost: 0.10 (so it nudges but doesn't override signals).
-        """
-        if user_context is None:
-            return 0.0
-
-        boost = 0.0
-
-        # Last chosen stop gets a boost
-        if user_context.last_chosen_stop_id and candidate.id == user_context.last_chosen_stop_id:
-            boost += 0.05
-
-        # Frequent stop gets a boost proportional to count (capped)
-        count = user_context.frequent_stops.get(candidate.id, 0)
-        if count > 0:
-            # Logarithmic scaling: boost grows slowly with frequency
-            boost += min(0.05, 0.02 * math.log1p(count))
-
-        return min(boost, 0.10)
 
     # ------------------------------------------------------------------
     # Journey-mode scoring
@@ -1203,15 +884,13 @@ class JourneyDisambiguationResult:
 # When a signal is unavailable, its weight is redistributed proportionally
 # to the remaining signals so the total always sums to 1.0 and missing
 # data never drags down scores.
-_JW_PROXIMITY_USER = 0.20       # proximity to user's current location
-_JW_PROXIMITY_OTHER = 0.15      # proximity to the other end (dest if origin, origin if dest)
-_JW_CONTEXT_MATCH = 0.30        # context clues ("near kingsbury") — user explicitly specified area
-_JW_NAME_MATCH = 0.20           # name similarity to query
-_JW_USER_HISTORY = 0.15         # user history boost
-_JW_ROUTE_FEASIBILITY = 0.05    # route feasibility (reserved for future TfL integration)
+_JW_PROXIMITY_USER = 0.45       # proximity to user's current location
+_JW_PROXIMITY_OTHER = 0.13      # proximity to the other end (dest if origin, origin if dest)
+_JW_NAME_MATCH = 0.10           # name similarity to query
+_JW_USER_HISTORY = 0.32         # user history boost
 
 # Thresholds for journey disambiguation outcomes
-_J_AUTO_SELECT_THRESHOLD = 0.82
+_J_AUTO_SELECT_THRESHOLD = 0.75
 _J_AUTO_SELECT_GAP = 0.20       # minimum gap between #1 and #2 for auto-select
 _J_CLARIFY_GAP = 0.15           # if gap < this, ask for clarification
 _J_SHOW_LIST_THRESHOLD = 0.30   # below this, show full list
@@ -1328,24 +1007,19 @@ def _journey_score_all(
     # --- Determine which signals are available globally ---
     has_user_geo = (ctx.user_lat is not None and ctx.user_lon is not None)
     has_other_end = (ctx.other_end_lat is not None and ctx.other_end_lon is not None)
-    has_context = (ctx.near_area_anchor is not None)
     has_history = (
         ctx.user_history is not None
         and len(ctx.user_history.chosen_locations) > 0
     )
 
     # Build {signal_name: ideal_weight} only for available signals.
-    # Name match is always available. Route feasibility is always included
-    # (placeholder neutral 0.5) so there's always at least two signals.
+    # Name match is always available.
     active_weights: Dict[str, float] = {}
     active_weights["name_match"] = _JW_NAME_MATCH
-    active_weights["route_feasibility"] = _JW_ROUTE_FEASIBILITY
     if has_user_geo:
         active_weights["proximity_user"] = _JW_PROXIMITY_USER
     if has_other_end:
         active_weights["proximity_other"] = _JW_PROXIMITY_OTHER
-    if has_context:
-        active_weights["context_match"] = _JW_CONTEXT_MATCH
     if has_history:
         active_weights["user_history"] = _JW_USER_HISTORY
 
@@ -1357,126 +1031,33 @@ def _journey_score_all(
 
     w_prox_user = active_weights.get("proximity_user", 0.0)
     w_prox_other = active_weights.get("proximity_other", 0.0)
-    w_context = active_weights.get("context_match", 0.0)
     w_name = active_weights.get("name_match", 0.0)
     w_history = active_weights.get("user_history", 0.0)
-    w_feasibility = active_weights.get("route_feasibility", 0.0)
 
     print(
         f"[JourneyScore] Active weights: "
         f"prox_user={w_prox_user:.3f} prox_other={w_prox_other:.3f} "
-        f"context={w_context:.3f} name={w_name:.3f} "
-        f"history={w_history:.3f} feasibility={w_feasibility:.3f}"
+        f"name={w_name:.3f} history={w_history:.3f}"
     )
 
-    # Pre-compute max distances for normalization
-    max_user_dist = 0.0
-    max_other_dist = 0.0
-
     for c in candidates:
-        if c.lat is None or c.lon is None:
-            continue
-        if has_user_geo:
-            d = haversine_km(ctx.user_lat, ctx.user_lon, c.lat, c.lon)
-            c.distance_km = d
-            max_user_dist = max(max_user_dist, d)
-        if has_other_end:
-            d2 = haversine_km(ctx.other_end_lat, ctx.other_end_lon, c.lat, c.lon)
-            max_other_dist = max(max_other_dist, d2)
-
-    for c in candidates:
-        # 1. Proximity to user (only when geolocation available)
+        # 1. Proximity to user (absolute stepped decay — close = high score regardless
+        #    of what other candidates score, so a nearby location is strongly rewarded)
         prox_user = 0.0
+        user_dist_km = None
         if has_user_geo and c.lat is not None and c.lon is not None:
-            d = haversine_km(ctx.user_lat, ctx.user_lon, c.lat, c.lon)
-            prox_user = max(0.0, 1.0 - (d / max(max_user_dist, 0.001)))
+            user_dist_km = haversine_km(ctx.user_lat, ctx.user_lon, c.lat, c.lon)
+            c.distance_km = user_dist_km
+            prox_user = DisambiguationEngine._stepped_geo_score(user_dist_km)
 
-        # 2. Proximity to other end (only when other end is resolved)
+        # 2. Proximity to other end (absolute stepped decay)
         prox_other = 0.0
+        other_dist_km = None
         if has_other_end and c.lat is not None and c.lon is not None:
-            d2 = haversine_km(ctx.other_end_lat, ctx.other_end_lon, c.lat, c.lon)
-            prox_other = max(0.0, 1.0 - (d2 / max(max_other_dist, 0.001)))
+            other_dist_km = haversine_km(ctx.other_end_lat, ctx.other_end_lon, c.lat, c.lon)
+            prox_other = DisambiguationEngine._stepped_geo_score(other_dist_km)
 
-        # 3. Context match — three complementary sub-signals:
-        #   a) Structured: hard-boundary match on postcode prefix / borough / suburb
-        #      extracted from the grounded near_area (most precise)
-        #   b) Geometric:  haversine distance from grounded lat/lng anchor
-        #      (fallback when structured data is absent or incomplete)
-        #   c) Text:       loose token match of raw near_area text against address
-        #      (catches cases the other two miss)
-        # Final context_score = best single signal, boosted when multiple agree.
-        context_score = 0.0
-        if has_context:
-            addr_text = (c.qualifier or c.name or "").lower()
-            addr_tokens = set(re.findall(r"[a-z0-9]+", addr_text))
-
-            # --- a) Structured sub-score -----------------------------------
-            structured_score = 0.0
-            s = ctx.near_area_structured
-            if s:
-                # Postcode prefix is the tightest boundary — "HA0" in address
-                # means the candidate is definitely in that postcode area.
-                if s.postcode_prefix:
-                    # Look for the prefix as a standalone token in the address
-                    pc_lower = s.postcode_prefix.lower()
-                    if pc_lower in addr_tokens:
-                        structured_score = max(structured_score, 1.0)
-
-                # Borough match — candidate is in the right borough
-                if s.borough and len(s.borough) > 4:
-                    if s.borough.lower() in addr_text:
-                        structured_score = max(structured_score, 0.90)
-
-                # Suburb/neighbourhood match — most specific area name
-                if s.suburb and len(s.suburb) > 2:
-                    if s.suburb.lower() in addr_text:
-                        structured_score = max(structured_score, 0.80)
-
-            # --- b) Geometric sub-score ------------------------------------
-            geo_score = 0.0
-            if c.lat is not None and c.lon is not None and ctx.near_area_anchor is not None:
-                anchor_dist = haversine_km(
-                    ctx.near_area_anchor.lat, ctx.near_area_anchor.lng,
-                    c.lat, c.lon
-                )
-                if anchor_dist <= 1.0:
-                    geo_score = 1.0
-                elif anchor_dist <= 2.0:
-                    geo_score = 0.90
-                elif anchor_dist <= 3.0:
-                    geo_score = 0.75
-                elif anchor_dist <= 5.0:
-                    geo_score = 0.50
-                elif anchor_dist <= 8.0:
-                    geo_score = 0.20
-            else:
-                anchor_dist = -1.0
-
-            # --- c) Text sub-score ----------------------------------------
-            text_score = 0.0
-            if ctx.near_area_text:
-                near_tokens = set(re.findall(r"[a-z0-9]+", ctx.near_area_text.lower()))
-                if near_tokens:
-                    text_score = len(near_tokens & addr_tokens) / len(near_tokens)
-
-            # --- Combine ---------------------------------------------------
-            # Use the highest single signal as the base, then add a bonus
-            # when multiple independent signals agree (convergent evidence).
-            best = max(structured_score, geo_score, text_score)
-            agreeing = sum(1 for v in (structured_score, geo_score, text_score) if v >= 0.5)
-            if agreeing >= 2:
-                context_score = min(1.0, best + 0.10)   # bonus for agreement
-            else:
-                context_score = best
-
-            print(
-                f"[JourneyScore] '{c.name}' "
-                f"structured={structured_score:.2f} geo={geo_score:.2f} "
-                f"text={text_score:.2f} → context={context_score:.2f}"
-                + (f" (anchor_dist={anchor_dist:.1f}km)" if anchor_dist >= 0 else "")
-            )
-
-        # 4. Name match (always available)
+        # 3. Name match (always available)
         c_norm = DisambiguationEngine._normalize_place_name(c.name)
         name_sim = SequenceMatcher(None, q_norm, c_norm).ratio()
         c.name_similarity = round(name_sim, 4)
@@ -1502,7 +1083,7 @@ def _journey_score_all(
         else:
             name_score = name_sim
 
-        # 5. User history (only when history data exists)
+        # 4. User history (only when history data exists)
         history_score = 0.0
         if has_history and c.id:
             count = ctx.user_history.chosen_locations.get(c.id, 0)
@@ -1510,27 +1091,25 @@ def _journey_score_all(
                 # Logarithmic scaling: grows quickly for first few uses, then plateaus
                 history_score = min(1.0, 0.3 * math.log1p(count))
 
-        # 6. Route feasibility (placeholder — always neutral 0.5)
-        feasibility_score = 0.5
-
         # Weighted combination (only active signals contribute, weights sum to 1.0)
         raw_score = (
             w_prox_user * prox_user
             + w_prox_other * prox_other
-            + w_context * context_score
             + w_name * name_score
             + w_history * history_score
-            + w_feasibility * feasibility_score
         )
 
         c.score = round(min(1.0, raw_score), 4)
 
+        dist_str = f"{user_dist_km:.2f}km" if user_dist_km is not None else "no-geo"
+        other_str = f"{other_dist_km:.2f}km" if other_dist_km is not None else "no-other"
         print(
-            f"[JourneyScore] '{c.name}' | "
-            f"prox_user={prox_user:.3f} prox_other={prox_other:.3f} "
-            f"context={context_score:.3f} name={name_score:.3f} "
-            f"history={history_score:.3f} feasibility={feasibility_score:.3f} "
-            f"| score={c.score}"
+            f"[JourneyScore] '{c.name}'\n"
+            f"  prox_user   raw={prox_user:.3f} ({dist_str})  weight={w_prox_user:.3f}  contrib={w_prox_user * prox_user:.4f}\n"
+            f"  prox_other  raw={prox_other:.3f} ({other_str})  weight={w_prox_other:.3f}  contrib={w_prox_other * prox_other:.4f}\n"
+            f"  name        raw={name_score:.3f}  weight={w_name:.3f}  contrib={w_name * name_score:.4f}\n"
+            f"  history     raw={history_score:.3f}  weight={w_history:.3f}  contrib={w_history * history_score:.4f}\n"
+            f"  → TOTAL score={c.score}"
         )
 
 
@@ -1691,11 +1270,10 @@ _engine_instance: Optional[DisambiguationEngine] = None
 def get_disambiguation_engine(sentence_model=None) -> DisambiguationEngine:
     """Get or create the singleton DisambiguationEngine.
 
-    If the instance already exists but was created without a sentence model and
-    a model is now supplied, the instance is recreated so that semantic scoring
-    is enabled.  This prevents the common call-order bug where chatbot.py
-    initialises the singleton first (without a model) and journey_planner.py's
-    later call with a model is silently ignored.
+    ``sentence_model`` is retained for backward compatibility; timetable
+    disambiguation does not use it. If a model is supplied after the singleton
+    was created without one, the instance is recreated so callers can still
+    pass a model consistently.
     """
     global _engine_instance
     if _engine_instance is None:

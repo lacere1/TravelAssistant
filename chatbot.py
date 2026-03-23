@@ -8,13 +8,7 @@ from nlp_processor import NLPProcessor
 from transport_api import TransportDataFetcher
 from dialog_state import DialogStateTracker, DialogState, DisambiguationContext, UserState
 from disambiguation_engine import (
-    DisambiguationEngine,
-    DisambiguationCandidate,
-    SpatialAnchor,
-    UserContext,
     candidates_from_tfl_matches,
-    anchor_from_places,
-    get_disambiguation_engine,
 )
 from places_grounder import get_grounder
 import json
@@ -102,8 +96,7 @@ class TrafficChatbot:
 
     def get_user_preferences(self, user_key: str) -> tuple:
         """Return (last_chosen_stop_id, frequent_stops) from the authoritative
-        _user_preferences store (used by _build_user_context and updated on
-        every auto-resolve and manual-pick path).
+        _user_preferences store (updated on every manual-pick path).
 
         Safe to call even when no preferences exist yet.
         """
@@ -119,8 +112,7 @@ class TrafficChatbot:
         """Seed both preference stores from SQLite after a server restart.
 
         - state_tracker: used by resolve_disambiguation / FSM transitions.
-        - _user_preferences: used by _build_user_context (disambiguation scoring)
-          and _reorder_options_by_preference (option ordering).
+        - _user_preferences: used by _reorder_options_by_preference (option ordering).
 
         No-op if the user already has a live in-memory session.
         """
@@ -222,7 +214,7 @@ class TrafficChatbot:
         # self.conversation_state works correctly per-user.
         self.conversation_state = self._get_user_conversation_state(user_key)
 
-        # Store device location for use during disambiguation scoring
+        # Store device location (used by journey disambiguation)
         if user_lat is not None and user_lon is not None:
             self.conversation_state['_user_lat'] = user_lat
             self.conversation_state['_user_lon'] = user_lon
@@ -578,11 +570,7 @@ class TrafficChatbot:
     def _reorder_options_by_preference(
         self, options: List[Dict[str, Any]], user_key: Optional[str]
     ) -> List[Dict[str, Any]]:
-        """Sort disambiguation options: score descending first, then user preference.
-
-        Primary key: score (descending) — already set by DisambiguationEngine.
-        Secondary key: last-chosen / frequent-stop preference (tiebreaker only).
-        """
+        """Sort disambiguation options by user preference (last-chosen / frequent-stop)."""
         prefs = self._user_preferences.get(user_key) if user_key else None
         last_id = (prefs or {}).get('last_chosen_stop_id')
         frequent = (prefs or {}).get('frequent_stops') or {}
@@ -597,40 +585,9 @@ class TrafficChatbot:
 
         return sorted(options, key=sort_key)
 
-    def _build_timetable_spatial_anchor(
-        self, query: str, entities: Dict[str, Any]
-    ) -> Optional[SpatialAnchor]:
-        """
-        Build a SpatialAnchor for timetable disambiguation from LLM-extracted entities.
-
-        Only builds an anchor when the user has explicitly provided geographic context
-        via the near_area entity (e.g. "bus times at Lavender Avenue in Kingsbury").
-
-        near_area and towards are intentionally kept separate (for bus AND train):
-          - near_area  = where the stop IS (area/neighbourhood context for disambiguation)
-          - towards    = where the bus is GOING (direction/destination, used for label
-                         matching in _resolve_disambiguation_reply, not for geo-filtering)
-
-        Grounding the query itself as a fallback is deliberately excluded: when there
-        is no near_area the query is the ambiguous thing being resolved, so pinning it
-        to one Google Places result would silently bias disambiguation against stops in
-        other parts of London that share the same street name.
-        """
-        grounder = get_grounder()
-        if not grounder.available:
-            return None
-
-        # Only anchor on near_area — an explicit area context provided by the user
-        near_area = entities.get('near_area')
-        if near_area:
-            places_result = grounder.ground(near_area)
-            anchor = anchor_from_places(places_result, source="near_area")
-            if anchor:
-                print(f"[Chatbot] Spatial anchor from near_area='{near_area}': ({anchor.lat}, {anchor.lng})")
-                return anchor
-
-        # No near_area → no anchor; let the scoring stage rank without geo-filtering
-        return None
+    # _build_timetable_spatial_anchor and _build_user_context are no longer called
+    # from the timetable path — stop disambiguation now relies solely on the towards
+    # mechanism (live TfL arrivals + bearing fallback) and presents candidates directly.
 
     # ------------------------------------------------------------------
     #  Coordinate-based platform direction resolution
@@ -852,18 +809,6 @@ class TrafficChatbot:
         )
         return chosen
 
-    def _build_user_context(self, user_key: Optional[str]) -> Optional[UserContext]:
-        """Build a UserContext from stored per-user preferences."""
-        if not user_key:
-            return None
-        prefs = self._user_preferences.get(user_key)
-        if not prefs:
-            return None
-        return UserContext(
-            last_chosen_stop_id=prefs.get('last_chosen_stop_id'),
-            frequent_stops=prefs.get('frequent_stops', {}),
-        )
-
     def _update_user_preference(
         self, user_key: Optional[str], stop_id: str, stop_name: str
     ) -> None:
@@ -884,24 +829,10 @@ class TrafficChatbot:
         mode = disamb.get('timetable_mode', 'bus')
         is_train_direction = disamb.get('train_direction_disambiguation') is True
 
-        # Build numbered option list with scores next to each candidate.
-        # Bus timetables: show explicit numeric score (and %) for every stop.
         opt_lines = []
         for i, opt in enumerate(options[:10], 1):
             label = opt.get('label', opt.get('name', 'Unknown'))
-            score = opt.get('score')
-            if mode == 'bus':
-                if score is not None:
-                    s = float(score)
-                    pct = round(s * 100)
-                    opt_lines.append(f"  {i}. {label}  (score {s:.4f} · {pct}%)")
-                else:
-                    opt_lines.append(f"  {i}. {label}")
-            elif score is not None and float(score) > 0:
-                pct = round(float(score) * 100)
-                opt_lines.append(f"  {i}. {label}  ({pct}% match)")
-            else:
-                opt_lines.append(f"  {i}. {label}")
+            opt_lines.append(f"  {i}. {label}")
         station_list = '\n'.join(opt_lines)
 
         if is_train_direction:
@@ -1238,8 +1169,7 @@ class TrafficChatbot:
                     # ---- Towards-location resolution (bus + train) ----
                     # If the user said "towards X", check which candidate stops/stations
                     # actually have vehicles travelling towards X via live arrivals /
-                    # route sequence.  This runs before the geo/score engine so it can
-                    # hard-filter or auto-resolve without needing a spatial anchor.
+                    # route sequence.  If exactly one stop matches, auto-resolve immediately.
                     towards = entities.get('towards') if mode in ('bus', 'train') else None
                     if towards:
                         stop_ids = [c.id for c in candidates if c.id]
@@ -1326,53 +1256,12 @@ class TrafficChatbot:
                                     response_message['timetable_data'] = timetable_data
                                     return response_message
 
-                    # Build spatial anchor from near_area entity
-                    anchor = self._build_timetable_spatial_anchor(query, entities)
-
-                    # Build user context for preference boosting
-                    user_ctx = self._build_user_context(user_key)
-
-                    # Run the disambiguation engine.
-                    # Pass the towards entity so the scorer can boost candidates
-                    # whose direction matches even when live-arrivals didn't resolve.
-                    engine = get_disambiguation_engine()
-                    result = engine.disambiguate(
-                        query=query,
-                        candidates=candidates,
-                        anchor=anchor,
-                        user_context=user_ctx,
-                        mode=mode or "bus",
-                        towards_query=towards,
-                        user_lat=self.conversation_state.get('_user_lat'),
-                        user_lon=self.conversation_state.get('_user_lon'),
-                    )
-
-                    if result.resolved and result.chosen:
-                        # Auto-resolved: fetch timetable for the chosen stop directly
-                        chosen = result.chosen
-                        self._update_user_preference(user_key, chosen.id, chosen.name)
-                        print(f"[Chatbot] Auto-resolved '{query}' → '{chosen.name}' (score={result.top_score:.3f})")
-                        timetable_data = self.transport_api.get_tfl_timetable_by_stop_id(
-                            chosen.id, mode_filter=timetable_mode, stop_name=chosen.name
-                        )
-                        if timetable_data and isinstance(timetable_data, dict) and 'error' not in timetable_data:
-                            response_message = self._format_timetable_response(timetable_data, timetable_mode)
-                            response_message['timetable_data'] = timetable_data
-                            return response_message
-                        # If fetch failed, fall through to present options
-
-                    if result.action == "ask_rephrase":
-                        mode_text = 'train stations' if mode == 'train' else 'bus stops' if mode == 'bus' else 'stops'
-                        return {
-                            'primary': f"I couldn't confidently match '{query}' to a specific {mode_text.rstrip('s')}.",
-                            'details': "Could you be more specific?",
-                            'alternatives': [],
-                            'next_steps': f"Try including a direction, area, or route number (e.g., '{query} towards Wembley' or '{query} in Kingsbury')."
-                        }
-
-                    # present_options: store ranked candidates for user to choose from
-                    ranked_options = [c.to_dict() for c in result.candidates]
-                    # Also apply legacy preference reordering for bus stops
+                    # No scoring engine for stop disambiguation.
+                    # The towards mechanism above handles directional resolution
+                    # via live TfL arrivals / bearing fallback. If we reach here,
+                    # towards didn't resolve — just present the candidates directly.
+                    ranked_options = [c.to_dict() for c in candidates[:5]]
+                    # Apply preference reordering for bus stops
                     if mode == 'bus':
                         ranked_options = self._reorder_options_by_preference(ranked_options, user_key)
 
@@ -1380,12 +1269,8 @@ class TrafficChatbot:
                         'options': ranked_options,
                         'query': query,
                         'timetable_mode': timetable_mode or mode,
-                        'top_score': round(result.top_score, 4),
-                        'scores': {
-                            str(o['id']): o.get('score')
-                            for o in ranked_options
-                            if o.get('id') is not None
-                        },
+                        'top_score': 0.0,
+                        'scores': {},
                     }
                     # FSM transition: enter disambiguation state
                     self.state_tracker.start_disambiguation(
@@ -1778,7 +1663,7 @@ class TrafficChatbot:
                 }
             return {
                 'primary': "I couldn't find a train line.",
-                'details': "Please specify a London Underground, Overground or DLR line by name (e.g. Victoria, Windrush, Northern, DLR), or a bus route (e.g. bus 83). You can reply with just the line or route.",
+                'details': "Please specify a London Underground, Overground or DLR line, or a bus route (e.g. 'Victoria line status' or 'is the 83 bus running?').",
                 'alternatives': [],
                 'next_steps': None,
                 'awaiting_line': 'train',

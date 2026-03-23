@@ -1596,12 +1596,18 @@ function addDisambiguationMarkersToMap(map, points, disamb) {
     if (!map || !points || !points.length) return;
     const bounds = new google.maps.LatLngBounds();
     const scoresDict = disamb.scores || {};
+    const isTimetableDisamb =
+        disamb && Object.prototype.hasOwnProperty.call(disamb, 'timetable_mode');
     points.forEach((pt) => {
         const opt = disamb.options[parseInt(pt.label, 10) - 1] || {};
         const score = scoresDict[opt.id || ''] || opt.score || 0;
         let markerColor = '#EA4335';
         if (score >= 0.7) markerColor = '#34A853';
         else if (score >= 0.4) markerColor = '#FBBC05';
+
+        const markerTitle = isTimetableDisamb
+            ? String(pt.title || '')
+            : `${pt.title} (score ${Number(score).toFixed(4)} · ${Math.round(score * 100)}%)`;
 
         const marker = new google.maps.Marker({
             position: pt.position,
@@ -1611,7 +1617,7 @@ function addDisambiguationMarkersToMap(map, points, disamb) {
                 color: '#FFFFFF',
                 fontWeight: 'bold',
             },
-            title: `${pt.title} (score ${Number(score).toFixed(4)} · ${Math.round(score * 100)}%)`,
+            title: markerTitle,
             icon: {
                 path: google.maps.SymbolPath.CIRCLE,
                 fillColor: markerColor,
