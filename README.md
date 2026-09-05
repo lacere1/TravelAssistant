@@ -14,6 +14,7 @@ A conversational web app for London transport queries, powered by a multi-layer 
 - **User Accounts** — register and log in to save preferences, shortcuts, and chat history across sessions (SQLite-backed).
 - **Custom Shortcuts** — define personal shortcuts (e.g. `home` → `Neasden Station`) that are automatically expanded in your messages.
 - **Google Places Autocomplete** — optional frontend autocomplete for location inputs.
+- **Photo input** — upload a photo of a London landmark and the recognised place becomes a normal location entity in the journey planner. See [Photo input](#photo-input-landmarklens-integration).
 - **Cross-platform** — run scripts provided for Windows (`run.bat`) and Unix/Mac (`run.sh`).
 
 ---
@@ -33,6 +34,7 @@ places_grounder.py      OSM / TfL place search and geocoding
 journey_slot_extractor.py Slot filling for journey planning (origin, destination, time)
 dialog_state.py         Per-user dialog state tracking
 training_data.py        Labelled training examples for the intent classifier
+landmark_client.py      HTTP client for the LandmarkLens photo-recognition service
 transport_api.py        TfL REST API wrapper
 tfl_stop_datasets.py    TfL stop data loader utilities
 bus_stops.csv           Bus stop reference data
@@ -155,6 +157,80 @@ Go to Settings in the UI, or use the `/shortcuts` API directly to add key→valu
 | `GET/PUT` | `/chat_history` | Load or save conversation history |
 | `GET` | `/suggest` | TfL place search autocomplete |
 | `GET` | `/health` | Health check |
+| `POST` | `/chat_photo` | Journey planning from a photo (see below) |
+| `GET` | `/landmark_status` | Whether the LandmarkLens service is reachable |
+
+---
+
+## Photo input (LandmarkLens integration)
+
+A photo can be used instead of typed text to supply a location.
+`POST /chat_photo` sends the image to
+[LandmarkLens](../../ImageRecognition/Image-classifier), a separate
+image-recognition service, and puts the place name it returns into the same
+`nlp_origin` / `nlp_destination` slot the text pipeline fills. From there it is
+the existing journey planner: disambiguation, geocoding, the TfL Journey API.
+
+```
+browser --photo--> /chat_photo --HTTP--> LandmarkLens /predict
+                        |                       |
+                        <--- location_name -----+
+                        |
+        nlp_destination = location_name
+                        |
+        journey_chatbot.handle_message(...)   <- same call /chat makes
+```
+
+`landmark_client.py` speaks HTTP and imports nothing from LandmarkLens, so the
+projects stay decoupled.
+
+LandmarkLens returns a `resolvable` flag. Classes like a bus stop flag or a tube
+roundel identify a kind of place, not a specific one, so `/chat_photo` does not
+plan a journey for those — it asks which one the user means. Same below the
+confidence floor.
+
+**Config** (all optional, defaults shown):
+
+```
+LANDMARKLENS_API_URL=http://localhost:8000
+LANDMARKLENS_TIMEOUT=20
+LANDMARKLENS_MIN_CONF=0.45
+```
+
+If the service is unreachable, `/landmark_status` reports it and the frontend
+hides the camera button. Typed input is unaffected.
+
+**Running both:**
+
+```bash
+# terminal 1
+cd ../ImageRecognition/Image-classifier
+PYTHONPATH=. .venv/Scripts/python backend/app.py     # :8000
+
+# terminal 2
+python app.py                                        # :5000
+```
+
+Then use the camera button next to the microphone. The radio buttons choose
+whether the photo is the destination or the starting point.
+
+**End-to-end test**, against both live services:
+
+```bash
+python test_landmarklens_integration.py
+```
+
+8/8 checks pass. A photo of Tower Bridge was recognised at 93.15%, combined with
+"from Waterloo" typed alongside, and returned three TfL journey options (first:
+29 min, walk to Waterloo East, Southeastern to London Bridge, 343 bus, walk). A
+photo of a bus stop planned no journey and asked which stop was meant.
+
+### Windows note
+
+`app.py` reconfigures stdout/stderr to UTF-8 at startup. Several diagnostic
+prints in the journey planner emit an arrow character that the default cp1252
+console cannot encode, and the resulting `UnicodeEncodeError` was turning
+working responses into HTTP 500s.
 
 ---
 
@@ -166,6 +242,7 @@ Test sets and results are included in the project:
 - `TravelAssistant_TestSet_COMPLETED.xlsx` — test cases with expected outputs
 - `TravelAssistant_TestResults_Actual.xlsx` — actual outputs from evaluation runs
 - `evaluate_classifier.py` — runs the intent classifier against the test set
+- `test_landmarklens_integration.py` — end-to-end test of the photo → journey integration (requires both services running)
 
 To evaluate the classifier:
 

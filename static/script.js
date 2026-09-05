@@ -869,6 +869,130 @@ function sendDisambiguationChoice(choiceText) {
         });
 }
 
+// -------- Photo input (LandmarkLens location recognition) --------
+// A photo is an alternative way of supplying a location entity: the backend
+// sends it to LandmarkLens, and the recognised place name is fed into the same
+// journey-planning slot a typed location would fill, so the reply below is an
+// ordinary journey response and goes through handleChatResponse unchanged.
+
+const photoInputButton = document.getElementById('photoInputButton');
+const photoInput = document.getElementById('photoInput');
+const photoRoleBar = document.getElementById('photoRoleBar');
+
+function selectedPhotoRole() {
+    const checked = document.querySelector('input[name="photoRole"]:checked');
+    return checked ? checked.value : 'to';
+}
+
+function sendPhoto(file) {
+    if (!file) return;
+
+    const role = selectedPhotoRole();
+    const roleWord = role === 'from' ? 'starting point' : 'destination';
+    const accompanying = userInput.value.trim();
+
+    addMessageAndStore(
+        `📷 Sent a photo as my ${roleWord}${accompanying ? ` — "${accompanying}"` : ''}`,
+        'user'
+    );
+    userInput.value = '';
+
+    if (!hasShownJourneyInputs) {
+        showJourneyInputsIfNeeded();
+    }
+
+    const typingId = showTypingIndicator();
+
+    const form = new FormData();
+    form.append('image', file, file.name || 'photo.jpg');
+    form.append('role', role);
+    if (accompanying) form.append('message', accompanying);
+
+    // Reuse the same geolocation context the text path sends.
+    const ctx = getJourneyContextPayload() || {};
+    if (ctx.userLat != null) form.append('userLat', ctx.userLat);
+    if (ctx.userLon != null) form.append('userLon', ctx.userLon);
+
+    fetch('/chat_photo', { method: 'POST', body: form })
+        .then((response) => response.json())
+        .then((data) => {
+            removeTypingIndicator(typingId);
+            if (data && data.photo) {
+                renderPhotoRecognition(data.photo);
+            }
+            if (data && data.error && !data.response) {
+                addMessageAndStore(
+                    'Sorry, I could not analyse that photo. Please type the location instead.',
+                    'bot'
+                );
+                return;
+            }
+            handleChatResponse(data);
+        })
+        .catch((error) => {
+            removeTypingIndicator(typingId);
+            addMessageAndStore(
+                'Sorry, I could not analyse that photo. Please type the location instead.',
+                'bot'
+            );
+            // eslint-disable-next-line no-console
+            console.error('Photo error:', error);
+        });
+}
+
+/** Show what the recogniser saw, plus its Grad-CAM explanation if available. */
+function renderPhotoRecognition(photo) {
+    const wrap = document.createElement('div');
+    wrap.className = 'message bot-message photo-recognition';
+
+    const content = document.createElement('div');
+    content.className = 'message-content';
+
+    const pct = Math.round((photo.confidence || 0) * 100);
+    const title = document.createElement('p');
+    title.className = 'photo-recognition-title';
+    title.textContent = `I recognised: ${photo.label} (${pct}% confidence)`;
+    content.appendChild(title);
+
+    if (photo.heatmap_url) {
+        const fig = document.createElement('figure');
+        fig.className = 'photo-heatmap';
+        const img = document.createElement('img');
+        img.src = photo.heatmap_url;
+        img.alt = `Heatmap showing which parts of the photo led to "${photo.label}"`;
+        img.loading = 'lazy';
+        const cap = document.createElement('figcaption');
+        cap.textContent = 'Warm areas are what the model looked at.';
+        fig.appendChild(img);
+        fig.appendChild(cap);
+        content.appendChild(fig);
+    }
+
+    wrap.appendChild(content);
+    chatMessages.appendChild(wrap);
+    chatMessages.scrollTop = chatMessages.scrollHeight;
+}
+
+if (photoInputButton && photoInput) {
+    photoInputButton.addEventListener('click', () => photoInput.click());
+    photoInput.addEventListener('change', (e) => {
+        const file = e.target.files && e.target.files[0];
+        photoInput.value = '';  // allow re-picking the same file
+        sendPhoto(file);
+    });
+
+    // Only offer the control when the recognition service is actually up.
+    fetch('/landmark_status')
+        .then((r) => r.json())
+        .then((s) => {
+            if (s && s.available) {
+                photoInputButton.hidden = false;
+                if (photoRoleBar) photoRoleBar.hidden = false;
+            }
+        })
+        .catch(() => { /* service down: leave the button hidden */ });
+}
+
 function addMessage(text, sender) {
     const messageDiv = document.createElement('div');
     messageDiv.className = `message ${sender}-message`;
