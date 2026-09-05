@@ -125,7 +125,17 @@
                                 <span class="voice-btn-icon" aria-hidden="true">🎤</span>
                                 <span class="voice-btn-label">Voice input</span>
                             </button>
+                            <button type="button" id="photoInputButton" class="photo-btn" aria-label="Recognise a location from a photo" title="Photo location" hidden>
+                                <span class="photo-btn-icon" aria-hidden="true">📷</span>
+                                <span class="photo-btn-label">Photo</span>
+                            </button>
+                            <input type="file" id="photoInput" accept="image/*" capture="environment" hidden>
                             <button id="sendButton">Send</button>
+                        </div>
+                        <div class="photo-role-bar" id="photoRoleBar" hidden>
+                            <span class="photo-role-label">Photo is my</span>
+                            <label class="photo-role-option"><input type="radio" name="photoRole" value="to" checked> destination</label>
+                            <label class="photo-role-option"><input type="radio" name="photoRole" value="from"> starting point</label>
                         </div>
                     </div>
                 </div>

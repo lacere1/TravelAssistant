@@ -38,3 +38,8 @@ htmlcov/
 instance/
 
 GitIgnoreFile/
+# Cached intent classifier (regenerated on first run)
+.model_cache/
+
+# Security research work-in-progress (not yet reviewed for publication)
+security/

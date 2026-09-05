@@ -4,6 +4,17 @@ import os
 import re
 import sqlite3
 import json
+import sys
+
+# Windows consoles default to cp1252, which cannot encode the arrows and other
+# symbols used in this app's diagnostic prints. Without this, a single logging
+# line raises UnicodeEncodeError mid-request and turns a working response into
+# a 500. Replace rather than fail: logs are diagnostics, not payload.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):  # not a reconfigurable TextIO
+        pass
 from dotenv import load_dotenv
 from werkzeug.security import generate_password_hash, check_password_hash
 
@@ -12,6 +23,8 @@ load_dotenv()
 
 from chatbot import TrafficChatbot
 from journey_planner import JourneyChatbot, TflJourneyClient
+# Photo -> location entity, resolved by the LandmarkLens service over HTTP.
+import landmark_client
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev-secret-key-change-in-production')
@@ -706,6 +719,170 @@ def chat():
             'disruption': traffic_response.get('disruption'),
             'timetable_disambiguation': traffic_response.get('timetable_disambiguation'),
         })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+# ---------------------------------------------------------------------------
+# Photo input (LandmarkLens integration)
+# ---------------------------------------------------------------------------
+
+@app.route('/landmark_status', methods=['GET'])
+def landmark_status():
+    """Whether the image-recognition service is reachable, for the UI to gate on."""
+    try:
+        return jsonify({'available': True, 'url': landmark_client.api_url(),
+                        'service': landmark_client.health()})
+    except landmark_client.LandmarkLensError as exc:
+        return jsonify({'available': False, 'url': landmark_client.api_url(),
+                        'error': str(exc)})
+
+
+@app.route('/chat_photo', methods=['POST'])
+def chat_photo():
+    """Journey planning from a photo instead of (or alongside) typed text.
+
+    The photo is sent to LandmarkLens, which returns a recognised
+    `location_name`. That name is then injected into exactly the same slot the
+    typed-text NLP pipeline fills -- `nlp_origin` or `nlp_destination` -- and
+    handed to the identical `journey_chatbot.handle_message` call that /chat
+    uses, so the journey flows through disambiguation, TfL lookup and rendering
+    unchanged.
+
+    Multipart form fields:
+        image     (file, required)  the photo
+        role      "to" (default) | "from"   which side of the journey it is
+        message   optional accompanying text, e.g. "from Camden Town"
+        date, time, userLat, userLon   as per /chat
+    """
+    try:
+        file_storage = request.files.get('image') or request.files.get('photo')
+        if file_storage is None or not file_storage.filename:
+            return jsonify({'error': "no image uploaded (expected form field 'image')"}), 400
+
+        image_bytes = file_storage.read()
+        if not image_bytes:
+            return jsonify({'error': 'uploaded image was empty'}), 400
+
+        role = (request.form.get('role') or 'to').strip().lower()
+        if role not in ('to', 'from'):
+            role = 'to'
+
+        # 1) Recognise the location from the photo.
+        try:
+            result = landmark_client.recognise(
+                image_bytes, filename=file_storage.filename)
+        except landmark_client.LandmarkLensError as exc:
+            return jsonify({
+                'response': ("I couldn't analyse that photo right now - the "
+                             "image recognition service isn't responding. You "
+                             "can still type the location instead."),
+                'error': str(exc),
+                'intent': 'photo_location',
+                'entities': {},
+                'confidence': 0.0,
+                'journeys': [],
+                'disambiguation': False,
+            }), 502
+
+        photo_meta = {
+            'label': result.label,
+            'class': result.class_slug,
+            'location_name': result.location_name,
+            'confidence': round(result.confidence, 4),
+            'resolvable': result.resolvable,
+            'low_confidence': result.low_confidence,
+            'heatmap_url': result.heatmap_url,
+            'role': role,
+        }
+
+        # 2) A recognised *kind* of place (a bus stop, a roundel) or a weak
+        #    prediction is not a location we can route to. Say so and let the
+        #    user type the specific name, rather than planning to a guess.
+        if not result.usable:
+            if result.low_confidence:
+                reply = (f"I'm not confident about that photo - my best guess "
+                         f"is {result.describe()}. Could you type the location "
+                         f"name instead?")
+            else:
+                reply = (f"That looks like {result.label.lower()}, but that "
+                         f"tells me the kind of place, not which one. "
+                         f"Which {result.location_name.lower()} is it?")
+            return jsonify({
+                'response': reply,
+                'intent': 'photo_location',
+                'entities': {'photo_label': result.label},
+                'confidence': result.confidence,
+                'journeys': [],
+                'disambiguation': False,
+                'photo': photo_meta,
+            })
+
+        # 3) Run the normal NLP pipeline over any accompanying text, then let
+        #    the photo win for its side of the journey. This is the whole
+        #    integration: `location_name` becomes an ordinary location entity.
+        user_key = _current_user_key()
+        username = session.get('username')
+        message = _apply_shortcuts_to_text(
+            user_key, (request.form.get('message') or '').strip())
+        now = datetime.utcnow()
+
+        nlp_entities, nlp_origin, nlp_destination = {}, None, None
+        if message:
+            try:
+                nlp_result = traffic_chatbot.nlp.process(message)
+                nlp_entities = nlp_result.get('entities', {}) if isinstance(nlp_result, dict) else {}
+                nlp_origin = nlp_entities.get('origin')
+                nlp_destination = nlp_entities.get('destination')
+            except Exception as nlp_err:
+                print(f"[app] photo: NLP extraction error (non-fatal): {nlp_err}")
+
+        if role == 'from':
+            nlp_origin = result.location_name
+        else:
+            nlp_destination = result.location_name
+        nlp_entities = dict(nlp_entities)
+        nlp_entities['origin'] = nlp_origin
+        nlp_entities['destination'] = nlp_destination
+        nlp_entities['source'] = 'photo'
+        print(f"[app] photo slots: origin={nlp_origin!r} "
+              f"destination={nlp_destination!r} "
+              f"(from {result.class_slug} @ {result.confidence:.2f})")
+
+        # Same geolocation / history injection the text path performs.
+        jp_state = journey_chatbot.state.setdefault('global', {})
+        try:
+            if request.form.get('userLat') and request.form.get('userLon'):
+                jp_state['_user_lat'] = float(request.form['userLat'])
+                jp_state['_user_lon'] = float(request.form['userLon'])
+        except (TypeError, ValueError):
+            pass
+        if username:
+            jp_state['_user_journey_history'] = _load_journey_history(username)
+
+        # 4) Identical downstream call to the typed-text path.
+        jp_response = journey_chatbot.handle_message(
+            message,
+            now=now,
+            username=username,
+            nlp_origin=nlp_origin,
+            nlp_destination=nlp_destination,
+            nlp_entities=nlp_entities,
+        )
+
+        jp_entities = _journey_planner_entities(jp_response.get('state', {}))
+        for k, v in nlp_entities.items():
+            if k.startswith('llm_') or k in ('route_preference', 'accessibility',
+                                             'time_preference'):
+                jp_entities[k] = v
+        jp_entities['photo_location'] = result.location_name
+        _maybe_save_journey_history(username, jp_response)
+
+        payload = _build_journey_jsonify(jp_response, jp_entities,
+                                         confidence=result.confidence)
+        payload['photo'] = photo_meta
+        return jsonify(payload)
+
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
